@@ -1,0 +1,58 @@
+[project]
+enable_telemetry = false
+user_env = []
+session_timeout = 1800
+cache = false
+allow_origins = ["*"]
+
+[features]
+latex = false
+auto_tag_thread = false
+max_turns_in_context = -1
+show_readme_as_default = true
+prompt_playground = false
+persistent_starters = true
+
+[UI]
+name = "Deep Research Lab"
+show_readme_as_default = true
+description = "AI-powered custom deep research with multi-agent harness engineering on Red Hat OpenShift AI"
+default_collapse_content = true
+default_expand_messages = false
+hide_cot = false
+custom_css = "/public/style.css"
+
+custom_logo = "/public/logo_light.png"
+default_avatar_file_url = "/public/images/my_assistant.png"
+avatar_size = 32
+[UI.theme]
+default_theme = "dark"
+layout = "wide"
+font_family = "Red Hat Display, Inter, sans-serif"
+
+[UI.theme.light]
+background = "#F8F9FA"
+paper = "#FFFFFF"
+
+[UI.theme.light.primary]
+main = "#EE0000"
+dark = "#A30000"
+light = "#FFEAEA"
+
+[UI.theme.dark]
+background = "#1A1A2E"
+paper = "#16213E"
+
+[UI.theme.dark.primary]
+main = "#EE0000"
+dark = "#CC0000"
+light = "#2D2D44"
+
+[features.spontaneous_file_upload]
+enabled = true
+accept = ["*/*"]
+max_files = 5
+max_size_mb = 50
+
+[meta]
+generated_by = "1.0.0"

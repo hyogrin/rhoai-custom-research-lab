@@ -1,0 +1,185 @@
+/* Deep Research Lab — Custom Theme */
+
+@import url('https://fonts.googleapis.com/css2?family=Red+Hat+Display:wght@400;500;600;700&family=Red+Hat+Mono:wght@400;500&display=swap');
+
+:root {
+  --accent: #EE0000;
+  --accent-hover: #CC0000;
+  --surface-dark: #1A1A2E;
+  --surface-card: #16213E;
+  --text-primary: #E8E8E8;
+  --text-secondary: #A0A0B8;
+  --border: rgba(255, 255, 255, 0.08);
+  --glow: rgba(238, 0, 0, 0.15);
+}
+
+/* Header */
+header {
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border) !important;
+}
+
+/* Message bubbles */
+.MuiPaper-root {
+  border-radius: 12px !important;
+}
+
+/* Steps (harness phases) */
+.step {
+  border-left: 3px solid var(--accent) !important;
+  border-radius: 8px !important;
+  margin: 8px 0 !important;
+}
+
+/* Input area */
+.composer-container {
+  border-radius: 16px !important;
+  border: 1px solid var(--border) !important;
+  transition: border-color 0.2s ease;
+}
+
+.composer-container:focus-within {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px var(--glow) !important;
+}
+
+/* Send button */
+button[class*="send"] {
+  background: var(--accent) !important;
+  border-radius: 12px !important;
+  transition: transform 0.1s ease, background 0.2s ease;
+}
+
+button[class*="send"]:hover {
+  background: var(--accent-hover) !important;
+  transform: scale(1.05);
+}
+
+/* Starter cards */
+.MuiCard-root,
+[class*="starter"] {
+  border-radius: 12px !important;
+  border: 1px solid var(--border) !important;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.MuiCard-root:hover,
+[class*="starter"]:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3) !important;
+  border-color: var(--accent) !important;
+}
+
+/* Settings sliders */
+.MuiSlider-thumb {
+  background: var(--accent) !important;
+}
+
+.MuiSlider-track {
+  background: var(--accent) !important;
+}
+
+/* File upload area */
+[class*="dropzone"],
+[class*="upload"] {
+  border-radius: 12px !important;
+  border: 2px dashed var(--border) !important;
+  transition: border-color 0.2s ease;
+}
+
+[class*="dropzone"]:hover,
+[class*="upload"]:hover {
+  border-color: var(--accent) !important;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+/* Code blocks */
+pre, code {
+  font-family: 'Red Hat Mono', monospace !important;
+  border-radius: 8px !important;
+}
+
+/* Phase indicator animation */
+@keyframes pulse-glow {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+.step[class*="running"] {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+/* App description below logo */
+#message-composer {
+  position: relative;
+  margin-top: 3rem !important;
+}
+
+#message-composer::before {
+  content: "AI-powered custom deep research with multi-agent harness engineering\Aon Red Hat OpenShift AI";
+  white-space: pre-wrap;
+  position: absolute;
+  bottom: calc(100% + 0.5rem);
+  left: 50%;
+  transform: translateX(-50%);
+  text-align: center;
+  color: #000000;
+  font-size: 1.05rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  width: max-content;
+  pointer-events: none;
+}
+
+/* Welcome page styling */
+.markdown-body h1 {
+  background: linear-gradient(135deg, var(--accent), #FF4444);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  font-weight: 700;
+}
+
+.markdown-body h2 {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* AI avatar animation — pulse glow while responding */
+.ai-message img[alt] {
+  border-radius: 50%;
+  transition: box-shadow 0.3s ease;
+}
+
+.ai-message:last-child img[alt] {
+  animation: avatar-pulse 2s ease-in-out infinite;
+}
+
+@keyframes avatar-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(238, 0, 0, 0.4); }
+  50% { box-shadow: 0 0 0 8px rgba(238, 0, 0, 0); }
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .composer-container {
+    border-radius: 12px !important;
+  }
+}

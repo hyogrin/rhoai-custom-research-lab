@@ -1,0 +1,465 @@
+"""Orchestrator Agent — Iterative harness controller for deep research.
+
+Replaces the linear pipeline with an iteration loop that evolves the research
+output through Context → Tool → Execution → Verification → Observability layers
+until quality threshold is met or max iterations reached.
+"""
+
+import json
+import logging
+import os
+import sys
+import uuid
+
+from a2a.types import Message
+from a2a.utils.message import get_message_text
+from kagenti_adk.server import Server
+from kagenti_adk.server.context import RunContext
+from kagenti_adk.a2a.types import AgentMessage
+from langgraph.graph import StateGraph, END
+from typing import Literal
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+
+from agents.orchestrator.state import ResearchState
+from agents.orchestrator.layers.context import gather_context, load_past_failure_memory
+from agents.orchestrator.layers.tools import (
+    semantic_search,
+    rewrite_query,
+    synthesize_context,
+    generate_plan,
+    draft_report,
+)
+from agents.orchestrator.layers.verification import run_verification
+from agents.orchestrator.layers.observability import HarnessObserver
+from harness.failure import FailureCategory
+from harness.session import SessionManager, ResearchSession
+
+logger = logging.getLogger(__name__)
+
+# Module-level observer registry (per session)
+_observers: dict[str, HarnessObserver] = {}
+
+# Session manager for periodic checkpointing
+_session_mgr: SessionManager | None = None
+
+
+def _get_session_mgr() -> SessionManager:
+    global _session_mgr
+    if _session_mgr is None:
+        _session_mgr = SessionManager()
+        try:
+            _session_mgr.ensure_table()
+        except Exception as e:
+            logger.warning(f"Could not ensure sessions table: {e}")
+    return _session_mgr
+
+
+def checkpoint_session(state: ResearchState):
+    """Persist the current graph state to PostgreSQL for frontend resume."""
+    try:
+        mgr = _get_session_mgr()
+        session = ResearchSession(
+            session_id=state.get("session_id", ""),
+            query=state.get("query", ""),
+            iteration=state.get("iteration", 0),
+            max_iterations=state.get("max_iterations", 3),
+            quality_threshold=state.get("quality_threshold", 7.0),
+            research_plan=state.get("research_plan", []),
+            accumulated_context=state.get("accumulated_context", []),
+            current_draft=state.get("current_draft", ""),
+            verification_history=state.get("verification_history", []),
+            total_tokens=state.get("total_tokens", 0),
+            total_cost=state.get("total_cost", 0.0),
+            status=state.get("status", "unknown"),
+            quality_score=state.get("quality_score", 0.0),
+        )
+        mgr.save(session)
+    except Exception as e:
+        logger.warning(f"Session checkpoint failed: {e}")
+
+
+def _get_observer(session_id: str) -> HarnessObserver:
+    if session_id not in _observers:
+        _observers[session_id] = HarnessObserver(session_id)
+    return _observers[session_id]
+
+
+# --- Graph Nodes ---
+
+
+def normalize_node(state: ResearchState) -> dict:
+    """Normalize the input and initialize session state."""
+    session_id = state.get("session_id") or str(uuid.uuid4())[:12]
+    observer = _get_observer(session_id)
+    observer.start_iteration(1)
+    observer.trace_context(0, "normalize", f"Query: {state['query'][:200]}")
+
+    past_memory = load_past_failure_memory()
+
+    update = {
+        "session_id": session_id,
+        "iteration": 1,
+        "status": "planning",
+        "failure_hints": past_memory,
+    }
+    checkpoint_session({**state, **update})
+    return update
+
+
+def plan_node(state: ResearchState) -> dict:
+    """Plan the research strategy using the context and tool layers."""
+    observer = _get_observer(state["session_id"])
+    iteration = state["iteration"]
+
+    # Context layer
+    ctx = gather_context(state)
+    observer.trace_context(iteration, "gather_context", ctx.get("context_summary", "")[:200])
+
+    # Generate plan via tool layer
+    existing_context = "\n".join(
+        c.get("content", "")[:200] for c in (state.get("accumulated_context") or [])[-5:]
+    )
+    result = generate_plan(
+        state["query"],
+        iteration,
+        state.get("failure_hints", ""),
+        existing_context,
+    )
+
+    observer.trace_tool_call(
+        iteration=iteration,
+        operation="generate_plan",
+        input_summary=state["query"][:200],
+        output_summary=json.dumps(result.get("plan", []))[:200],
+        tokens_used=result.get("tokens_used", 0),
+    )
+
+    update = {
+        "research_plan": result.get("plan", []),
+        "status": "researching",
+        "total_tokens": state.get("total_tokens", 0) + result.get("tokens_used", 0),
+    }
+    checkpoint_session({**state, **update})
+    return update
+
+
+def execute_node(state: ResearchState) -> dict:
+    """Execute research: search, retrieve, synthesize via tool layer."""
+    observer = _get_observer(state["session_id"])
+    iteration = state["iteration"]
+    plan = state.get("research_plan", [])
+
+    new_context = list(state.get("accumulated_context") or [])
+    total_tokens = state.get("total_tokens", 0)
+
+    # Execute each plan step (limit to 2 to reduce LLM call volume)
+    for step in plan[:2]:
+        action = step.get("action", "search")
+        step_query = step.get("query", state["query"])
+
+        if action == "search":
+            # Search directly without rewriting to conserve API quota
+            all_results = []
+            results = semantic_search(step_query, top_k=5)
+            all_results.extend(results)
+
+            # Deduplicate by chunk content
+            seen = set()
+            unique_results = []
+            for r in all_results:
+                key = (r.get("document_id", ""), r.get("chunk_index", 0))
+                if key not in seen:
+                    seen.add(key)
+                    unique_results.append(r)
+
+            for r in unique_results[:5]:
+                new_context.append({
+                    "iteration": iteration,
+                    "source": f"{r.get('document_name', 'unknown')}[{r.get('chunk_index', 0)}]",
+                    "content": r.get("content", ""),
+                    "metadata": {"similarity": r.get("similarity", 0)},
+                })
+
+            observer.trace_tool_call(
+                iteration=iteration,
+                operation="semantic_search",
+                input_summary=step_query[:200],
+                output_summary=f"Found {len(unique_results)} unique chunks",
+                tokens_used=0,
+            )
+
+        elif action in ("analyze", "compare"):
+            synthesis = synthesize_context(step_query, [
+                {"content": c.get("content", ""), "document_name": c.get("source", ""), "chunk_index": 0, "similarity": 0.8}
+                for c in new_context[-5:]
+            ])
+            total_tokens += synthesis.get("tokens_used", 0)
+
+            new_context.append({
+                "iteration": iteration,
+                "source": "synthesis",
+                "content": synthesis.get("synthesis", ""),
+                "metadata": {"type": action},
+            })
+
+            observer.trace_tool_call(
+                iteration=iteration,
+                operation=f"synthesize_{action}",
+                input_summary=step_query[:200],
+                output_summary=synthesis.get("synthesis", "")[:200],
+                tokens_used=synthesis.get("tokens_used", 0),
+            )
+
+    # Draft or improve the report
+    context_text = "\n\n".join(c.get("content", "")[:500] for c in new_context[-10:])
+    plan_text = json.dumps(plan)
+
+    logger.info(
+        "draft_report input: query=%d chars, context=%d chars, plan=%d chars",
+        len(state["query"]), len(context_text), len(plan_text),
+    )
+
+    result = draft_report(
+        state["query"],
+        context_text,
+        plan_text,
+        previous_draft=state.get("current_draft", ""),
+        improvement_hints=state.get("failure_hints", ""),
+        language_instruction=state.get("language_instruction", ""),
+    )
+    total_tokens += result.get("tokens_used", 0)
+
+    observer.trace_tool_call(
+        iteration=iteration,
+        operation="draft_report",
+        input_summary=f"Drafting iteration {iteration}",
+        output_summary=result.get("draft", "")[:200],
+        tokens_used=result.get("tokens_used", 0),
+    )
+
+    update = {
+        "accumulated_context": new_context,
+        "current_draft": result.get("draft", ""),
+        "status": "verifying",
+        "total_tokens": total_tokens,
+    }
+    checkpoint_session({**state, **update})
+    return update
+
+
+def verify_node(state: ResearchState) -> dict:
+    """Run verification checks on the current draft."""
+    observer = _get_observer(state["session_id"])
+    iteration = state["iteration"]
+    draft = state.get("current_draft", "")
+    context = state.get("accumulated_context") or []
+
+    verification = run_verification(draft, state["query"], context, iteration)
+
+    observer.trace_verification(
+        iteration=iteration,
+        operation="full_verification",
+        input_summary=f"Draft length: {len(draft)} chars",
+        output_summary=f"Score: {verification.get('quality_score', 0)}, Passed: {verification.get('passed', False)}",
+        tokens_used=verification.get("tokens_used", 0),
+    )
+
+    # Record failures if verification didn't pass
+    if not verification.get("passed", False):
+        details = verification.get("quality_details", {})
+        if details.get("completeness", 10) < 6:
+            observer.record_failure(iteration, FailureCategory.INSUFFICIENT_DEPTH, "Report lacks depth")
+        if not verification.get("citation_check", {}).get("passed", True):
+            observer.record_failure(iteration, FailureCategory.MISSING_CITATIONS, "Missing or invalid citations")
+        if not verification.get("fact_check", {}).get("passed", True):
+            observer.record_failure(iteration, FailureCategory.HALLUCINATION, "Unsupported claims detected")
+
+    history = list(state.get("verification_history") or [])
+    history.append({
+        "iteration": iteration,
+        "score": verification.get("quality_score", 0),
+        "passed": verification.get("passed", False),
+        "improvements": verification.get("improvements", []),
+    })
+
+    update = {
+        "verification_result": verification,
+        "verification_history": history,
+        "quality_score": verification.get("quality_score", 0),
+        "status": "observing",
+        "total_tokens": state.get("total_tokens", 0) + verification.get("tokens_used", 0),
+    }
+    checkpoint_session({**state, **update})
+    return update
+
+
+def observe_node(state: ResearchState) -> dict:
+    """Record observability data and determine next action."""
+    observer = _get_observer(state["session_id"])
+    iteration = state["iteration"]
+    passed = state.get("verification_result", {}).get("passed", False)
+
+    observer.end_iteration(state.get("quality_score", 0), passed)
+
+    # Prepare failure hints for next iteration
+    failure_hints = observer.get_improvement_hints()
+    improvements = state.get("verification_result", {}).get("improvements", [])
+    if improvements:
+        failure_hints += "\n" + "\n".join(f"- {imp}" for imp in improvements)
+
+    update = {
+        "failure_hints": failure_hints,
+    }
+    checkpoint_session({**state, **update})
+    return update
+
+
+def should_iterate(state: ResearchState) -> Literal["plan", "finalize"]:
+    """Decide whether to iterate or finalize."""
+    quality_score = state.get("quality_score", 0)
+    threshold = state.get("quality_threshold", 7.0)
+    iteration = state.get("iteration", 0)
+    max_iterations = state.get("max_iterations", 5)
+
+    if quality_score >= threshold:
+        return "finalize"
+    if iteration >= max_iterations:
+        return "finalize"
+    return "plan"
+
+
+def iterate_node(state: ResearchState) -> dict:
+    """Advance to next iteration."""
+    new_iteration = state.get("iteration", 0) + 1
+    observer = _get_observer(state["session_id"])
+    observer.start_iteration(new_iteration)
+
+    update = {
+        "iteration": new_iteration,
+        "status": "planning",
+    }
+    checkpoint_session({**state, **update})
+    return update
+
+
+def finalize_node(state: ResearchState) -> dict:
+    """Finalize the research output."""
+    observer = _get_observer(state["session_id"])
+    summary = observer.get_summary()
+
+    # Persist observability data
+    observer.persist()
+
+    draft = state.get("current_draft", "")
+    score = state.get("quality_score", 0)
+    iterations = state.get("iteration", 0)
+
+    output = (
+        f"{draft}\n\n"
+        f"---\n"
+        f"*Research completed in {iterations} iteration(s) | "
+        f"Quality score: {score}/10 | "
+        f"Total tokens: {state.get('total_tokens', 0)}*"
+    )
+
+    # Clean up observer
+    _observers.pop(state.get("session_id", ""), None)
+
+    update = {
+        "final_output": output,
+        "status": "complete",
+    }
+    checkpoint_session({**state, **update})
+    return update
+
+
+# --- Build the Graph ---
+
+
+def build_graph():
+    graph = StateGraph(ResearchState)
+
+    graph.add_node("normalize", normalize_node)
+    graph.add_node("plan", plan_node)
+    graph.add_node("execute", execute_node)
+    graph.add_node("verify", verify_node)
+    graph.add_node("observe", observe_node)
+    graph.add_node("iterate", iterate_node)
+    graph.add_node("finalize", finalize_node)
+
+    graph.set_entry_point("normalize")
+    graph.add_edge("normalize", "plan")
+    graph.add_edge("plan", "execute")
+    graph.add_edge("execute", "verify")
+    graph.add_edge("verify", "observe")
+    graph.add_conditional_edges("observe", should_iterate, {"plan": "iterate", "finalize": "finalize"})
+    graph.add_edge("iterate", "plan")
+    graph.add_edge("finalize", END)
+
+    return graph.compile()
+
+
+orchestrator_graph = build_graph()
+
+# --- A2A Server ---
+
+server = Server()
+
+
+@server.agent()
+async def orchestrator(input: Message, context: RunContext):
+    """Orchestrate iterative deep research via the harness controller."""
+    text = get_message_text(input)
+
+    has_document = False
+    file_path = ""
+    user_query = text
+
+    if "\n" in text:
+        lines = text.strip().split("\n", 1)
+        if os.path.exists(lines[0].strip()) or lines[0].strip().startswith("/"):
+            file_path = lines[0].strip()
+            user_query = lines[1].strip()
+            has_document = True
+
+    result = await orchestrator_graph.ainvoke({
+        "session_id": str(uuid.uuid4())[:12],
+        "query": user_query,
+        "file_path": file_path,
+        "has_document": has_document,
+        "iteration": 0,
+        "max_iterations": int(os.getenv("MAX_ITERATIONS", "3")),
+        "quality_threshold": float(os.getenv("QUALITY_THRESHOLD", "7.0")),
+        "language_instruction": "You MUST respond entirely in English.",
+        "research_plan": [],
+        "accumulated_context": [],
+        "current_draft": "",
+        "verification_result": {},
+        "verification_history": [],
+        "quality_score": 0.0,
+        "total_tokens": 0,
+        "total_cost": 0.0,
+        "failure_hints": "",
+        "status": "normalizing",
+        "final_output": "",
+        "error": "",
+    })
+
+    if result.get("error"):
+        yield AgentMessage(text=f"Error during research: {result['error']}")
+    else:
+        yield AgentMessage(text=result.get("final_output", "No output generated"))
+
+
+def run():
+    port = int(os.getenv("ORCHESTRATOR_PORT", "8100"))
+    server.run(host="0.0.0.0", port=port)
+
+
+if __name__ == "__main__":
+    run()

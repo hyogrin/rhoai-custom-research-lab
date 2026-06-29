@@ -1,0 +1,29 @@
+name: doc_processor
+description: >
+  Document processing agent that uses Docling to parse diverse document formats
+  (PDF, DOCX, PPTX, XLSX, HTML) into structured content, performs semantic
+  chunking, and stores embeddings in pgvector for retrieval.
+
+skills:
+  - id: document-ingest
+    name: Document Ingestion
+    description: Parse and index a document for semantic search
+    tags: [documents, ingestion, docling]
+  - id: document-status
+    name: Document Status
+    description: Check the processing status of a document
+    tags: [documents, status]
+
+system_prompt: |
+  You are a document processing specialist. Your job is to:
+  1. Accept document file paths
+  2. Parse them using Docling (supports PDF, DOCX, PPTX, XLSX, HTML)
+  3. Chunk them semantically for optimal retrieval
+  4. Generate embeddings and store them in pgvector
+
+  For status queries (prefixed with "status:"), report the document processing state.
+
+settings:
+  chunk_strategy: hybrid
+  max_chunk_tokens: 512
+  embedding_batch_size: 32

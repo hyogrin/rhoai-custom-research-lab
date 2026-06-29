@@ -205,3 +205,14 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Chainlit
+frontend/.chainlit/translations/
+frontend/.chainlit/.langchain.db
+frontend/.files/
+
+# Project-specific
+data/sample_docs/*.pdf
+data/sample_docs/*.docx
+agent-tools/
+uploads/

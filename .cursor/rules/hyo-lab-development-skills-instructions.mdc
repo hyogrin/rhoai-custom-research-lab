@@ -1,0 +1,59 @@
+---
+description: hyo-lab-development-skills module instructions
+globs:
+alwaysApply: true
+---
+
+# hyo-lab-development-skills
+
+AI skills for developing RHOAI hands-on labs with harness engineering patterns.
+
+## Skill-First Rule
+
+ALWAYS use the appropriate skill for lab development tasks. Skills encode
+conventions, patterns, and anti-patterns that ensure consistency across the lab.
+
+To invoke a skill, use the Skill tool with the skill name (e.g., `/rhoai-lab-dev`).
+
+## Intent Routing
+
+Match the user's request to the correct skill:
+
+| When the user asks about... | Use skill |
+|----------------------------|-----------|
+| Writing or editing notebook cells | `/rhoai-lab-dev` |
+| Adding OpenShift/Kubernetes setup steps | `/rhoai-lab-dev` |
+| Updating `.env` or `sample.env` files | `/rhoai-lab-dev` |
+| Installing CRs, operators, or services in notebooks | `/rhoai-lab-dev` |
+| Lab notebook conventions, cell structure, numbering | `/rhoai-lab-dev` |
+| Designing AGENTS.md files | `/harness-engineering` |
+| Plan-execute-verify-reflect loop design | `/harness-engineering` |
+| Quality thresholds, iteration limits, failure categories | `/harness-engineering` |
+| MCP tools as harness components | `/harness-engineering` |
+| Long transaction pattern, session state | `/harness-engineering` |
+| Iterative research orchestration | `/harness-engineering` |
+
+If the request doesn't clearly match one skill, ask the user to clarify.
+
+## Skill Chaining
+
+Some workflows require both skills in sequence:
+
+- **New harness-driven lab phase**: `/harness-engineering` first (design the inner loop),
+  then `/rhoai-lab-dev` (implement as notebooks)
+- **Adding verification to a lab**: `/harness-engineering` (design verification MCP tools),
+  then `/rhoai-lab-dev` (create notebooks that test them)
+- **Refactoring existing notebooks**: `/rhoai-lab-dev` (follow conventions),
+  then `/harness-engineering` (ensure harness patterns are preserved)
+
+After completing a skill, suggest relevant next-step skills to the user.
+
+## Global Rules
+
+1. **English only** — all code, comments, markdown, and print messages must be in English.
+2. **Idempotent cells** — every notebook cell must be safe to re-run.
+3. **`.env` updates** — after creating any resource that other notebooks depend on,
+   persist the value to `.env`.
+4. **Notebook-first** — if you do something in the terminal, capture it in a notebook cell.
+5. **Never expose credentials** — do not display API keys, passwords, or tokens in output.
+6. **Numbered headings** — maintain sequential numbering when adding/removing notebook sections.

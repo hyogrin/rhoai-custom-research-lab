@@ -1,0 +1,192 @@
+---
+apiVersion: kagenti.io/v1alpha1
+kind: Component
+metadata:
+  name: orchestrator
+  namespace: doc-research-lab
+  labels:
+    kagenti.io/type: agent
+    kagenti.io/framework: LangGraph
+    protocol.kagenti.io/a2a: ""
+    app.kubernetes.io/name: orchestrator
+    app.kubernetes.io/part-of: doc-research
+    app.kubernetes.io/managed-by: kagenti-ui
+spec:
+  image: ${REGISTRY}/rhoai-custom-research-lab/orchestrator:latest
+  port: 8100
+  replicas: 1
+  env:
+    - name: LLM_BASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: doc-research-secret
+          key: LLM_BASE_URL
+    - name: LLM_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: doc-research-secret
+          key: LLM_API_KEY
+    - name: LLM_MODEL
+      value: granite-3.3-8b-instruct
+    - name: DOC_PROCESSOR_URL
+      value: http://doc-processor:8101
+    - name: RESEARCHER_URL
+      value: http://researcher:8102
+    - name: WRITER_URL
+      value: http://writer:8103
+    - name: REVIEWER_URL
+      value: http://reviewer:8104
+---
+apiVersion: kagenti.io/v1alpha1
+kind: Component
+metadata:
+  name: doc-processor
+  namespace: doc-research-lab
+  labels:
+    kagenti.io/type: agent
+    kagenti.io/framework: LangGraph
+    protocol.kagenti.io/a2a: ""
+    app.kubernetes.io/name: doc-processor
+    app.kubernetes.io/part-of: doc-research
+    app.kubernetes.io/managed-by: kagenti-ui
+spec:
+  image: ${REGISTRY}/rhoai-custom-research-lab/doc_processor:latest
+  port: 8101
+  replicas: 1
+  env:
+    - name: PGVECTOR_HOST
+      value: postgresql
+    - name: PGVECTOR_PORT
+      value: "5432"
+    - name: PGVECTOR_DB
+      value: doc_research
+    - name: PGVECTOR_USER
+      valueFrom:
+        secretKeyRef:
+          name: doc-research-secret
+          key: PGVECTOR_USER
+    - name: PGVECTOR_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: doc-research-secret
+          key: PGVECTOR_PASSWORD
+    - name: EMBEDDING_BASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: doc-research-secret
+          key: EMBEDDING_BASE_URL
+    - name: EMBEDDING_MODEL
+      value: granite-embedding-278m-multilingual
+---
+apiVersion: kagenti.io/v1alpha1
+kind: Component
+metadata:
+  name: researcher
+  namespace: doc-research-lab
+  labels:
+    kagenti.io/type: agent
+    kagenti.io/framework: LangGraph
+    protocol.kagenti.io/a2a: ""
+    app.kubernetes.io/name: researcher
+    app.kubernetes.io/part-of: doc-research
+    app.kubernetes.io/managed-by: kagenti-ui
+spec:
+  image: ${REGISTRY}/rhoai-custom-research-lab/researcher:latest
+  port: 8102
+  replicas: 1
+  env:
+    - name: PGVECTOR_HOST
+      value: postgresql
+    - name: PGVECTOR_PORT
+      value: "5432"
+    - name: PGVECTOR_DB
+      value: doc_research
+    - name: PGVECTOR_USER
+      valueFrom:
+        secretKeyRef:
+          name: doc-research-secret
+          key: PGVECTOR_USER
+    - name: PGVECTOR_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: doc-research-secret
+          key: PGVECTOR_PASSWORD
+    - name: LLM_BASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: doc-research-secret
+          key: LLM_BASE_URL
+    - name: LLM_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: doc-research-secret
+          key: LLM_API_KEY
+    - name: LLM_MODEL
+      value: granite-3.3-8b-instruct
+    - name: EMBEDDING_BASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: doc-research-secret
+          key: EMBEDDING_BASE_URL
+    - name: EMBEDDING_MODEL
+      value: granite-embedding-278m-multilingual
+---
+apiVersion: kagenti.io/v1alpha1
+kind: Component
+metadata:
+  name: writer
+  namespace: doc-research-lab
+  labels:
+    kagenti.io/type: agent
+    kagenti.io/framework: LangGraph
+    protocol.kagenti.io/a2a: ""
+    app.kubernetes.io/name: writer
+    app.kubernetes.io/part-of: doc-research
+    app.kubernetes.io/managed-by: kagenti-ui
+spec:
+  image: ${REGISTRY}/rhoai-custom-research-lab/writer:latest
+  port: 8103
+  replicas: 1
+  env:
+    - name: LLM_BASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: doc-research-secret
+          key: LLM_BASE_URL
+    - name: LLM_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: doc-research-secret
+          key: LLM_API_KEY
+    - name: LLM_MODEL
+      value: granite-3.3-8b-instruct
+---
+apiVersion: kagenti.io/v1alpha1
+kind: Component
+metadata:
+  name: reviewer
+  namespace: doc-research-lab
+  labels:
+    kagenti.io/type: agent
+    kagenti.io/framework: LangGraph
+    protocol.kagenti.io/a2a: ""
+    app.kubernetes.io/name: reviewer
+    app.kubernetes.io/part-of: doc-research
+    app.kubernetes.io/managed-by: kagenti-ui
+spec:
+  image: ${REGISTRY}/rhoai-custom-research-lab/reviewer:latest
+  port: 8104
+  replicas: 1
+  env:
+    - name: LLM_BASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: doc-research-secret
+          key: LLM_BASE_URL
+    - name: LLM_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: doc-research-secret
+          key: LLM_API_KEY
+    - name: LLM_MODEL
+      value: granite-3.3-8b-instruct
