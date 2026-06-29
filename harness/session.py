@@ -51,6 +51,11 @@ class ResearchSession:
     total_cost: float = 0.0
     failure_log: list[dict] = field(default_factory=list)
 
+    # Sectioned report (used when SECTIONED_REPORT=true)
+    report_sections: list[dict] = field(default_factory=list)
+    section_order: list[str] = field(default_factory=list)
+    failing_sections: list[str] = field(default_factory=list)
+
     # Control
     status: str = "initialized"  # initialized|planning|researching|writing|verifying|complete|failed
     quality_score: float = 0.0

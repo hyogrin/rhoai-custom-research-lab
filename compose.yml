@@ -48,6 +48,23 @@ services:
       echo 'Bucket created successfully';
       "
 
+  searxng:
+    image: dandehoon/searxng-mcp:latest
+    container_name: doc-research-searxng
+    environment:
+      SEARXNG_MCP_TRANSPORT: "http"
+      SEARXNG_MCP_PATH: "/mcp"
+      SEARXNG_MCP_MAX_RESULTS: "10"
+      SEARXNG_LANGUAGE: "en"
+    ports:
+      - "8888:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
 volumes:
   pgdata:
   minio_data:

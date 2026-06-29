@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 DOC_MCP_URL = os.getenv("DOC_MCP_URL", "http://localhost:9001")
 SEARCH_MCP_URL = os.getenv("SEARCH_MCP_URL", "http://localhost:9002")
 ANALYSIS_MCP_URL = os.getenv("ANALYSIS_MCP_URL", "http://localhost:9003")
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8888")
 
 PG_HOST = os.getenv("PGVECTOR_HOST", "localhost")
 PG_PORT = os.getenv("PGVECTOR_PORT", "5432")
@@ -182,6 +183,36 @@ def semantic_search(query: str, top_k: int = 5) -> list[dict]:
     return results
 
 
+def web_search(query: str, num_results: int = 5) -> list[dict]:
+    """Search the web via SearXNG. Returns list of {title, url, content}.
+
+    Gracefully returns empty list if SearXNG is unavailable.
+    """
+    try:
+        client = _httpx.Client(
+            verify=_VERIFY_SSL if _VERIFY_SSL else False,
+            timeout=_httpx.Timeout(15.0),
+        )
+        resp = client.get(
+            f"{SEARXNG_URL}/search",
+            params={"q": query, "format": "json", "engines": "google,duckduckgo"},
+        )
+        client.close()
+        resp.raise_for_status()
+        data = resp.json()
+        results = []
+        for r in data.get("results", [])[:num_results]:
+            results.append({
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "content": r.get("content", ""),
+            })
+        return results
+    except Exception as e:
+        logger.warning("Web search failed: %s", e)
+        return []
+
+
 def rewrite_query(query: str) -> list[str]:
     """Rewrite a query into multiple search-optimized sub-queries."""
     content, _ = _call_llm_with_retry(
@@ -243,11 +274,14 @@ def synthesize_context(query: str, passages: list[dict]) -> dict:
     }
 
 
-def generate_plan(query: str, iteration: int, failure_hints: str, existing_context: str) -> dict:
+def generate_plan(query: str, iteration: int, failure_hints: str, existing_context: str, enable_web_search: bool = False) -> dict:
     """Generate a structured research plan."""
+    actions = "search|analyze|compare|validate"
+    if enable_web_search:
+        actions += "|web_search"
     system_content = (
         "You are a research planner. Return ONLY a JSON array (no other text). "
-        "Each element: {\"action\": \"search|analyze|compare|validate\", \"query\": \"...\", \"purpose\": \"...\"}. "
+        f"Each element: {{\"action\": \"{actions}\", \"query\": \"...\", \"purpose\": \"...\"}}. "
         f"This is iteration {iteration}. Generate 2-3 steps."
     )
     if failure_hints:
@@ -267,6 +301,150 @@ def generate_plan(query: str, iteration: int, failure_hints: str, existing_conte
         if isinstance(parsed, list):
             return {"plan": parsed, "tokens_used": tokens}
     return {"plan": [{"action": "search", "query": query, "purpose": "Direct search"}], "tokens_used": tokens}
+
+
+def generate_sectioned_plan(query: str, iteration: int, failure_hints: str, existing_context: str, language_instruction: str = "", enable_web_search: bool = False) -> dict:
+    """Decompose a research query into 2-5 sub-topics, each with search queries.
+
+    Returns a dict with 'sub_topics' (list) and 'tokens_used' (int).
+    The plan is compatible with per-section writing in execute_sections().
+    """
+    web_note = ""
+    if enable_web_search:
+        web_note = (
+            "- You may include web search queries prefixed with 'web:' for topics that "
+            "benefit from up-to-date web information\n"
+        )
+    system_content = (
+        "You are a research planner. Given a research question, decompose it into "
+        "2-5 sub-topics for a structured report. "
+        "Return ONLY a JSON object (no other text) with this shape:\n"
+        '{"sub_topics": [{"title": "...", "queries": ["search query 1", "..."], "purpose": "..."}], '
+        '"summary_query": "one-line summary of the full research"}\n\n'
+        "Rules:\n"
+        "- Each sub_topic has a clear title, 1-3 search queries, and a purpose\n"
+        "- Sub-topics should cover the question comprehensively without overlap\n"
+        "- Order sub-topics logically (background first, analysis later)\n"
+        f"{web_note}"
+        f"- This is iteration {iteration}. Adjust the plan based on any hints below."
+    )
+    if failure_hints:
+        system_content += f"\n\nAvoid these past issues:\n{failure_hints[:500]}"
+    if existing_context:
+        system_content += f"\n\nContext gathered so far:\n{existing_context[:800]}"
+    if language_instruction:
+        system_content += f"\n\n{language_instruction}"
+
+    content, tokens = _call_llm_with_retry(
+        messages=[
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": query},
+        ],
+        max_tokens=_MAX_TOKEN_MEDIUM,
+    )
+    if content:
+        parsed = _extract_json(content)
+        if isinstance(parsed, dict) and "sub_topics" in parsed:
+            return {"sub_topics": parsed["sub_topics"], "summary_query": parsed.get("summary_query", query), "tokens_used": tokens}
+        if isinstance(parsed, list):
+            sub_topics = []
+            for item in parsed:
+                if isinstance(item, dict) and "title" in item:
+                    sub_topics.append(item)
+            if sub_topics:
+                return {"sub_topics": sub_topics, "summary_query": query, "tokens_used": tokens}
+    return {
+        "sub_topics": [{"title": "Research Report", "queries": [query], "purpose": "Comprehensive analysis"}],
+        "summary_query": query,
+        "tokens_used": tokens,
+    }
+
+
+def draft_section(query: str, sub_topic: dict, search_context: list[dict], previous_content: str = "", improvement_hints: str = "", language_instruction: str = "") -> dict:
+    """Draft a single report section for one sub-topic.
+
+    Similar to draft_report() but scoped to one section with its own context.
+    """
+    title = sub_topic.get("title", "Section")
+    purpose = sub_topic.get("purpose", "")
+
+    system_prompt = (
+        f"You are a research report writer. Write the section titled \"{title}\" "
+        f"for a larger research report.\n"
+        f"Purpose of this section: {purpose}\n\n"
+        "Guidelines:\n"
+        "- Write ONLY this section (do not include executive summary or conclusion for the whole report)\n"
+        "- Start with a ## heading matching the section title\n"
+        "- Include citations as [Source N] referencing the provided context\n"
+        "- Be thorough but focused on this sub-topic only\n"
+        "- Use clear structure with sub-headings (###) if needed"
+    )
+    if language_instruction:
+        system_prompt += f"\n\n{language_instruction}"
+
+    context_text = "\n\n".join(
+        f"[Source {i+1}: {c.get('document_name', c.get('source', 'unknown'))}]\n{c.get('content', '')[:600]}"
+        for i, c in enumerate(search_context[:8])
+    )
+
+    user_content = f"Research Question: {query}\n\nSection: {title}\n\nContext:\n{context_text}"
+    if previous_content:
+        user_content += f"\n\nPrevious version (improve upon):\n{previous_content[:800]}"
+    if improvement_hints:
+        user_content += f"\n\nImprovements needed:\n{improvement_hints[:300]}"
+
+    content, tokens = _call_llm_with_retry(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        max_tokens=_MAX_TOKEN_LARGE,
+        attempts=3,
+    )
+    if content.strip():
+        return {"content": content, "tokens_used": tokens}
+    return {"content": f"## {title}\n\nSection generation failed.", "tokens_used": 0}
+
+
+def assemble_report(sections: list[dict], section_order: list[str], query: str, language_instruction: str = "") -> dict:
+    """Concatenate completed sections into a full report with an executive summary.
+
+    Generates a brief executive summary via LLM, then appends all sections in order.
+    """
+    ordered_contents = []
+    for title in section_order:
+        section = next((s for s in sections if s.get("sub_topic") == title), None)
+        if section and section.get("content"):
+            ordered_contents.append(section["content"])
+
+    if not ordered_contents:
+        return {"draft": "No sections were generated.", "tokens_used": 0}
+
+    body = "\n\n".join(ordered_contents)
+
+    system_prompt = (
+        "You are a research report editor. Given the section contents below, "
+        "write ONLY a brief Executive Summary (3-5 sentences) that synthesizes "
+        "the key findings across all sections. Do NOT repeat the sections."
+    )
+    if language_instruction:
+        system_prompt += f"\n\n{language_instruction}"
+
+    summary_content, tokens = _call_llm_with_retry(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Research Question: {query}\n\nSections:\n{body[:3000]}"},
+        ],
+        max_tokens=_MAX_TOKEN_MEDIUM,
+        attempts=2,
+    )
+
+    if summary_content.strip():
+        full_report = f"# Executive Summary\n\n{summary_content}\n\n{body}"
+    else:
+        full_report = body
+
+    return {"draft": full_report, "tokens_used": tokens}
 
 
 def draft_report(query: str, context: str, plan: str, previous_draft: str = "", improvement_hints: str = "", language_instruction: str = "") -> dict:

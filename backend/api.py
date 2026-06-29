@@ -45,6 +45,10 @@ class ResearchRequest(BaseModel):
     quality_threshold: float = 7.0
     max_iterations: int = 3
     language_instruction: str = "You MUST respond entirely in English."
+    enable_web_search: bool = True
+    enable_planning: bool = True
+    enable_fact_check: bool = True
+    enable_parallel: bool = True
 
 
 UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "rhoai_uploads")
@@ -67,7 +71,8 @@ def _emit_sub_events(node_name: str, state_update: dict, session: ResearchSessio
             "event": "step",
             "phase": "normalize",
             "icon": "🔄",
-            "title": "[Harness] Research session initialized",
+            "title": "[Harness][Orchestrator] Research session initialized",
+            "agent": "Orchestrator",
             "detail": f"Query: \"{session.query[:120]}\"",
         })
         hints = state_update.get("failure_hints", "")
@@ -76,79 +81,155 @@ def _emit_sub_events(node_name: str, state_update: dict, session: ResearchSessio
                 "event": "step",
                 "phase": "normalize",
                 "icon": "💡",
-                "title": "[Harness] Loaded past failure memory",
+                "title": "[Harness][Orchestrator] Loaded past failure memory",
+                "agent": "Orchestrator",
                 "detail": hints[:200],
             })
 
     elif node_name == "plan":
         plan = state_update.get("research_plan", [])
-        events.append({
-            "event": "step",
-            "phase": "plan",
-            "icon": "📋",
-            "title": f"[Plan] Research plan generated ({len(plan)} steps)",
-            "detail": "",
-        })
-        for i, step in enumerate(plan, 1):
-            action = step.get("action", "search")
-            query = step.get("query", "")
-            icon = {"search": "🔍", "analyze": "🧪", "compare": "⚖️"}.get(action, "📌")
+        section_order = state_update.get("section_order", [])
+        is_sectioned = bool(section_order)
+
+        if is_sectioned:
             events.append({
                 "event": "step",
                 "phase": "plan",
-                "icon": icon,
-                "title": f"[Plan] Step {i}: [{action}] {query[:80]}",
-                "detail": step.get("purpose", ""),
+                "icon": "📋",
+                "title": f"[Plan][Planner] Sectioned research plan — {len(plan)} sub-topics",
+                "agent": "Planner",
+                "detail": "",
             })
-
-    elif node_name == "execute":
-        ctx = state_update.get("accumulated_context", [])
-        new_ctx = [c for c in ctx if c.get("iteration") == iteration]
-
-        search_results = [c for c in new_ctx if c.get("source", "").startswith(("search", "semantic")) or "[" in c.get("source", "")]
-        synth_results = [c for c in new_ctx if c.get("source") == "synthesis"]
-
-        if search_results:
-            sources = set()
-            for r in search_results:
-                src = r.get("source", "")
-                doc_name = src.split("[")[0] if "[" in src else src
-                sources.add(doc_name)
-            events.append({
-                "event": "step",
-                "phase": "execute",
-                "icon": "🔍",
-                "title": f"[Tool-Search] {len(search_results)} chunks retrieved",
-                "detail": f"Sources: {', '.join(list(sources)[:5])}",
-            })
-
-        if synth_results:
-            events.append({
-                "event": "step",
-                "phase": "execute",
-                "icon": "🧠",
-                "title": "[Researching] Context synthesized",
-                "detail": synth_results[-1].get("content", "")[:150],
-            })
-
-        draft = state_update.get("current_draft", "")
-        if draft:
-            draft_preview = draft[:200].replace("\n", " ")
-            events.append({
-                "event": "step",
-                "phase": "execute",
-                "icon": "📝",
-                "title": f"[Writing] Report drafted ({len(draft):,} chars)",
-                "detail": draft_preview,
-            })
+            for i, topic in enumerate(plan, 1):
+                title = topic.get("title", "Untitled")
+                queries = topic.get("queries", [])
+                events.append({
+                    "event": "step",
+                    "phase": "plan",
+                    "icon": "📑",
+                    "title": f"[Plan][Planner] Section {i}: {title}",
+                    "agent": "Planner",
+                    "detail": f"Queries: {', '.join(q[:60] for q in queries[:3])} | {topic.get('purpose', '')}",
+                })
         else:
             events.append({
                 "event": "step",
-                "phase": "execute",
-                "icon": "⚠️",
-                "title": "[Writing] Report generation failed",
-                "detail": "Report could not be generated in this iteration.",
+                "phase": "plan",
+                "icon": "📋",
+                "title": f"[Plan][Planner] Research plan generated ({len(plan)} steps)",
+                "agent": "Planner",
+                "detail": "",
             })
+            for i, step in enumerate(plan, 1):
+                action = step.get("action", "search")
+                query = step.get("query", "")
+                icon = {"search": "🔍", "analyze": "🧪", "compare": "⚖️"}.get(action, "📌")
+                events.append({
+                    "event": "step",
+                    "phase": "plan",
+                    "icon": icon,
+                    "title": f"[Plan][Planner] Step {i}: [{action}] {query[:80]}",
+                    "agent": "Planner",
+                    "detail": step.get("purpose", ""),
+                })
+
+    elif node_name == "execute":
+        report_sections = state_update.get("report_sections", [])
+        is_sectioned = bool(report_sections)
+
+        if is_sectioned:
+            for section in report_sections:
+                if section.get("status") == "drafted":
+                    sub_topic = section.get("sub_topic", "")
+                    content = section.get("content", "")
+                    events.append({
+                        "event": "step",
+                        "phase": "execute",
+                        "icon": "📝",
+                        "title": f"[Writing][Writer] Section drafted: {sub_topic}",
+                        "agent": "Writer",
+                        "detail": content[:150].replace("\n", " "),
+                    })
+                    events.append({
+                        "event": "section",
+                        "sub_topic": sub_topic,
+                        "content": content,
+                    })
+
+            draft = state_update.get("current_draft", "")
+            if draft:
+                events.append({
+                    "event": "step",
+                    "phase": "execute",
+                    "icon": "📋",
+                    "title": f"[Writing][Writer] Full report assembled ({len(draft):,} chars, {len(report_sections)} sections)",
+                    "agent": "Writer",
+                    "detail": "",
+                })
+        else:
+            ctx = state_update.get("accumulated_context", [])
+            new_ctx = [c for c in ctx if c.get("iteration") == iteration]
+
+            web_results = [c for c in new_ctx if c.get("source", "").startswith("web:")]
+            search_results = [c for c in new_ctx if not c.get("source", "").startswith("web:") and (c.get("source", "").startswith(("search", "semantic")) or "[" in c.get("source", ""))]
+            synth_results = [c for c in new_ctx if c.get("source") == "synthesis"]
+
+            if web_results:
+                urls = [c.get("metadata", {}).get("url", "") for c in web_results if c.get("metadata", {}).get("url")]
+                events.append({
+                    "event": "step",
+                    "phase": "execute",
+                    "icon": "🌐",
+                    "title": f"[Web Search][Researcher] Web search: {len(web_results)} results",
+                    "agent": "Researcher",
+                    "detail": ", ".join(urls[:3]),
+                })
+
+            if search_results:
+                sources = set()
+                for r in search_results:
+                    src = r.get("source", "")
+                    doc_name = src.split("[")[0] if "[" in src else src
+                    sources.add(doc_name)
+                events.append({
+                    "event": "step",
+                    "phase": "execute",
+                    "icon": "🔍",
+                    "title": f"[Tool-Search][Researcher] {len(search_results)} chunks retrieved",
+                    "agent": "Researcher",
+                    "detail": f"Sources: {', '.join(list(sources)[:5])}",
+                })
+
+            if synth_results:
+                events.append({
+                    "event": "step",
+                    "phase": "execute",
+                    "icon": "🧠",
+                    "title": "[Researching][Researcher] Context synthesized",
+                    "agent": "Researcher",
+                    "detail": synth_results[-1].get("content", "")[:150],
+                })
+
+            draft = state_update.get("current_draft", "")
+            if draft:
+                draft_preview = draft[:200].replace("\n", " ")
+                events.append({
+                    "event": "step",
+                    "phase": "execute",
+                    "icon": "📝",
+                    "title": f"[Writing][Writer] Report drafted ({len(draft):,} chars)",
+                    "agent": "Writer",
+                    "detail": draft_preview,
+                })
+            else:
+                events.append({
+                    "event": "step",
+                    "phase": "execute",
+                    "icon": "⚠️",
+                    "title": "[Writing][Writer] Report generation failed",
+                    "agent": "Writer",
+                    "detail": "Report could not be generated in this iteration.",
+                })
 
     elif node_name == "verify":
         score = state_update.get("quality_score", 0)
@@ -162,9 +243,33 @@ def _emit_sub_events(node_name: str, state_update: dict, session: ResearchSessio
             "event": "step",
             "phase": "verify",
             "icon": status_icon,
-            "title": f"[Reviewing] Quality score: {score}/10 — {'PASSED' if passed else 'needs improvement'}",
+            "title": f"[Reviewing][Reviewer] Quality score: {score}/10 — {'PASSED' if passed else 'needs improvement'}",
+            "agent": "Reviewer",
             "detail": "",
         })
+
+        failing_sections = state_update.get("failing_sections", [])
+        if failing_sections:
+            events.append({
+                "event": "step",
+                "phase": "verify",
+                "icon": "🔄",
+                "title": f"[Reviewing][Reviewer] {len(failing_sections)} section(s) need rewrite",
+                "agent": "Reviewer",
+                "detail": ", ".join(failing_sections),
+            })
+        sections = state_update.get("report_sections", [])
+        if sections:
+            passed_sections = [s["sub_topic"] for s in sections if s.get("status") == "passed"]
+            if passed_sections:
+                events.append({
+                    "event": "step",
+                    "phase": "verify",
+                    "icon": "✅",
+                    "title": f"[Reviewing][Reviewer] {len(passed_sections)} section(s) passed",
+                    "agent": "Reviewer",
+                    "detail": ", ".join(passed_sections),
+                })
 
         if details:
             breakdown = " | ".join(f"{k}: {v}" for k, v in details.items() if isinstance(v, (int, float)))
@@ -173,7 +278,8 @@ def _emit_sub_events(node_name: str, state_update: dict, session: ResearchSessio
                     "event": "step",
                     "phase": "verify",
                     "icon": "📊",
-                    "title": "[Reviewing] Score breakdown",
+                    "title": "[Reviewing][Reviewer] Score breakdown",
+                    "agent": "Reviewer",
                     "detail": breakdown,
                 })
 
@@ -182,7 +288,8 @@ def _emit_sub_events(node_name: str, state_update: dict, session: ResearchSessio
                 "event": "step",
                 "phase": "verify",
                 "icon": "💬",
-                "title": "[Reviewing] Improvement suggestions",
+                "title": "[Reviewing][Reviewer] Improvement suggestions",
+                "agent": "Reviewer",
                 "detail": " / ".join(improvements[:3]),
             })
 
@@ -191,7 +298,8 @@ def _emit_sub_events(node_name: str, state_update: dict, session: ResearchSessio
             "event": "step",
             "phase": "observe",
             "icon": "📊",
-            "title": f"[Harness] Iteration {iteration}/{max_iter} analysis recorded",
+            "title": f"[Harness][Orchestrator] Iteration {iteration}/{max_iter} analysis recorded",
+            "agent": "Orchestrator",
             "detail": state_update.get("failure_hints", "")[:150],
         })
 
@@ -201,7 +309,8 @@ def _emit_sub_events(node_name: str, state_update: dict, session: ResearchSessio
             "event": "step",
             "phase": "iterate",
             "icon": "🔁",
-            "title": f"[Harness] Starting iteration {new_iter}/{max_iter}",
+            "title": f"[Harness][Orchestrator] Starting iteration {new_iter}/{max_iter}",
+            "agent": "Orchestrator",
             "detail": "Applying improvements from previous verification feedback...",
         })
 
@@ -210,11 +319,36 @@ def _emit_sub_events(node_name: str, state_update: dict, session: ResearchSessio
             "event": "step",
             "phase": "finalize",
             "icon": "🎯",
-            "title": f"[Harness] Research complete — Quality: {session.quality_score}/10, Iterations: {iteration}",
+            "title": f"[Harness][Orchestrator] Research complete — Quality: {session.quality_score}/10, Iterations: {iteration}",
+            "agent": "Orchestrator",
             "detail": f"Total tokens used: {session.total_tokens:,}",
         })
 
     return events
+
+
+def _collect_sources(accumulated_context: list[dict]) -> list[dict]:
+    """Deduplicate and format sources from accumulated_context for citation display."""
+    seen: set[str] = set()
+    sources: list[dict] = []
+    for ctx in accumulated_context:
+        src = ctx.get("source", "")
+        if not src or src in ("synthesis",) or src in seen:
+            continue
+        seen.add(src)
+        meta = ctx.get("metadata", {})
+        entry: dict = {"source": src}
+        if src.startswith("web:"):
+            entry["type"] = "web"
+            entry["url"] = meta.get("url", src[4:])
+            entry["title"] = ctx.get("content", "").split("\n")[0][:120]
+        else:
+            entry["type"] = "document"
+            doc_name = src.split("[")[0] if "[" in src else src
+            entry["document"] = doc_name
+            entry["chunk"] = src
+        sources.append(entry)
+    return sources
 
 
 async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None]:
@@ -237,6 +371,13 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
         "total_tokens": 0,
         "total_cost": 0.0,
         "failure_hints": "",
+        "enable_web_search": getattr(session, "_enable_web_search", True),
+        "enable_planning": getattr(session, "_enable_planning", True),
+        "enable_fact_check": getattr(session, "_enable_fact_check", True),
+        "enable_parallel": getattr(session, "_enable_parallel", True),
+        "report_sections": [],
+        "section_order": [],
+        "failing_sections": [],
         "status": "normalizing",
         "final_output": "",
         "error": "",
@@ -266,6 +407,12 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
                 session.verification_history = state_update["verification_history"]
             if "total_tokens" in state_update:
                 session.total_tokens = state_update["total_tokens"]
+            if "report_sections" in state_update:
+                session.report_sections = state_update["report_sections"]
+            if "section_order" in state_update:
+                session.section_order = state_update["section_order"]
+            if "failing_sections" in state_update:
+                session.failing_sections = state_update["failing_sections"]
             session.updated_at = __import__("datetime").datetime.utcnow().isoformat()
 
             session_mgr.save(session)
@@ -283,6 +430,10 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
         session_mgr.save(session)
 
         yield _sse({"event": "content", "text": final_output})
+
+        sources = _collect_sources(session.accumulated_context)
+        if sources:
+            yield _sse({"event": "sources", "sources": sources})
 
     except Exception as exc:
         logger.exception("Error during research streaming")
@@ -302,6 +453,10 @@ async def start_research(req: ResearchRequest):
         quality_threshold=req.quality_threshold,
     )
     session.language_instruction = req.language_instruction
+    session._enable_web_search = req.enable_web_search
+    session._enable_planning = req.enable_planning
+    session._enable_fact_check = req.enable_fact_check
+    session._enable_parallel = req.enable_parallel
     session_mgr.save(session)
     logger.info("Starting research session %s for query: %s", session.session_id, req.query[:120])
     return StreamingResponse(

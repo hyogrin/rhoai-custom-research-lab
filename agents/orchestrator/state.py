@@ -37,6 +37,17 @@ class ResearchState(TypedDict):
     total_cost: float
     failure_hints: str
 
+    # Tool toggles (controlled from Chainlit settings panel)
+    enable_web_search: bool
+    enable_planning: bool
+    enable_fact_check: bool
+    enable_parallel: bool
+
+    # Sectioned report (used when SECTIONED_REPORT=true)
+    report_sections: list[dict]   # [{sub_topic, content, search_context, score, status}]
+    section_order: list[str]      # sub_topic titles in planned order
+    failing_sections: list[str]   # sub_topics to rewrite on next iteration
+
     # Control flow
     status: str  # normalizing|planning|researching|writing|verifying|observing|complete|failed
     final_output: str

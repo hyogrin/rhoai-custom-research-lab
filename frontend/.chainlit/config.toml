@@ -15,6 +15,7 @@ persistent_starters = true
 
 [UI]
 name = "Deep Research Lab"
+language = "en-US"
 show_readme_as_default = true
 description = "AI-powered custom deep research with multi-agent harness engineering on Red Hat OpenShift AI"
 default_collapse_content = true

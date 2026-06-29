@@ -228,12 +228,30 @@ def llm_as_judge(draft: str, query: str, iteration: int) -> dict:
     }
 
 
-def run_verification(draft: str, query: str, context: list[dict], iteration: int) -> dict:
-    """Run all verification checks and aggregate results."""
-    quality = quality_score(draft, query)
+def run_verification(draft: str, query: str, context: list[dict], iteration: int, enable_fact_check: bool = True, enable_parallel: bool = True) -> dict:
+    """Run all verification checks and aggregate results. Parallel when enabled."""
     citations = validate_citations(draft, context)
-    facts = fact_check(draft, context)
-    judge = llm_as_judge(draft, query, iteration)
+
+    if enable_parallel:
+        from concurrent.futures import ThreadPoolExecutor, Future
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            quality_fut: Future = pool.submit(quality_score, draft, query)
+            judge_fut: Future = pool.submit(llm_as_judge, draft, query, iteration)
+            if enable_fact_check:
+                facts_fut: Future = pool.submit(fact_check, draft, context)
+            else:
+                facts_fut = None
+
+            quality = quality_fut.result()
+            judge = judge_fut.result()
+            facts = facts_fut.result() if facts_fut is not None else {"supported_claims": 0, "unsupported_claims": 0, "hallucinations": [], "passed": True, "tokens_used": 0}
+    else:
+        quality = quality_score(draft, query)
+        judge = llm_as_judge(draft, query, iteration)
+        if enable_fact_check:
+            facts = fact_check(draft, context)
+        else:
+            facts = {"supported_claims": 0, "unsupported_claims": 0, "hallucinations": [], "passed": True, "tokens_used": 0}
 
     overall_score = judge.get("total", quality.get("overall", 5))
 
@@ -263,3 +281,57 @@ def run_verification(draft: str, query: str, context: list[dict], iteration: int
         "improvements": improvements,
         "tokens_used": total_tokens,
     }
+
+
+def verify_sections(report_sections: list[dict], query: str, quality_threshold: float = 7.0, enable_parallel: bool = True) -> list[str]:
+    """Score each report section and return titles of failing sections.
+
+    Sections with score >= 80% of threshold are marked 'passed'; others 'needs_rewrite'.
+    This is additive -- called after run_verification() on the full report.
+    """
+    section_threshold = quality_threshold * 0.8
+    failing: list[str] = []
+
+    sections_to_score = [
+        s for s in report_sections
+        if s.get("content") and s.get("status") != "passed"
+    ]
+    if not sections_to_score:
+        return failing
+
+    def _score_section(section: dict) -> tuple[dict, dict]:
+        sub_topic = section.get("sub_topic", "")
+        scores = quality_score(section["content"], f"{query} — section: {sub_topic}")
+        return section, scores
+
+    def _apply_score(section: dict, scores: dict):
+        section_score = scores.get("overall", 5)
+        section["score"] = section_score
+        sub_topic = section.get("sub_topic", "")
+        if section_score >= section_threshold:
+            section["status"] = "passed"
+        else:
+            section["status"] = "needs_rewrite"
+            failing.append(sub_topic)
+            logger.info("Section '%s' needs rewrite (score %.1f < %.1f)", sub_topic, section_score, section_threshold)
+
+    if enable_parallel:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        max_workers = min(int(os.getenv("PARALLEL_WORKERS", "4")), len(sections_to_score))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_score_section, s) for s in sections_to_score]
+            for future in as_completed(futures):
+                try:
+                    section, scores = future.result()
+                    _apply_score(section, scores)
+                except Exception as e:
+                    logger.error("Section verification failed: %s", e)
+    else:
+        for s in sections_to_score:
+            try:
+                section, scores = _score_section(s)
+                _apply_score(section, scores)
+            except Exception as e:
+                logger.error("Section verification failed: %s", e)
+
+    return failing

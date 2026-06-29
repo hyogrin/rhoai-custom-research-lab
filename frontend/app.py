@@ -80,6 +80,30 @@ async def on_chat_start():
                 initial=settings.log_sse,
                 description="ON: show all processing steps. OFF: show only the current step (compact).",
             ),
+            cl.input_widget.Switch(
+                id="enable_web_search",
+                label="Web Search",
+                initial=settings.enable_web_search,
+                description="Allow the agent to search the web for up-to-date information.",
+            ),
+            cl.input_widget.Switch(
+                id="enable_planning",
+                label="Research Planning",
+                initial=settings.enable_planning,
+                description="Generate a structured research plan before executing. OFF: search directly.",
+            ),
+            cl.input_widget.Switch(
+                id="enable_fact_check",
+                label="Fact Check",
+                initial=settings.enable_fact_check,
+                description="Cross-reference claims against source documents during verification.",
+            ),
+            cl.input_widget.Switch(
+                id="enable_parallel",
+                label="Parallel Processing",
+                initial=settings.enable_parallel,
+                description="Run multiple searches and verifications concurrently for faster results.",
+            ),
         ]
     ).send()
 
@@ -106,6 +130,14 @@ def _apply_settings(settings: ChatSettings, raw: dict):
         settings.verbose = bool(raw["verbose"])
     if "log_sse" in raw:
         settings.log_sse = bool(raw["log_sse"])
+    if "enable_web_search" in raw:
+        settings.enable_web_search = bool(raw["enable_web_search"])
+    if "enable_planning" in raw:
+        settings.enable_planning = bool(raw["enable_planning"])
+    if "enable_fact_check" in raw:
+        settings.enable_fact_check = bool(raw["enable_fact_check"])
+    if "enable_parallel" in raw:
+        settings.enable_parallel = bool(raw["enable_parallel"])
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +164,7 @@ async def chat_profiles():
         cl.ChatProfile(
             name="Korean",
             markdown_description="한국어로 리서치",
+            starters=_starters_for_language("ko-KR"),
         ),
     ]
 
@@ -295,6 +328,10 @@ async def stream_research(query: str, settings: ChatSettings, file_path: str = "
                 "quality_threshold": settings.quality_threshold,
                 "max_iterations": settings.max_iterations,
                 "language_instruction": lang_instruction,
+                "enable_web_search": settings.enable_web_search,
+                "enable_planning": settings.enable_planning,
+                "enable_fact_check": settings.enable_fact_check,
+                "enable_parallel": settings.enable_parallel,
             }
 
             async with session.post(f"{API_URL}/research", json=payload) as resp:
@@ -363,6 +400,34 @@ async def stream_research(query: str, settings: ChatSettings, file_path: str = "
         await safe_update_message(msg)
 
 
+def _format_sources(sources: list[dict]) -> str:
+    """Render a list of sources as a markdown citation block."""
+    if not sources:
+        return ""
+    lines = ["\n\n---\n\n**Sources**\n"]
+    doc_sources = [s for s in sources if s.get("type") == "document"]
+    web_sources = [s for s in sources if s.get("type") == "web"]
+
+    if doc_sources:
+        seen_docs: set[str] = set()
+        for s in doc_sources:
+            doc = s.get("document", s.get("source", ""))
+            if doc not in seen_docs:
+                seen_docs.add(doc)
+                lines.append(f"- 📄 {doc}")
+
+    if web_sources:
+        for s in web_sources:
+            url = s.get("url", "")
+            title = s.get("title", url)
+            if url:
+                lines.append(f"- 🌐 [{title}]({url})")
+            else:
+                lines.append(f"- 🌐 {title}")
+
+    return "\n".join(lines) + "\n"
+
+
 async def _close_phase(step: cl.Step | None) -> None:
     """Finalize and close an open phase step."""
     if step is not None:
@@ -392,13 +457,24 @@ async def _handle_event(
             detail = data.get("detail", "")
             status_msg.content = f"{icon} {title}" + (f"\n_{detail}_" if detail else "")
             await safe_update_message(status_msg)
+        elif event_type == "section":
+            section_content = data.get("content", "")
+            if section_content:
+                sub_topic = data.get("sub_topic", "")
+                status_msg.content = f"📝 Writing section: {sub_topic}"
+                await safe_update_message(status_msg)
+                await safe_stream_token(msg, section_content + "\n\n")
         elif event_type == "content":
             text = data.get("text", "")
             if text:
-                # Final content — clear status and stream to main message
                 status_msg.content = ""
                 await safe_update_message(status_msg)
-                await safe_stream_token(msg, text)
+                msg.content = text
+                await safe_update_message(msg)
+        elif event_type == "sources":
+            sources_md = _format_sources(data.get("sources", []))
+            if sources_md:
+                await safe_stream_token(msg, sources_md)
         elif event_type == "error":
             error_msg = data.get("message", "Unknown error")
             status_msg.content = ""
@@ -416,10 +492,24 @@ async def _handle_event(
             await safe_send_step(step)
     elif event_type == "step":
         current_phase_step = await _handle_step_event(data, msg, current_phase_step, step_mgr, settings)
+    elif event_type == "section":
+        section_content = data.get("content", "")
+        sub_topic = data.get("sub_topic", "")
+        if section_content:
+            step_name = step_mgr.get_unique_name(f"📝 Section: {sub_topic}")
+            step = cl.Step(name=step_name, type="tool")
+            step.output = section_content[:300] + ("..." if len(section_content) > 300 else "")
+            await safe_send_step(step)
+            await safe_stream_token(msg, section_content + "\n\n")
     elif event_type == "content":
         text = data.get("text", "")
         if text:
-            await safe_stream_token(msg, text)
+            msg.content = text
+            await safe_update_message(msg)
+    elif event_type == "sources":
+        sources_md = _format_sources(data.get("sources", []))
+        if sources_md:
+            await safe_stream_token(msg, sources_md)
     elif event_type == "error":
         error_msg = data.get("message", "Unknown error")
         await safe_stream_token(msg, f"\n\n❌ {error_msg}")

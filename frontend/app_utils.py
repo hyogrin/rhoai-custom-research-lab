@@ -20,6 +20,10 @@ class ChatSettings:
         self.verbose: bool = True
         self.log_sse: bool = False  # True: accumulate all steps, False: show only current step
         self.language: str = "en-US"  # en-US or ko-KR
+        self.enable_web_search: bool = True
+        self.enable_planning: bool = True
+        self.enable_fact_check: bool = True
+        self.enable_parallel: bool = True
 
 
 class StepNameManager:
