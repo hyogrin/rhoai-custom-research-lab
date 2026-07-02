@@ -183,14 +183,45 @@ def semantic_search(query: str, top_k: int = 5) -> list[dict]:
     return results
 
 
+_searxng_available: bool | None = None
+_searxng_checked_at: float = 0.0
+_SEARXNG_RETRY_INTERVAL = 60.0
+
+
+def _check_searxng() -> bool:
+    """Probe SearXNG with TTL-based caching. Retries after 60s on failure."""
+    global _searxng_available, _searxng_checked_at
+    now = _time.time()
+    if _searxng_available is not None:
+        if _searxng_available or (now - _searxng_checked_at < _SEARXNG_RETRY_INTERVAL):
+            return _searxng_available
+    _searxng_checked_at = now
+    verify = not SEARXNG_URL.startswith("https://") or _VERIFY_SSL
+    try:
+        client = _httpx.Client(verify=verify, timeout=_httpx.Timeout(5.0))
+        resp = client.get(f"{SEARXNG_URL}/search", params={"q": "test", "format": "json"})
+        client.close()
+        _searxng_available = resp.status_code == 200
+    except Exception:
+        _searxng_available = False
+    if not _searxng_available:
+        logger.warning("SearXNG not available at %s — will retry in %ds", SEARXNG_URL, int(_SEARXNG_RETRY_INTERVAL))
+    else:
+        logger.info("SearXNG available at %s", SEARXNG_URL)
+    return _searxng_available
+
+
 def web_search(query: str, num_results: int = 5) -> list[dict]:
     """Search the web via SearXNG. Returns list of {title, url, content}.
 
     Gracefully returns empty list if SearXNG is unavailable.
     """
+    if not _check_searxng():
+        return []
     try:
+        verify = not SEARXNG_URL.startswith("https://") or _VERIFY_SSL
         client = _httpx.Client(
-            verify=_VERIFY_SSL if _VERIFY_SSL else False,
+            verify=verify,
             timeout=_httpx.Timeout(15.0),
         )
         resp = client.get(

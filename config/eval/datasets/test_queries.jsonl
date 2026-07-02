@@ -1,0 +1,10 @@
+{"query": "What is the main architecture described in the paper?", "expected_topics": ["architecture", "design", "components"]}
+{"query": "What are the key contributions and innovations?", "expected_topics": ["contributions", "novelty", "improvements"]}
+{"query": "How does the system handle document parsing and conversion?", "expected_topics": ["parsing", "docling", "conversion", "chunking"]}
+{"query": "What evaluation metrics are used and what are the results?", "expected_topics": ["evaluation", "metrics", "performance", "results"]}
+{"query": "What are the limitations and future work directions?", "expected_topics": ["limitations", "future work", "challenges"]}
+{"query": "Compare the retrieval strategies used in the system", "expected_topics": ["retrieval", "semantic search", "comparison"]}
+{"query": "Explain the quality verification process", "expected_topics": ["verification", "quality", "LLM-as-Judge", "scoring"]}
+{"query": "How does the multi-agent orchestration work?", "expected_topics": ["orchestration", "agents", "workflow", "coordination"]}
+{"query": "What security considerations are addressed?", "expected_topics": ["security", "authentication", "authorization"]}
+{"query": "Summarize the deployment requirements", "expected_topics": ["deployment", "infrastructure", "requirements"]}

@@ -141,7 +141,7 @@ def plan_node(state: ResearchState) -> dict:
         c.get("content", "")[:200] for c in (state.get("accumulated_context") or [])[-5:]
     )
 
-    use_sections = os.getenv("SECTIONED_REPORT", "").lower() == "true"
+    use_sections = state.get("enable_sectioned", False)
 
     ws_flag = state.get("enable_web_search", False)
 
@@ -211,9 +211,9 @@ def _process_one_section(
     if parallel:
         futures_map: dict = {}
         with ThreadPoolExecutor(max_workers=_PARALLEL_WORKERS) as pool:
-            for q in queries[:3]:
+            for idx, q in enumerate(queries[:3]):
                 futures_map[pool.submit(_run_semantic, q, iteration)] = ("semantic", q)
-                if ws_flag:
+                if ws_flag and idx == 0:
                     futures_map[pool.submit(_run_web, q, iteration)] = ("web", q)
 
             for future in as_completed(futures_map):
@@ -226,11 +226,11 @@ def _process_one_section(
                 except Exception as e:
                     logger.error("Section '%s' search (%s) failed: %s", title, kind, e)
     else:
-        for q in queries[:3]:
+        for idx, q in enumerate(queries[:3]):
             for r in _run_semantic(q, iteration):
                 r.setdefault("metadata", {})["sub_topic"] = title
                 section_context.append(r)
-            if ws_flag:
+            if ws_flag and idx == 0:
                 for r in _run_web(q, iteration):
                     r.setdefault("metadata", {})["sub_topic"] = title
                     section_context.append(r)
@@ -322,8 +322,8 @@ def _execute_sections(state: ResearchState) -> dict:
                     title = topic.get("title", "Untitled")
                     logger.error("Section '%s' failed: %s", title, e)
                     sections.append({
-                        "sub_topic": title, "content": f"## {title}\n\nSection generation failed: {e}",
-                        "search_context": [], "score": 0.0, "status": "drafted",
+                        "sub_topic": title, "content": "",
+                        "search_context": [], "score": 0.0, "status": "failed",
                     })
     else:
         for topic in topics_to_process:
@@ -333,8 +333,8 @@ def _execute_sections(state: ResearchState) -> dict:
                 title = topic.get("title", "Untitled")
                 logger.error("Section '%s' failed: %s", title, e)
                 sections.append({
-                    "sub_topic": title, "content": f"## {title}\n\nSection generation failed: {e}",
-                    "search_context": [], "score": 0.0, "status": "drafted",
+                    "sub_topic": title, "content": "",
+                    "search_context": [], "score": 0.0, "status": "failed",
                 })
 
     report_result = assemble_report(
@@ -374,7 +374,7 @@ def _run_semantic(query: str, iteration: int) -> list[dict]:
 def _run_web(query: str, iteration: int) -> list[dict]:
     """Run a single web_search and return context entries. Thread-safe."""
     entries: list[dict] = []
-    for wr in web_search(query, num_results=5):
+    for wr in web_search(query, num_results=3):
         entries.append({
             "iteration": iteration,
             "source": f"web:{wr.get('url', '')}",
@@ -389,7 +389,7 @@ def execute_node(state: ResearchState) -> dict:
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     use_sections = (
-        os.getenv("SECTIONED_REPORT", "").lower() == "true"
+        state.get("enable_sectioned", False)
         and bool(state.get("section_order"))
     )
     if use_sections:
@@ -612,30 +612,63 @@ def iterate_node(state: ResearchState) -> dict:
 
 
 def finalize_node(state: ResearchState) -> dict:
-    """Finalize the research output."""
+    """Finalize the research output.
+
+    For sectioned reports: concatenate original section texts in order and
+    prepend the executive summary. This preserves the full section content
+    that was streamed to the UI — the LLM-assembled draft is only used for
+    verification scoring.
+    """
     observer = _get_observer(state["session_id"])
     summary = observer.get_summary()
-
-    # Persist observability data
     observer.persist()
+    total_cost = summary.get("total_cost", 0.0)
+    logger.info(
+        "Session %s summary: %s",
+        state.get("session_id", ""),
+        json.dumps(summary.get("metrics", {}), default=str)[:500],
+    )
 
-    draft = state.get("current_draft", "")
     score = state.get("quality_score", 0)
     iterations = state.get("iteration", 0)
 
-    output = (
-        f"{draft}\n\n"
-        f"---\n"
+    sections = state.get("report_sections") or []
+    section_order = state.get("section_order") or []
+
+    if sections and section_order:
+        ordered_parts: list[str] = []
+        for title in section_order:
+            sec = next((s for s in sections if s.get("sub_topic") == title), None)
+            if sec and sec.get("content"):
+                ordered_parts.append(sec["content"])
+        body = "\n\n".join(ordered_parts)
+
+        draft = state.get("current_draft", "")
+        exec_summary = ""
+        if draft and "# Executive Summary" in draft:
+            summary_end = draft.find("\n\n", draft.find("# Executive Summary") + 20)
+            if summary_end > 0:
+                exec_summary = draft[: summary_end].strip()
+
+        if exec_summary:
+            output = f"{exec_summary}\n\n---\n\n{body}"
+        else:
+            output = body
+    else:
+        output = state.get("current_draft", "")
+
+    output += (
+        f"\n\n---\n"
         f"*Research completed in {iterations} iteration(s) | "
         f"Quality score: {score}/10 | "
-        f"Total tokens: {state.get('total_tokens', 0)}*"
+        f"Total tokens: {state.get('total_tokens', 0):,}*"
     )
 
-    # Clean up observer
     _observers.pop(state.get("session_id", ""), None)
 
     update = {
         "final_output": output,
+        "total_cost": total_cost,
         "status": "complete",
     }
     checkpoint_session({**state, **update})
@@ -713,6 +746,7 @@ async def orchestrator(input: Message, context: RunContext):
         "enable_planning": True,
         "enable_fact_check": True,
         "enable_parallel": True,
+        "enable_sectioned": True,
         "report_sections": [],
         "section_order": [],
         "failing_sections": [],

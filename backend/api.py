@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from prometheus_fastapi_instrumentator import Instrumentator
 
 load_dotenv()
 
@@ -22,11 +23,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from harness.session import SessionManager, ResearchSession
 from agents.orchestrator.agent import orchestrator_graph
+from backend.metrics import (
+    active_research_sessions,
+    research_sessions_total,
+    research_quality_score,
+    documents_processed_total,
+)
+from backend.observability import init_mlflow
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="RHOAI Deep Research API", version="0.1.0")
+
+Instrumentator().instrument(app).expose(app)
+init_mlflow()
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,12 +54,13 @@ class ResearchRequest(BaseModel):
     query: str
     file_path: str = ""
     quality_threshold: float = 7.0
-    max_iterations: int = 3
+    max_iterations: int = 2
     language_instruction: str = "You MUST respond entirely in English."
     enable_web_search: bool = True
     enable_planning: bool = True
     enable_fact_check: bool = True
     enable_parallel: bool = True
+    enable_sectioned: bool = True
 
 
 UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "rhoai_uploads")
@@ -138,6 +150,38 @@ def _emit_sub_events(node_name: str, state_update: dict, session: ResearchSessio
         is_sectioned = bool(report_sections)
 
         if is_sectioned:
+            ctx = state_update.get("accumulated_context", [])
+            new_ctx = [c for c in ctx if c.get("iteration") == iteration]
+
+            web_results = [c for c in new_ctx if c.get("source", "").startswith("web:")]
+            search_results = [c for c in new_ctx if not c.get("source", "").startswith("web:") and c.get("source") != "synthesis" and "[" in c.get("source", "")]
+
+            if search_results:
+                sources = set()
+                for r in search_results:
+                    src = r.get("source", "")
+                    doc_name = src.split("[")[0] if "[" in src else src
+                    sources.add(doc_name)
+                events.append({
+                    "event": "step",
+                    "phase": "execute",
+                    "icon": "🔍",
+                    "title": f"[Tool-Search][Researcher] {len(search_results)} chunks retrieved",
+                    "agent": "Researcher",
+                    "detail": f"Sources: {', '.join(list(sources)[:5])}",
+                })
+
+            if web_results:
+                urls = [c.get("metadata", {}).get("url", "") for c in web_results if c.get("metadata", {}).get("url")]
+                events.append({
+                    "event": "step",
+                    "phase": "execute",
+                    "icon": "🌐",
+                    "title": f"[Web Search][Researcher] Web search: {len(web_results)} results",
+                    "agent": "Researcher",
+                    "detail": ", ".join(urls[:3]),
+                })
+
             for section in report_sections:
                 if section.get("status") == "drafted":
                     sub_topic = section.get("sub_topic", "")
@@ -375,6 +419,7 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
         "enable_planning": getattr(session, "_enable_planning", True),
         "enable_fact_check": getattr(session, "_enable_fact_check", True),
         "enable_parallel": getattr(session, "_enable_parallel", True),
+        "enable_sectioned": getattr(session, "_enable_sectioned", True),
         "report_sections": [],
         "section_order": [],
         "failing_sections": [],
@@ -431,12 +476,25 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
 
         yield _sse({"event": "content", "text": final_output})
 
+        active_research_sessions.dec()
+        research_sessions_total.labels(status="completed").inc()
+        research_quality_score.observe(session.quality_score)
+
+        yield _sse({
+            "event": "metadata",
+            "iterations": session.iteration,
+            "quality_score": session.quality_score,
+            "total_tokens": session.total_tokens,
+        })
+
         sources = _collect_sources(session.accumulated_context)
         if sources:
             yield _sse({"event": "sources", "sources": sources})
 
     except Exception as exc:
         logger.exception("Error during research streaming")
+        active_research_sessions.dec()
+        research_sessions_total.labels(status="failed").inc()
         session.status = "failed"
         session_mgr.save(session)
         yield _sse({"event": "error", "message": f"Research error: {exc}", "phase": "error"})
@@ -457,7 +515,10 @@ async def start_research(req: ResearchRequest):
     session._enable_planning = req.enable_planning
     session._enable_fact_check = req.enable_fact_check
     session._enable_parallel = req.enable_parallel
+    session._enable_sectioned = req.enable_sectioned
     session_mgr.save(session)
+    active_research_sessions.inc()
+    research_sessions_total.labels(status="started").inc()
     logger.info("Starting research session %s for query: %s", session.session_id, req.query[:120])
     return StreamingResponse(
         _stream_research(session),
@@ -617,6 +678,7 @@ def _process_documents_background(upload_id: str, file_paths: list[str]):
             cur.close()
             conn.close()
             total_chunks_stored += len(chunks)
+            documents_processed_total.labels(status="success").inc()
             logger.info("Document stored: %s → %d chunks", filename, len(chunks))
 
         _upload_status[upload_id] = {
@@ -628,6 +690,7 @@ def _process_documents_background(upload_id: str, file_paths: list[str]):
             "files": filenames,
         }
     except Exception as e:
+        documents_processed_total.labels(status="error").inc()
         logger.exception("Background document processing failed for upload %s", upload_id)
         _upload_status[upload_id] = {
             "upload_id": upload_id,

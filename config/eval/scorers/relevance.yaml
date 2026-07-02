@@ -1,0 +1,7 @@
+name: relevance
+type: mlflow.metrics.genai.relevance
+description: Measures how relevant the response is to the query
+model: ${LLM_MODEL}
+threshold: 0.7
+parameters:
+  max_tokens: 512

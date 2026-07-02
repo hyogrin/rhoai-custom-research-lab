@@ -1,0 +1,20 @@
+evaluation:
+  experiment_name: deep-research-eval
+  quality_threshold: 7.0
+  max_iterations: 3
+  model: ${LLM_MODEL}
+
+scorers:
+  - name: relevance
+    type: mlflow.metrics.genai.relevance
+    threshold: 0.7
+  - name: faithfulness
+    type: mlflow.metrics.genai.faithfulness
+    threshold: 0.8
+  - name: completeness
+    type: custom
+    prompt_name: completeness_judge
+    threshold: 7.0
+
+datasets:
+  default: config/eval/datasets/test_queries.jsonl

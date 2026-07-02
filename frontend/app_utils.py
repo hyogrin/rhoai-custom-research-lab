@@ -14,7 +14,7 @@ class ChatSettings:
 
     def __init__(self):
         self.quality_threshold: float = 7.0
-        self.max_iterations: int = 3
+        self.max_iterations: int = 2
         self.max_tokens: int = 4096
         self.temperature: float = 0.7
         self.verbose: bool = True
@@ -24,6 +24,7 @@ class ChatSettings:
         self.enable_planning: bool = True
         self.enable_fact_check: bool = True
         self.enable_parallel: bool = True
+        self.enable_sectioned: bool = True
 
 
 class StepNameManager:

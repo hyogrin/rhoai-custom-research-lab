@@ -1,0 +1,16 @@
+name: completeness
+type: custom
+description: Measures whether the response covers all aspects of the query
+model: ${LLM_MODEL}
+threshold: 7.0
+prompt: |
+  You are evaluating the completeness of a research report.
+
+  Query: {query}
+  Expected topics: {expected_topics}
+  Report: {response}
+
+  Score the report on a scale of 1-10 based on how completely it covers
+  the expected topics. Return only a JSON object: {"score": <number>, "reasoning": "<text>"}
+parameters:
+  max_tokens: 256

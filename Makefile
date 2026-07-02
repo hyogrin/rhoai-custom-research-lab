@@ -1,5 +1,15 @@
 .PHONY: help setup dev-up dev-down agents-start agents-stop test lint clean \
-	backend-start frontend-start ui-start ui-stop
+	backend-start frontend-start ui-start ui-stop \
+	build-all push-all deploy deploy-infra deploy-apps deploy-agents undeploy
+
+REGISTRY ?= quay.io/your-org
+IMAGE_TAG ?= latest
+REPO     := rhoai-custom-research-lab
+NAMESPACE ?= doc-research-lab
+
+AGENTS      := orchestrator doc_processor researcher writer reviewer
+MCP_SERVERS := doc_mcp search_mcp analysis_mcp
+UI_APPS     := backend frontend
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -71,14 +81,80 @@ ui-stop: ## Stop UI processes
 sse-test: ## Run SSE smoke test
 	uv run python backend/test_sse.py
 
-build-images: ## Build container images for all agents
-	@for agent in orchestrator doc_processor researcher writer reviewer; do \
+build-images: ## Build container images for agents only
+	@for agent in $(AGENTS); do \
 		echo "Building $$agent..."; \
-		podman build -t rhoai-custom-research-lab/$$agent:latest agents/$$agent/; \
+		podman build -t $(REPO)/$$agent:$(IMAGE_TAG) agents/$$agent/; \
 	done
 
-push-images: ## Push container images to registry (set REGISTRY env var)
+push-images: ## Push agent images to registry
 	@if [ -z "$(REGISTRY)" ]; then echo "Set REGISTRY env var"; exit 1; fi
-	@for agent in orchestrator doc_processor researcher writer reviewer; do \
-		podman push rhoai-custom-research-lab/$$agent:latest $(REGISTRY)/rhoai-custom-research-lab/$$agent:latest; \
+	@for agent in $(AGENTS); do \
+		podman tag $(REPO)/$$agent:$(IMAGE_TAG) $(REGISTRY)/$(REPO)/$$agent:$(IMAGE_TAG); \
+		podman push $(REGISTRY)/$(REPO)/$$agent:$(IMAGE_TAG); \
 	done
+
+build-all: ## Build ALL container images (agents + MCP + UI)
+	@echo "=== Building agent images ==="
+	@for agent in $(AGENTS); do \
+		echo "Building agent: $$agent..."; \
+		podman build -t $(REPO)/$$agent:$(IMAGE_TAG) agents/$$agent/; \
+	done
+	@echo "=== Building MCP server images ==="
+	@for mcp in $(MCP_SERVERS); do \
+		echo "Building MCP: $$mcp..."; \
+		podman build -f mcp_servers/$$mcp/Dockerfile -t $(REPO)/$$mcp:$(IMAGE_TAG) .; \
+	done
+	@echo "=== Building UI images ==="
+	@for app in $(UI_APPS); do \
+		echo "Building UI: $$app..."; \
+		podman build -f $$app/Dockerfile -t $(REPO)/$$app:$(IMAGE_TAG) .; \
+	done
+	@echo "=== All 10 images built ==="
+
+push-all: ## Push ALL images to $(REGISTRY)
+	@if [ -z "$(REGISTRY)" ]; then echo "Error: Set REGISTRY env var"; exit 1; fi
+	@for img in $(AGENTS) $(MCP_SERVERS) $(UI_APPS); do \
+		echo "Pushing $$img..."; \
+		podman tag $(REPO)/$$img:$(IMAGE_TAG) $(REGISTRY)/$(REPO)/$$img:$(IMAGE_TAG); \
+		podman push $(REGISTRY)/$(REPO)/$$img:$(IMAGE_TAG); \
+	done
+	@echo "=== All images pushed to $(REGISTRY) ==="
+
+deploy: deploy-infra deploy-apps deploy-agents ## Deploy all components to OpenShift
+	@echo "=== Deployment complete ==="
+
+deploy-infra: ## Deploy namespace, secret, PostgreSQL, MinIO
+	@echo "=== Deploying infrastructure ==="
+	oc apply -f deploy/namespace.yaml
+	@. ./.env 2>/dev/null; export $$(grep -v '^#' .env | xargs) 2>/dev/null; \
+		envsubst < deploy/secret.yaml | oc apply -f -
+	oc create configmap init-db-sql --from-file=scripts/init-db.sql \
+		-n $(NAMESPACE) --dry-run=client -o yaml | oc apply -f -
+	oc apply -f deploy/infra/ -n $(NAMESPACE)
+	@echo "Waiting for PostgreSQL to be ready..."
+	oc wait --for=condition=ready pod -l app=postgresql -n $(NAMESPACE) --timeout=120s
+	@echo "Waiting for MinIO to be ready..."
+	oc wait --for=condition=ready pod -l app=minio -n $(NAMESPACE) --timeout=120s
+
+deploy-apps: ## Deploy backend, frontend, MCP servers
+	@echo "=== Deploying applications ==="
+	@. ./.env 2>/dev/null; export $$(grep -v '^#' .env | xargs) 2>/dev/null; \
+		for f in deploy/apps/*.yaml; do \
+			envsubst < "$$f" | oc apply -f - -n $(NAMESPACE); \
+		done
+
+deploy-agents: ## Deploy Kagenti agent Components
+	@echo "=== Deploying Kagenti agents ==="
+	@. ./.env 2>/dev/null; export $$(grep -v '^#' .env | xargs) 2>/dev/null; \
+		envsubst < deploy/kagenti/components.yaml | oc apply -f -
+
+undeploy: ## Remove all deployed resources
+	@echo "=== Removing all resources ==="
+	-oc delete -f deploy/kagenti/ 2>/dev/null
+	-oc delete -f deploy/apps/ -n $(NAMESPACE) 2>/dev/null
+	-oc delete -f deploy/infra/ -n $(NAMESPACE) 2>/dev/null
+	-oc delete configmap init-db-sql -n $(NAMESPACE) 2>/dev/null
+	-oc delete secret doc-research-secret -n $(NAMESPACE) 2>/dev/null
+	-oc delete namespace $(NAMESPACE) 2>/dev/null
+	@echo "=== All resources removed ==="

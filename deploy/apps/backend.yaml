@@ -1,0 +1,150 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: doc-research-lab
+  labels:
+    app: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: ${REGISTRY}/rhoai-custom-research-lab/backend:${IMAGE_TAG}
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: LLM_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: LLM_BASE_URL
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: LLM_API_KEY
+            - name: LLM_MODEL
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: LLM_MODEL
+            - name: MAAS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: MAAS_API_KEY
+            - name: EMBEDDING_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: EMBEDDING_BASE_URL
+            - name: EMBEDDING_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: EMBEDDING_API_KEY
+            - name: EMBEDDING_MODEL
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: EMBEDDING_MODEL
+            - name: PGVECTOR_USER
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: PGVECTOR_USER
+            - name: PGVECTOR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: PGVECTOR_PASSWORD
+            - name: MLFLOW_TRACKING_URI
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: MLFLOW_TRACKING_URI
+            - name: MLFLOW_EXPERIMENT_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: MLFLOW_EXPERIMENT_NAME
+            - name: PGVECTOR_HOST
+              value: postgresql
+            - name: PGVECTOR_PORT
+              value: "5432"
+            - name: PGVECTOR_DB
+              value: doc_research
+            - name: MINIO_ENDPOINT
+              value: minio:9000
+            - name: DOC_MCP_URL
+              value: http://doc-mcp:9001
+            - name: SEARCH_MCP_URL
+              value: http://search-mcp:9002
+            - name: ANALYSIS_MCP_URL
+              value: http://analysis-mcp:9003
+            - name: SEARXNG_URL
+              value: http://searxng:8888
+            - name: VERIFY_SSL
+              value: "false"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 250m
+            limits:
+              memory: 1Gi
+              cpu: 1000m
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: doc-research-lab
+  labels:
+    app: backend
+spec:
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: backend
+  namespace: doc-research-lab
+  labels:
+    app: backend
+spec:
+  to:
+    kind: Service
+    name: backend
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

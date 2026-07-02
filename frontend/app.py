@@ -104,6 +104,12 @@ async def on_chat_start():
                 initial=settings.enable_parallel,
                 description="Run multiple searches and verifications concurrently for faster results.",
             ),
+            cl.input_widget.Switch(
+                id="enable_sectioned",
+                label="Sectioned Report",
+                initial=settings.enable_sectioned,
+                description="Decompose the query into sub-topics and write each section independently.",
+            ),
         ]
     ).send()
 
@@ -138,6 +144,8 @@ def _apply_settings(settings: ChatSettings, raw: dict):
         settings.enable_fact_check = bool(raw["enable_fact_check"])
     if "enable_parallel" in raw:
         settings.enable_parallel = bool(raw["enable_parallel"])
+    if "enable_sectioned" in raw:
+        settings.enable_sectioned = bool(raw["enable_sectioned"])
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +233,7 @@ async def _poll_upload_status(
     session: aiohttp.ClientSession, upload_id: str, status_msg: cl.Message
 ):
     """Poll the upload status endpoint with progress bar."""
-    for _ in range(180):
+    for _ in range(600):
         await asyncio.sleep(2)
         try:
             async with session.get(f"{API_URL}/upload_status/{upload_id}") as resp:
@@ -262,7 +270,7 @@ async def _poll_upload_status(
             logger.warning("Upload status poll error: %s", e)
             continue
 
-    status_msg.content = "⏳ Document processing is taking longer than expected. It will continue in the background."
+    status_msg.content = "⏳ Document processing is taking longer than expected (>20 min). It will continue in the background."
     await safe_update_message(status_msg)
 
 
@@ -332,6 +340,7 @@ async def stream_research(query: str, settings: ChatSettings, file_path: str = "
                 "enable_planning": settings.enable_planning,
                 "enable_fact_check": settings.enable_fact_check,
                 "enable_parallel": settings.enable_parallel,
+                "enable_sectioned": settings.enable_sectioned,
             }
 
             async with session.post(f"{API_URL}/research", json=payload) as resp:
@@ -398,6 +407,19 @@ async def stream_research(query: str, settings: ChatSettings, file_path: str = "
             status_msg.content = ""
             await safe_update_message(status_msg)
         await safe_update_message(msg)
+
+
+def _format_metadata(data: dict) -> str:
+    """Render research metadata as a markdown footer."""
+    iterations = data.get("iterations", 0)
+    score = data.get("quality_score", 0)
+    tokens = data.get("total_tokens", 0)
+    return (
+        f"\n\n---\n"
+        f"*Research completed in {iterations} iteration(s) | "
+        f"Quality score: {score}/10 | "
+        f"Total tokens: {tokens:,}*\n"
+    )
 
 
 def _format_sources(sources: list[dict]) -> str:
@@ -469,8 +491,13 @@ async def _handle_event(
             if text:
                 status_msg.content = ""
                 await safe_update_message(status_msg)
-                msg.content = text
-                await safe_update_message(msg)
+                if len(text) >= len(msg.content):
+                    msg.content = text
+                    await safe_update_message(msg)
+        elif event_type == "metadata":
+            meta_md = _format_metadata(data)
+            if meta_md:
+                await safe_stream_token(msg, meta_md)
         elif event_type == "sources":
             sources_md = _format_sources(data.get("sources", []))
             if sources_md:
@@ -504,8 +531,13 @@ async def _handle_event(
     elif event_type == "content":
         text = data.get("text", "")
         if text:
-            msg.content = text
-            await safe_update_message(msg)
+            if len(text) >= len(msg.content):
+                msg.content = text
+                await safe_update_message(msg)
+    elif event_type == "metadata":
+        meta_md = _format_metadata(data)
+        if meta_md:
+            await safe_stream_token(msg, meta_md)
     elif event_type == "sources":
         sources_md = _format_sources(data.get("sources", []))
         if sources_md:

@@ -1,0 +1,7 @@
+name: faithfulness
+type: mlflow.metrics.genai.faithfulness
+description: Measures factual accuracy against source documents (hallucination detection)
+model: ${LLM_MODEL}
+threshold: 0.8
+parameters:
+  max_tokens: 512

@@ -42,6 +42,7 @@ class ResearchState(TypedDict):
     enable_planning: bool
     enable_fact_check: bool
     enable_parallel: bool
+    enable_sectioned: bool
 
     # Sectioned report (used when SECTIONED_REPORT=true)
     report_sections: list[dict]   # [{sub_topic, content, search_context, score, status}]
