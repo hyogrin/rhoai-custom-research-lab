@@ -49,15 +49,23 @@ User Query + Documents
 
 ## MCP Tools Available
 
-All capabilities are exposed as MCP servers for standardized, independent access:
+All capabilities are exposed as FastMCP servers with **streamable-http** transport
+for standardized, network-accessible, horizontally scalable access:
 
-| MCP Server | Tools | Harness Phase |
-|------------|-------|---------------|
-| `doc-mcp` | `ingest_document`, `get_document_status`, `list_documents` | Execute |
-| `search-mcp` | `semantic_search`, `search_by_document`, `get_chunk_context` | Execute |
-| `analysis-mcp` | `rewrite_query`, `synthesize_context`, `generate_research_plan`, `draft_report` | Plan + Execute |
-| `verification-mcp` | `quality_score`, `validate_citations`, `fact_check`, `llm_as_judge` | Verify |
-| `observability-mcp` | `record_trace`, `record_failure`, `get_metrics`, `get_failure_hints` | Reflect |
+| MCP Server | Port | Tools | Harness Phase |
+|------------|------|-------|---------------|
+| `doc-mcp` | 9001 | `ingest_document`, `get_document_status`, `list_documents` | Execute |
+| `search-mcp` | 9002 | `semantic_search`, `search_by_document`, `get_chunk_context`, `web_search` | Execute |
+| `analysis-mcp` | 9003 | `rewrite_query`, `synthesize_context`, `generate_research_plan`, `draft_report`, `generate_sectioned_plan`, `draft_section`, `assemble_report` | Plan + Execute |
+| `verification-mcp` | 9004 | `quality_score`, `validate_citations`, `fact_check`, `llm_as_judge`, `run_verification` | Verify |
+| `observability-mcp` | 9005 | `record_trace`, `record_failure`, `get_metrics`, `get_failure_hints`, `get_past_failure_patterns` | Reflect |
+
+### MCP Transport
+
+- **Protocol**: Streamable HTTP (`FastMCP` with `stateless_http=True`)
+- **Endpoint convention**: `http://<server>:<port>/mcp/`
+- **Client**: `mcp.client.streamable_http.streamablehttp_client` via `agents/orchestrator/layers/mcp_client.py`
+- **Feature flag**: `USE_MCP=true` in `.env` (set to `false` for legacy direct-call mode)
 
 ## Project Structure
 
@@ -79,7 +87,8 @@ All capabilities are exposed as MCP servers for standardized, independent access
 cp sample.env .env        # Configure model endpoints
 uv sync                   # Install dependencies
 make dev-up               # Start PostgreSQL+pgvector, MinIO
-make agents-start         # Start all 5 agents
+make backend-start        # Start backend + auto-start all 5 MCP servers
+make frontend-start       # Start Chainlit UI (separate terminal)
 ```
 
 ### Running a Research Query

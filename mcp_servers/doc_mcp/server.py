@@ -1,7 +1,6 @@
 """Document MCP Server — Docling-based document parsing, chunking, and ingestion."""
 
 import hashlib
-import json
 import os
 from typing import Any
 
@@ -11,9 +10,7 @@ import psycopg2.extras
 from docling.document_converter import DocumentConverter
 from docling.chunking import HybridChunker
 from dotenv import load_dotenv
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.server.fastmcp import FastMCP
 from openai import OpenAI
 
 load_dotenv()
@@ -30,7 +27,7 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "granite-embedding-278m-multiling
 _VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() not in ("false", "0", "no")
 _HTTP_CLIENT = None if _VERIFY_SSL else httpx.Client(verify=False, timeout=httpx.Timeout(300.0))
 
-app = Server("doc-mcp")
+mcp = FastMCP("doc-mcp", host="0.0.0.0", port=9001, stateless_http=True)
 
 
 def _get_db():
@@ -43,54 +40,9 @@ def _get_embeddings(texts: list[str]) -> list[list[float]]:
     return [item.embedding for item in response.data]
 
 
-@app.list_tools()
-async def list_tools() -> list[Tool]:
-    return [
-        Tool(
-            name="ingest_document",
-            description="Parse a document with Docling, chunk it, generate embeddings, and store in pgvector.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "Path to the document file (PDF, DOCX, etc.)"},
-                },
-                "required": ["file_path"],
-            },
-        ),
-        Tool(
-            name="get_document_status",
-            description="Check the processing status of a document by its ID.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "document_id": {"type": "string", "description": "Document ID (hash)"},
-                },
-                "required": ["document_id"],
-            },
-        ),
-        Tool(
-            name="list_documents",
-            description="List all ingested documents with their status and chunk counts.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-    ]
-
-
-@app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    if name == "ingest_document":
-        result = _ingest_document(arguments["file_path"])
-    elif name == "get_document_status":
-        result = _get_document_status(arguments["document_id"])
-    elif name == "list_documents":
-        result = _list_documents()
-    else:
-        result = {"error": f"Unknown tool: {name}"}
-
-    return [TextContent(type="text", text=json.dumps(result, default=str))]
-
-
-def _ingest_document(file_path: str) -> dict[str, Any]:
+@mcp.tool()
+def ingest_document(file_path: str) -> dict[str, Any]:
+    """Parse a document with Docling, chunk it, generate embeddings, and store in pgvector."""
     try:
         converter = DocumentConverter()
         result = converter.convert(file_path)
@@ -146,7 +98,9 @@ def _ingest_document(file_path: str) -> dict[str, Any]:
         return {"document_id": "", "status": "error", "chunk_count": 0, "error": str(e)}
 
 
-def _get_document_status(document_id: str) -> dict:
+@mcp.tool()
+def get_document_status(document_id: str) -> dict:
+    """Check the processing status of a document by its ID."""
     try:
         conn = _get_db()
         cur = conn.cursor()
@@ -161,7 +115,9 @@ def _get_document_status(document_id: str) -> dict:
         return {"error": str(e)}
 
 
-def _list_documents() -> list[dict]:
+@mcp.tool()
+def list_documents() -> list[dict]:
+    """List all ingested documents with their status and chunk counts."""
     try:
         conn = _get_db()
         cur = conn.cursor()
@@ -174,11 +130,5 @@ def _list_documents() -> list[dict]:
         return [{"error": str(e)}]
 
 
-async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
-
-
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    mcp.run(transport="streamable-http")

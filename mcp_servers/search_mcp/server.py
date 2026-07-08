@@ -1,15 +1,11 @@
 """Search MCP Server — pgvector semantic search tools."""
 
-import json
 import os
-from typing import Any
 
 import httpx
 import psycopg2
 from dotenv import load_dotenv
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.server.fastmcp import FastMCP
 from openai import OpenAI
 
 load_dotenv()
@@ -26,7 +22,9 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "granite-embedding-278m-multiling
 _VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() not in ("false", "0", "no")
 _HTTP_CLIENT = None if _VERIFY_SSL else httpx.Client(verify=False, timeout=httpx.Timeout(300.0))
 
-app = Server("search-mcp")
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8888")
+
+mcp = FastMCP("search-mcp", host="0.0.0.0", port=9002, stateless_http=True)
 
 
 def _get_db():
@@ -39,78 +37,9 @@ def _get_embedding(text: str) -> list[float]:
     return response.data[0].embedding
 
 
-@app.list_tools()
-async def list_tools() -> list[Tool]:
-    return [
-        Tool(
-            name="semantic_search",
-            description="Search for semantically similar document chunks using pgvector.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query text"},
-                    "top_k": {"type": "integer", "description": "Number of results to return", "default": 5},
-                    "min_similarity": {"type": "number", "description": "Minimum similarity threshold (0-1)", "default": 0.3},
-                },
-                "required": ["query"],
-            },
-        ),
-        Tool(
-            name="search_by_document",
-            description="Search within a specific document by document_id.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query text"},
-                    "document_id": {"type": "string", "description": "Target document ID"},
-                    "top_k": {"type": "integer", "description": "Number of results", "default": 5},
-                },
-                "required": ["query", "document_id"],
-            },
-        ),
-        Tool(
-            name="get_chunk_context",
-            description="Get surrounding chunks for a given chunk to provide broader context.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "document_id": {"type": "string", "description": "Document ID"},
-                    "chunk_index": {"type": "integer", "description": "Center chunk index"},
-                    "window": {"type": "integer", "description": "Number of chunks before/after", "default": 2},
-                },
-                "required": ["document_id", "chunk_index"],
-            },
-        ),
-    ]
-
-
-@app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    if name == "semantic_search":
-        result = _semantic_search(
-            arguments["query"],
-            arguments.get("top_k", 5),
-            arguments.get("min_similarity", 0.3),
-        )
-    elif name == "search_by_document":
-        result = _search_by_document(
-            arguments["query"],
-            arguments["document_id"],
-            arguments.get("top_k", 5),
-        )
-    elif name == "get_chunk_context":
-        result = _get_chunk_context(
-            arguments["document_id"],
-            arguments["chunk_index"],
-            arguments.get("window", 2),
-        )
-    else:
-        result = {"error": f"Unknown tool: {name}"}
-
-    return [TextContent(type="text", text=json.dumps(result, default=str))]
-
-
-def _semantic_search(query: str, top_k: int = 5, min_similarity: float = 0.3) -> list[dict]:
+@mcp.tool()
+def semantic_search(query: str, top_k: int = 5, min_similarity: float = 0.3) -> list[dict]:
+    """Search for semantically similar document chunks using pgvector."""
     embedding = _get_embedding(query)
     conn = _get_db()
     cur = conn.cursor()
@@ -142,7 +71,9 @@ def _semantic_search(query: str, top_k: int = 5, min_similarity: float = 0.3) ->
     return results
 
 
-def _search_by_document(query: str, document_id: str, top_k: int = 5) -> list[dict]:
+@mcp.tool()
+def search_by_document(query: str, document_id: str, top_k: int = 5) -> list[dict]:
+    """Search within a specific document by document_id."""
     embedding = _get_embedding(query)
     conn = _get_db()
     cur = conn.cursor()
@@ -174,7 +105,9 @@ def _search_by_document(query: str, document_id: str, top_k: int = 5) -> list[di
     return results
 
 
-def _get_chunk_context(document_id: str, chunk_index: int, window: int = 2) -> list[dict]:
+@mcp.tool()
+def get_chunk_context(document_id: str, chunk_index: int, window: int = 2) -> list[dict]:
+    """Get surrounding chunks for a given chunk to provide broader context."""
     conn = _get_db()
     cur = conn.cursor()
 
@@ -200,11 +133,26 @@ def _get_chunk_context(document_id: str, chunk_index: int, window: int = 2) -> l
     return results
 
 
-async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+@mcp.tool()
+def web_search(query: str, num_results: int = 5) -> list[dict]:
+    """Search the web via SearXNG. Returns list of {title, url, content}."""
+    try:
+        verify = not SEARXNG_URL.startswith("https://") or _VERIFY_SSL
+        client = httpx.Client(verify=verify, timeout=httpx.Timeout(15.0))
+        resp = client.get(
+            f"{SEARXNG_URL}/search",
+            params={"q": query, "format": "json", "engines": "google,duckduckgo"},
+        )
+        client.close()
+        resp.raise_for_status()
+        data = resp.json()
+        return [
+            {"title": r.get("title", ""), "url": r.get("url", ""), "content": r.get("content", "")}
+            for r in data.get("results", [])[:num_results]
+        ]
+    except Exception:
+        return []
 
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    mcp.run(transport="streamable-http")

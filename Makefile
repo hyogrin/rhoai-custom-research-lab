@@ -1,6 +1,6 @@
-.PHONY: help setup dev-up dev-down agents-start agents-stop test lint clean \
+.PHONY: help setup dev-up dev-down mcp-start mcp-stop agents-start agents-stop test lint clean \
 	backend-start frontend-start ui-start ui-stop \
-	build-all push-all deploy deploy-infra deploy-apps deploy-agents undeploy
+	build-all push-all deploy deploy-infra deploy-apps deploy-agents deploy-mcp undeploy
 
 REGISTRY ?= quay.io/your-org
 IMAGE_TAG ?= latest
@@ -8,7 +8,7 @@ REPO     := rhoai-custom-research-lab
 NAMESPACE ?= doc-research-lab
 
 AGENTS      := orchestrator doc_processor researcher writer reviewer
-MCP_SERVERS := doc_mcp search_mcp analysis_mcp
+MCP_SERVERS := doc_mcp search_mcp analysis_mcp verification_mcp observability_mcp
 UI_APPS     := backend frontend
 
 help: ## Show this help
@@ -27,7 +27,25 @@ dev-down: ## Stop local dev services
 dev-logs: ## Show logs from local dev services
 	podman-compose -f compose.yml logs -f
 
-agents-start: ## Start all agents locally
+mcp-start: ## Start all MCP servers locally
+	@echo "Starting doc-mcp on port 9001..."
+	@uv run python -m mcp_servers.doc_mcp.server &
+	@echo "Starting search-mcp on port 9002..."
+	@uv run python -m mcp_servers.search_mcp.server &
+	@echo "Starting analysis-mcp on port 9003..."
+	@uv run python -m mcp_servers.analysis_mcp.server &
+	@echo "Starting verification-mcp on port 9004..."
+	@uv run python -m mcp_servers.verification_mcp.server &
+	@echo "Starting observability-mcp on port 9005..."
+	@uv run python -m mcp_servers.observability_mcp.server &
+	@echo "All MCP servers started (ports 9001-9005)."
+
+mcp-stop: ## Stop all locally running MCP servers
+	@pkill -f "mcp_servers\." || true
+	@echo "All MCP servers stopped."
+
+agents-start: mcp-start ## Start MCP servers + all agents locally
+	@sleep 3
 	@echo "Starting Document Processor on port 8101..."
 	@cd agents/doc_processor && uv run python agent.py &
 	@echo "Starting Researcher on port 8102..."
@@ -41,7 +59,7 @@ agents-start: ## Start all agents locally
 	@cd agents/orchestrator && uv run python agent.py &
 	@echo "All agents started."
 
-agents-stop: ## Stop all locally running agents
+agents-stop: mcp-stop ## Stop all agents and MCP servers
 	@pkill -f "agents/.*/agent.py" || true
 	@echo "All agents stopped."
 
@@ -59,7 +77,7 @@ clean: ## Remove build artifacts
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -type f -name "*.pyc" -delete 2>/dev/null || true
 
-backend-start: ## Start the FastAPI backend API server
+backend-start: ## Start backend (auto-starts MCP servers as subprocesses)
 	uv run uvicorn backend.api:app --host 0.0.0.0 --port $${BACKEND_PORT:-8000} --reload
 
 frontend-start: ## Start the Chainlit frontend UI
@@ -73,9 +91,10 @@ ui-start: ## Start backend + frontend together
 	@cd frontend && uv run chainlit run app.py --host 0.0.0.0 --port $${FRONTEND_PORT:-7860} &
 	@echo "UI started: http://localhost:$${FRONTEND_PORT:-7860}"
 
-ui-stop: ## Stop UI processes
+ui-stop: ## Stop UI processes (MCP subprocesses auto-terminate with backend)
 	@pkill -f "uvicorn backend.api" || true
 	@pkill -f "chainlit run" || true
+	@pkill -f "mcp_servers\." || true
 	@echo "UI stopped."
 
 sse-test: ## Run SSE smoke test
@@ -110,7 +129,7 @@ build-all: ## Build ALL container images (agents + MCP + UI)
 		echo "Building UI: $$app..."; \
 		podman build -f $$app/Dockerfile -t $(REPO)/$$app:$(IMAGE_TAG) .; \
 	done
-	@echo "=== All 10 images built ==="
+	@echo "=== All 12 images built ==="
 
 push-all: ## Push ALL images to $(REGISTRY)
 	@if [ -z "$(REGISTRY)" ]; then echo "Error: Set REGISTRY env var"; exit 1; fi
@@ -121,7 +140,7 @@ push-all: ## Push ALL images to $(REGISTRY)
 	done
 	@echo "=== All images pushed to $(REGISTRY) ==="
 
-deploy: deploy-infra deploy-apps deploy-agents ## Deploy all components to OpenShift
+deploy: deploy-infra deploy-apps deploy-mcp deploy-agents ## Deploy all components to OpenShift
 	@echo "=== Deployment complete ==="
 
 deploy-infra: ## Deploy namespace, secret, PostgreSQL, MinIO
@@ -143,6 +162,12 @@ deploy-apps: ## Deploy backend, frontend, MCP servers
 		for f in deploy/apps/*.yaml; do \
 			envsubst < "$$f" | oc apply -f - -n $(NAMESPACE); \
 		done
+
+deploy-mcp: ## Deploy MCPServer CRs (requires MCP lifecycle operator)
+	@echo "=== Deploying MCPServer CRs ==="
+	@. ./.env 2>/dev/null; export $$(grep -v '^#' .env | xargs) 2>/dev/null; \
+		envsubst < deploy/mcp/mcpservers.yaml | oc apply -f - || \
+		echo "MCPServer CRD not found — skipping (deploy MCP servers via deploy-apps instead)"
 
 deploy-agents: ## Deploy Kagenti agent Components
 	@echo "=== Deploying Kagenti agents ==="

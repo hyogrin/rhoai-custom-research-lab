@@ -2,10 +2,15 @@
 
 import json
 import os
+import signal
+import subprocess
+import sys
 import uuid
 import tempfile
 import logging
+import time
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import BackgroundTasks, FastAPI, Header, UploadFile, File, HTTPException
@@ -16,8 +21,6 @@ from dotenv import load_dotenv
 from prometheus_fastapi_instrumentator import Instrumentator
 
 load_dotenv()
-
-import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -34,7 +37,93 @@ from backend.observability import init_mlflow
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="RHOAI Deep Research API", version="0.1.0")
+_USE_MCP = os.getenv("USE_MCP", "true").lower() in ("true", "1", "yes")
+
+MCP_SERVERS = [
+    ("doc-mcp", "mcp_servers.doc_mcp.server", 9001),
+    ("search-mcp", "mcp_servers.search_mcp.server", 9002),
+    ("analysis-mcp", "mcp_servers.analysis_mcp.server", 9003),
+    ("verification-mcp", "mcp_servers.verification_mcp.server", 9004),
+    ("observability-mcp", "mcp_servers.observability_mcp.server", 9005),
+]
+
+_mcp_processes: list[subprocess.Popen] = []
+
+
+def _port_in_use(port: int) -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _start_mcp_servers():
+    """Start MCP servers as subprocesses if USE_MCP is enabled."""
+    if not _USE_MCP:
+        logger.info("USE_MCP=false — skipping MCP server startup")
+        return
+
+    for name, module, port in MCP_SERVERS:
+        if _port_in_use(port):
+            logger.info("MCP server %s already running on port %d — skipping", name, port)
+            continue
+        proc = subprocess.Popen(
+            [sys.executable, "-m", module],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            cwd=os.path.join(os.path.dirname(__file__), ".."),
+        )
+        _mcp_processes.append(proc)
+        logger.info("Started %s (pid=%d) on port %d", name, proc.pid, port)
+
+    max_wait, interval = 15, 1
+    waited = 0
+    while waited < max_wait:
+        time.sleep(interval)
+        waited += interval
+        pending = [f"{n}:{p}" for n, _, p in MCP_SERVERS if not _port_in_use(p)]
+        if not pending:
+            break
+    if pending:
+        logger.warning("MCP servers not ready after %ds: %s", max_wait, ", ".join(pending))
+    else:
+        logger.info("All %d MCP servers ready (%ds)", len(MCP_SERVERS), waited)
+
+
+def _stop_mcp_servers():
+    """Gracefully stop all MCP subprocesses."""
+    for proc in _mcp_processes:
+        if proc.poll() is None:
+            proc.terminate()
+    for proc in _mcp_processes:
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    if _mcp_processes:
+        logger.info("Stopped %d MCP server subprocesses", len(_mcp_processes))
+    _mcp_processes.clear()
+
+
+import atexit
+
+atexit.register(_stop_mcp_servers)
+
+def _signal_handler(signum, frame):
+    _stop_mcp_servers()
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _start_mcp_servers()
+    yield
+    _stop_mcp_servers()
+
+
+app = FastAPI(title="RHOAI Deep Research API", version="0.1.0", lifespan=lifespan)
 
 Instrumentator().instrument(app).expose(app)
 init_mlflow()

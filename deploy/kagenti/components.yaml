@@ -36,6 +36,18 @@ spec:
       value: http://writer:8103
     - name: REVIEWER_URL
       value: http://reviewer:8104
+    - name: DOC_MCP_URL
+      value: http://doc-mcp:9001
+    - name: SEARCH_MCP_URL
+      value: http://search-mcp:9002
+    - name: ANALYSIS_MCP_URL
+      value: http://analysis-mcp:9003
+    - name: VERIFICATION_MCP_URL
+      value: http://verification-mcp:9004
+    - name: OBSERVABILITY_MCP_URL
+      value: http://observability-mcp:9005
+    - name: USE_MCP
+      value: "true"
 ---
 apiVersion: kagenti.io/v1alpha1
 kind: Component

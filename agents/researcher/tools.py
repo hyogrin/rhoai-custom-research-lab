@@ -1,151 +1,82 @@
-"""Research tools: semantic search, query rewriting, and context synthesis."""
+"""Research tools: MCP client wrappers for search and analysis servers."""
 
+import asyncio
 import json
+import logging
 import os
-from typing import Any
 
-import httpx
-import psycopg2
 from dotenv import load_dotenv
-from openai import OpenAI
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
 
 load_dotenv()
 
-PG_HOST = os.getenv("PGVECTOR_HOST", "localhost")
-PG_PORT = os.getenv("PGVECTOR_PORT", "5432")
-PG_DB = os.getenv("PGVECTOR_DB", "doc_research")
-PG_USER = os.getenv("PGVECTOR_USER", "postgres")
-PG_PASSWORD = os.getenv("PGVECTOR_PASSWORD", "postgres")
+logger = logging.getLogger(__name__)
 
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
-LLM_API_KEY = os.getenv("LLM_API_KEY", "not-needed")
-LLM_MODEL = os.getenv("LLM_MODEL", "granite-3.3-8b-instruct")
-MAAS_API_KEY = os.getenv("MAAS_API_KEY", "")
-_EFFECTIVE_LLM_KEY = MAAS_API_KEY if MAAS_API_KEY else LLM_API_KEY
-_MAX_TOKEN_SMALL = int(os.getenv("LLM_MAX_TOKEN_SMALL", "512"))
-_MAX_TOKEN_LARGE = int(os.getenv("LLM_MAX_TOKEN_LARGE", "4096"))
-_VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() not in ("false", "0", "no")
-_HTTP_CLIENT = None if _VERIFY_SSL else httpx.Client(verify=False, timeout=httpx.Timeout(300.0))
-
-EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "http://localhost:8000/v1")
-EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "not-needed")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "granite-embedding-278m-multilingual")
+SEARCH_MCP_URL = os.getenv("SEARCH_MCP_URL", "http://127.0.0.1:9002")
+ANALYSIS_MCP_URL = os.getenv("ANALYSIS_MCP_URL", "http://127.0.0.1:9003")
+_MCP_ENDPOINT = "/mcp"
 
 
-def get_db_connection():
-    return psycopg2.connect(
-        host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASSWORD
+async def _call_mcp_tool(url: str, tool_name: str, arguments: dict):
+    """Call a tool on a remote MCP server via streamable-http."""
+    async with streamablehttp_client(url) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool(tool_name, arguments)
+            if result.content and len(result.content) > 0:
+                try:
+                    return json.loads(result.content[0].text)
+                except (json.JSONDecodeError, TypeError):
+                    return result.content[0].text
+            return None
+
+
+def _call_sync(url: str, tool_name: str, arguments: dict):
+    """Synchronous wrapper for MCP tool calls."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, _call_mcp_tool(url, tool_name, arguments))
+            return future.result(timeout=120)
+    else:
+        return asyncio.run(_call_mcp_tool(url, tool_name, arguments))
+
+
+def semantic_search(query: str, top_k: int = 5) -> list[dict]:
+    """Search pgvector for semantically similar document chunks via search-mcp."""
+    result = _call_sync(
+        f"{SEARCH_MCP_URL}{_MCP_ENDPOINT}",
+        "semantic_search",
+        {"query": query, "top_k": top_k},
     )
-
-
-def get_embedding(text: str) -> list[float]:
-    """Get embedding for a single text."""
-    client = OpenAI(base_url=EMBEDDING_BASE_URL, api_key=EMBEDDING_API_KEY, http_client=_HTTP_CLIENT)
-    response = client.embeddings.create(input=[text], model=EMBEDDING_MODEL)
-    return response.data[0].embedding
-
-
-def get_llm_client() -> OpenAI:
-    return OpenAI(base_url=LLM_BASE_URL, api_key=_EFFECTIVE_LLM_KEY, http_client=_HTTP_CLIENT)
-
-
-def semantic_search(query: str, top_k: int = 5) -> list[dict[str, Any]]:
-    """Search pgvector for semantically similar document chunks."""
-    embedding = get_embedding(query)
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    cur.execute(
-        """SELECT id, document_id, document_name, chunk_index, content, metadata,
-                  1 - (embedding <=> %s::vector) as similarity
-           FROM document_chunks
-           ORDER BY embedding <=> %s::vector
-           LIMIT %s""",
-        (str(embedding), str(embedding), top_k),
-    )
-
-    results = []
-    for row in cur.fetchall():
-        results.append({
-            "id": row[0],
-            "document_id": row[1],
-            "document_name": row[2],
-            "chunk_index": row[3],
-            "content": row[4],
-            "metadata": row[5] if row[5] else {},
-            "similarity": float(row[6]),
-        })
-
-    cur.close()
-    conn.close()
-    return results
+    return result if isinstance(result, list) else []
 
 
 def rewrite_query(query: str) -> list[str]:
-    """Rewrite a query into multiple search-optimized sub-queries."""
-    client = get_llm_client()
-    response = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a search query optimizer. Given a research question, "
-                    "generate 3 diverse search queries that would help find relevant information. "
-                    "Return ONLY a JSON array of strings, no explanation."
-                ),
-            },
-            {"role": "user", "content": query},
-        ],
-        temperature=0.3,
-        max_tokens=_MAX_TOKEN_SMALL,
+    """Rewrite a query into multiple search-optimized sub-queries via analysis-mcp."""
+    result = _call_sync(
+        f"{ANALYSIS_MCP_URL}{_MCP_ENDPOINT}",
+        "rewrite_query",
+        {"query": query},
     )
-    try:
-        queries = json.loads(response.choices[0].message.content)
-        if isinstance(queries, list):
-            return [query] + queries[:3]
-    except (json.JSONDecodeError, IndexError):
-        pass
+    if isinstance(result, dict):
+        return result.get("queries", [query])
     return [query]
 
 
-def synthesize_context(query: str, passages: list[dict]) -> dict[str, Any]:
-    """Synthesize retrieved passages into a coherent context summary with citations."""
-    if not passages:
-        return {"synthesis": "No relevant documents found.", "citations": []}
-
-    context_parts = []
-    for i, p in enumerate(passages):
-        context_parts.append(f"[Source {i+1}: {p['document_name']}, chunk {p['chunk_index']}]\n{p['content']}")
-
-    context = "\n\n".join(context_parts)
-
-    client = get_llm_client()
-    response = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a research analyst. Synthesize the provided document excerpts "
-                    "to answer the user's question. Be comprehensive and accurate. "
-                    "Reference sources by their [Source N] identifiers."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Question: {query}\n\nDocuments:\n{context}",
-            },
-        ],
-        temperature=0.2,
-        max_tokens=_MAX_TOKEN_LARGE,
+def synthesize_context(query: str, passages: list[dict]) -> dict:
+    """Synthesize retrieved passages via analysis-mcp."""
+    result = _call_sync(
+        f"{ANALYSIS_MCP_URL}{_MCP_ENDPOINT}",
+        "synthesize_context",
+        {"query": query, "passages": passages},
     )
-
-    synthesis = response.choices[0].message.content
-
-    citations = [
-        {"document": p["document_name"], "chunk_index": p["chunk_index"], "similarity": p["similarity"]}
-        for p in passages
-    ]
-
-    return {"synthesis": synthesis, "citations": citations}
+    if isinstance(result, dict):
+        return result
+    return {"synthesis": "Synthesis unavailable.", "citations": []}

@@ -22,6 +22,18 @@ spec:
             - name: http
               containerPort: 9002
               protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /mcp/
+              port: 9002
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /mcp/
+              port: 9002
+            initialDelaySeconds: 10
+            periodSeconds: 30
           env:
             - name: PGVECTOR_USER
               valueFrom:

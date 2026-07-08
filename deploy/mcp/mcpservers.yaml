@@ -1,0 +1,127 @@
+---
+apiVersion: mcp.x-k8s.io/v1alpha1
+kind: MCPServer
+metadata:
+  name: doc-mcp
+  namespace: doc-research-lab
+  labels:
+    app.kubernetes.io/part-of: doc-research
+    kagenti.io/type: tool
+spec:
+  source:
+    type: ContainerImage
+    containerImage:
+      ref: ${REGISTRY}/rhoai-custom-research-lab/doc_mcp:${IMAGE_TAG}
+  config:
+    port: 9001
+    storage:
+      - path: /tmp
+        permissions: ReadWrite
+        source:
+          type: EmptyDir
+          emptyDir:
+            sizeLimit: 100Mi
+  runtime:
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+---
+apiVersion: mcp.x-k8s.io/v1alpha1
+kind: MCPServer
+metadata:
+  name: search-mcp
+  namespace: doc-research-lab
+  labels:
+    app.kubernetes.io/part-of: doc-research
+    kagenti.io/type: tool
+spec:
+  source:
+    type: ContainerImage
+    containerImage:
+      ref: ${REGISTRY}/rhoai-custom-research-lab/search_mcp:${IMAGE_TAG}
+  config:
+    port: 9002
+  runtime:
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
+---
+apiVersion: mcp.x-k8s.io/v1alpha1
+kind: MCPServer
+metadata:
+  name: analysis-mcp
+  namespace: doc-research-lab
+  labels:
+    app.kubernetes.io/part-of: doc-research
+    kagenti.io/type: tool
+spec:
+  source:
+    type: ContainerImage
+    containerImage:
+      ref: ${REGISTRY}/rhoai-custom-research-lab/analysis_mcp:${IMAGE_TAG}
+  config:
+    port: 9003
+  runtime:
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
+---
+apiVersion: mcp.x-k8s.io/v1alpha1
+kind: MCPServer
+metadata:
+  name: verification-mcp
+  namespace: doc-research-lab
+  labels:
+    app.kubernetes.io/part-of: doc-research
+    kagenti.io/type: tool
+spec:
+  source:
+    type: ContainerImage
+    containerImage:
+      ref: ${REGISTRY}/rhoai-custom-research-lab/verification_mcp:${IMAGE_TAG}
+  config:
+    port: 9004
+  runtime:
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
+---
+apiVersion: mcp.x-k8s.io/v1alpha1
+kind: MCPServer
+metadata:
+  name: observability-mcp
+  namespace: doc-research-lab
+  labels:
+    app.kubernetes.io/part-of: doc-research
+    kagenti.io/type: tool
+spec:
+  source:
+    type: ContainerImage
+    containerImage:
+      ref: ${REGISTRY}/rhoai-custom-research-lab/observability_mcp:${IMAGE_TAG}
+  config:
+    port: 9005
+  runtime:
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"

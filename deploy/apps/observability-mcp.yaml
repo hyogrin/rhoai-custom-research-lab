@@ -1,37 +1,37 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: doc-mcp
+  name: observability-mcp
   namespace: doc-research-lab
   labels:
-    app: doc-mcp
+    app: observability-mcp
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: doc-mcp
+      app: observability-mcp
   template:
     metadata:
       labels:
-        app: doc-mcp
+        app: observability-mcp
     spec:
       containers:
-        - name: doc-mcp
-          image: ${REGISTRY}/rhoai-custom-research-lab/doc_mcp:${IMAGE_TAG}
+        - name: observability-mcp
+          image: ${REGISTRY}/rhoai-custom-research-lab/observability_mcp:${IMAGE_TAG}
           ports:
             - name: http
-              containerPort: 9001
+              containerPort: 9005
               protocol: TCP
           readinessProbe:
             httpGet:
               path: /mcp/
-              port: 9001
+              port: 9005
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /mcp/
-              port: 9001
+              port: 9005
             initialDelaySeconds: 10
             periodSeconds: 30
           env:
@@ -45,21 +45,6 @@ spec:
                 secretKeyRef:
                   name: doc-research-secret
                   key: PGVECTOR_PASSWORD
-            - name: EMBEDDING_BASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: doc-research-secret
-                  key: EMBEDDING_BASE_URL
-            - name: EMBEDDING_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: doc-research-secret
-                  key: EMBEDDING_API_KEY
-            - name: EMBEDDING_MODEL
-              valueFrom:
-                secretKeyRef:
-                  name: doc-research-secret
-                  key: EMBEDDING_MODEL
             - name: PGVECTOR_HOST
               value: postgresql
             - name: PGVECTOR_PORT
@@ -70,15 +55,15 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: doc-mcp
+  name: observability-mcp
   namespace: doc-research-lab
   labels:
-    app: doc-mcp
+    app: observability-mcp
 spec:
   selector:
-    app: doc-mcp
+    app: observability-mcp
   ports:
     - name: http
-      port: 9001
-      targetPort: 9001
+      port: 9005
+      targetPort: 9005
       protocol: TCP

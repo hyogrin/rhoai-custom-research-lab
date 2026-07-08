@@ -1,84 +1,73 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: doc-mcp
+  name: verification-mcp
   namespace: doc-research-lab
   labels:
-    app: doc-mcp
+    app: verification-mcp
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: doc-mcp
+      app: verification-mcp
   template:
     metadata:
       labels:
-        app: doc-mcp
+        app: verification-mcp
     spec:
       containers:
-        - name: doc-mcp
-          image: ${REGISTRY}/rhoai-custom-research-lab/doc_mcp:${IMAGE_TAG}
+        - name: verification-mcp
+          image: ${REGISTRY}/rhoai-custom-research-lab/verification_mcp:${IMAGE_TAG}
           ports:
             - name: http
-              containerPort: 9001
+              containerPort: 9004
               protocol: TCP
           readinessProbe:
             httpGet:
               path: /mcp/
-              port: 9001
+              port: 9004
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /mcp/
-              port: 9001
+              port: 9004
             initialDelaySeconds: 10
             periodSeconds: 30
           env:
-            - name: PGVECTOR_USER
+            - name: LLM_BASE_URL
               valueFrom:
                 secretKeyRef:
                   name: doc-research-secret
-                  key: PGVECTOR_USER
-            - name: PGVECTOR_PASSWORD
+                  key: LLM_BASE_URL
+            - name: LLM_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: doc-research-secret
-                  key: PGVECTOR_PASSWORD
-            - name: EMBEDDING_BASE_URL
+                  key: LLM_API_KEY
+            - name: LLM_MODEL
               valueFrom:
                 secretKeyRef:
                   name: doc-research-secret
-                  key: EMBEDDING_BASE_URL
-            - name: EMBEDDING_API_KEY
+                  key: LLM_MODEL
+            - name: MAAS_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: doc-research-secret
-                  key: EMBEDDING_API_KEY
-            - name: EMBEDDING_MODEL
-              valueFrom:
-                secretKeyRef:
-                  name: doc-research-secret
-                  key: EMBEDDING_MODEL
-            - name: PGVECTOR_HOST
-              value: postgresql
-            - name: PGVECTOR_PORT
-              value: "5432"
-            - name: PGVECTOR_DB
-              value: doc_research
+                  key: MAAS_API_KEY
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: doc-mcp
+  name: verification-mcp
   namespace: doc-research-lab
   labels:
-    app: doc-mcp
+    app: verification-mcp
 spec:
   selector:
-    app: doc-mcp
+    app: verification-mcp
   ports:
     - name: http
-      port: 9001
-      targetPort: 9001
+      port: 9004
+      targetPort: 9004
       protocol: TCP

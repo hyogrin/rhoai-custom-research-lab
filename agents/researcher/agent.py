@@ -10,7 +10,7 @@ from kagenti_adk.a2a.types import AgentMessage
 from langgraph.graph import StateGraph, END
 from typing import TypedDict
 
-from tools import semantic_search, rewrite_query
+from tools import semantic_search, rewrite_query, synthesize_context
 
 
 class ResearchState(TypedDict):
@@ -42,7 +42,6 @@ def search_node(state: ResearchState) -> ResearchState:
 
 def synthesize_node(state: ResearchState) -> ResearchState:
     """Synthesize retrieved passages into a coherent context summary."""
-    from tools import synthesize_context
     result = synthesize_context(state["original_query"], state["retrieved_passages"])
     return {
         **state,

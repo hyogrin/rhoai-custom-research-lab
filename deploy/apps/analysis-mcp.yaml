@@ -22,6 +22,18 @@ spec:
             - name: http
               containerPort: 9003
               protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /mcp/
+              port: 9003
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /mcp/
+              port: 9003
+            initialDelaySeconds: 10
+            periodSeconds: 30
           env:
             - name: LLM_BASE_URL
               valueFrom:

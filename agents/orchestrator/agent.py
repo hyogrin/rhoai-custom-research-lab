@@ -27,20 +27,38 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from agents.orchestrator.state import ResearchState
 from agents.orchestrator.layers.context import gather_context, load_past_failure_memory
-from agents.orchestrator.layers.tools import (
-    semantic_search,
-    web_search,
-    synthesize_context,
-    generate_plan,
-    generate_sectioned_plan,
-    draft_report,
-    draft_section,
-    assemble_report,
-)
-from agents.orchestrator.layers.verification import run_verification, verify_sections
-from agents.orchestrator.layers.observability import HarnessObserver
 from harness.failure import FailureCategory
 from harness.session import SessionManager, ResearchSession
+
+_USE_MCP = os.getenv("USE_MCP", "true").lower() in ("true", "1", "yes")
+
+if _USE_MCP:
+    from agents.orchestrator.layers.mcp_client import (
+        semantic_search,
+        web_search,
+        synthesize_context,
+        generate_plan,
+        generate_sectioned_plan,
+        draft_report,
+        draft_section,
+        assemble_report,
+        run_verification,
+        verify_sections,
+    )
+    from agents.orchestrator.layers.observability import HarnessObserver
+else:
+    from agents.orchestrator.layers.tools import (
+        semantic_search,
+        web_search,
+        synthesize_context,
+        generate_plan,
+        generate_sectioned_plan,
+        draft_report,
+        draft_section,
+        assemble_report,
+    )
+    from agents.orchestrator.layers.verification import run_verification, verify_sections
+    from agents.orchestrator.layers.observability import HarnessObserver
 
 logger = logging.getLogger(__name__)
 
