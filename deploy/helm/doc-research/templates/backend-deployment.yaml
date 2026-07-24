@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  labels:
+    {{- include "doc-research.componentLabels" (dict "name" "backend" "root" .) | nindent 4 }}
+spec:
+  replicas: {{ .Values.backend.replicas }}
+  selector:
+    matchLabels:
+      {{- include "doc-research.selectorLabels" (dict "name" "backend" "root" .) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "doc-research.componentLabels" (dict "name" "backend" "root" .) | nindent 8 }}
+    spec:
+      containers:
+        - name: backend
+          image: {{ include "doc-research.image" (dict "image" .Values.backend.image "root" .) }}
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: {{ .Values.backend.port }}
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: {{ include "doc-research.secretName" . }}
+            - configMapRef:
+                name: {{ include "doc-research.configMapName" . }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.backend.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.backend.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

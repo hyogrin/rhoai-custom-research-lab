@@ -15,17 +15,18 @@ The `AGENTS.md` file *is* the harness — it defines the plan-execute-verify-ref
 │             AGENTS.md  Harness  (inner loop)            │
 │                                                         │
 │   1. Plan        ─→  2. Execute   ─→  3. Verify        │
-│   read AGENTS.md     use MCP tools     quality checks   │
-│   search context     (doc, search,     (scoring, judge, │
-│                       analysis)         citations)      │
-│        ↑                                   │            │
+│   read AGENTS.md     MCP tools         quality checks   │
+│   direct LLM         (vector-search,   (scoring, judge, │
+│   (plan/rewrite)      web-search)       citations)     │
+│        ↑             + direct LLM          │            │
+│        │             (draft/synthesize)     │            │
 │        └──── 4. Reflect (observe) ─────────┘            │
 │               (trace, failure memory,                   │
 │                cost tracking)                           │
 └─────────────────────────────────────────────────────────┘
 ```
 
-Each MCP tool maps to a phase in the inner loop — the harness orchestrator calls them in sequence, iterating until the quality threshold is met.
+The execute phase uses **MCP tools (vector-search, web-search) for retrieval** and **direct LLM calls for plan/draft/synthesis**. The harness orchestrator iterates until the quality threshold is met.
 
 ## From Linear to Iterative
 
@@ -96,7 +97,7 @@ Iteration 3: Citation-focused search → cited draft → score 8/10 → PASS
 |------|-------|---------|
 | `normalize` | Input | Parse query, initialize session |
 | `plan` | Context + Tool | Gather context, generate plan |
-| `execute` | Tool + Execution | Search, retrieve, synthesize, draft |
+| `execute` | Tool + Execution | Search via MCP (vector-search, web-search), synthesize + draft via direct LLM |
 | `verify` | Verification | Quality, citations, facts, judge |
 | `observe` | Observability | Record metrics, determine next step |
 | `iterate` | Control | Advance iteration counter |
@@ -104,6 +105,6 @@ Iteration 3: Citation-focused search → cited draft → score 8/10 → PASS
 
 ## Lab Exercises
 
-1. **Research Agents** (notebook 2) — Build Researcher + Writer as A2A agents
-2. **Iterative Orchestrator** (notebook 3) — Implement the harness controller
+1. **Research Agents** (notebook 2) — Explore MCP-based search and LLM drafting
+2. **Iterative Orchestrator** (notebook 3) — Implement the harness controller with LangGraph
 3. **Long Transaction** (notebook 4) — Session state management and iteration

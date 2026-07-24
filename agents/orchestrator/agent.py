@@ -1,7 +1,7 @@
-"""Orchestrator Agent — Iterative harness controller for deep research.
+"""Orchestrator — Iterative harness controller for deep research.
 
-Replaces the linear pipeline with an iteration loop that evolves the research
-output through Context → Tool → Execution → Verification → Observability layers
+LangGraph StateGraph that evolves research output through
+Context → Tool → Execution → Verification → Observability layers
 until quality threshold is met or max iterations reached.
 """
 
@@ -11,11 +11,6 @@ import os
 import sys
 import uuid
 
-from a2a.types import Message
-from a2a.utils.message import get_message_text
-from kagenti_adk.server import Server
-from kagenti_adk.server.context import RunContext
-from kagenti_adk.a2a.types import AgentMessage
 from langgraph.graph import StateGraph, END
 from typing import Literal
 
@@ -27,38 +22,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from agents.orchestrator.state import ResearchState
 from agents.orchestrator.layers.context import gather_context, load_past_failure_memory
+from agents.orchestrator.layers.mcp_client import (
+    semantic_search,
+    web_search,
+    synthesize_context,
+    generate_plan,
+    generate_sectioned_plan,
+    draft_report,
+    draft_section,
+    assemble_report,
+    run_verification,
+    verify_sections,
+)
+from agents.orchestrator.layers.observability import HarnessObserver
 from harness.failure import FailureCategory
 from harness.session import SessionManager, ResearchSession
-
-_USE_MCP = os.getenv("USE_MCP", "true").lower() in ("true", "1", "yes")
-
-if _USE_MCP:
-    from agents.orchestrator.layers.mcp_client import (
-        semantic_search,
-        web_search,
-        synthesize_context,
-        generate_plan,
-        generate_sectioned_plan,
-        draft_report,
-        draft_section,
-        assemble_report,
-        run_verification,
-        verify_sections,
-    )
-    from agents.orchestrator.layers.observability import HarnessObserver
-else:
-    from agents.orchestrator.layers.tools import (
-        semantic_search,
-        web_search,
-        synthesize_context,
-        generate_plan,
-        generate_sectioned_plan,
-        draft_report,
-        draft_section,
-        assemble_report,
-    )
-    from agents.orchestrator.layers.verification import run_verification, verify_sections
-    from agents.orchestrator.layers.observability import HarnessObserver
 
 logger = logging.getLogger(__name__)
 
@@ -720,69 +698,3 @@ def build_graph():
 
 
 orchestrator_graph = build_graph()
-
-# --- A2A Server ---
-
-server = Server()
-
-
-@server.agent()
-async def orchestrator(input: Message, context: RunContext):
-    """Orchestrate iterative deep research via the harness controller."""
-    text = get_message_text(input)
-
-    has_document = False
-    file_path = ""
-    user_query = text
-
-    if "\n" in text:
-        lines = text.strip().split("\n", 1)
-        if os.path.exists(lines[0].strip()) or lines[0].strip().startswith("/"):
-            file_path = lines[0].strip()
-            user_query = lines[1].strip()
-            has_document = True
-
-    result = await orchestrator_graph.ainvoke({
-        "session_id": str(uuid.uuid4())[:12],
-        "query": user_query,
-        "file_path": file_path,
-        "has_document": has_document,
-        "iteration": 0,
-        "max_iterations": int(os.getenv("MAX_ITERATIONS", "3")),
-        "quality_threshold": float(os.getenv("QUALITY_THRESHOLD", "7.0")),
-        "language_instruction": "You MUST respond entirely in English.",
-        "research_plan": [],
-        "accumulated_context": [],
-        "current_draft": "",
-        "verification_result": {},
-        "verification_history": [],
-        "quality_score": 0.0,
-        "total_tokens": 0,
-        "total_cost": 0.0,
-        "failure_hints": "",
-        "enable_web_search": True,
-        "enable_planning": True,
-        "enable_fact_check": True,
-        "enable_parallel": True,
-        "enable_sectioned": True,
-        "report_sections": [],
-        "section_order": [],
-        "failing_sections": [],
-        "status": "normalizing",
-        "final_output": "",
-        "error": "",
-    })
-
-    if result.get("error"):
-        yield AgentMessage(text=f"Error during research: {result['error']}")
-    else:
-        yield AgentMessage(text=result.get("final_output", "No output generated"))
-
-
-def run():
-    port = int(os.getenv("ORCHESTRATOR_PORT", "8100"))
-    server.run(host="0.0.0.0", port=port)
-
-
-if __name__ == "__main__":
-    run()

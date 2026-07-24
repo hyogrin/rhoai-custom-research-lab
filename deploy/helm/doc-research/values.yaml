@@ -1,0 +1,131 @@
+# =============================================================================
+# RHOAI Custom Deep Research Lab — Helm Values
+# =============================================================================
+# App components only. Infrastructure (PostgreSQL, MinIO) managed separately.
+
+global:
+  registry: "quay.io/rhoai-lab"
+  imageTag: "latest"
+
+# -----------------------------------------------------------------------------
+# Backend (FastAPI)
+# -----------------------------------------------------------------------------
+backend:
+  image: backend
+  port: 8000
+  replicas: 1
+
+# -----------------------------------------------------------------------------
+# Frontend (Chainlit)
+# -----------------------------------------------------------------------------
+frontend:
+  image: frontend
+  port: 7860
+  replicas: 1
+  env:
+    BACKEND_URL: "http://backend:8000"
+
+# -----------------------------------------------------------------------------
+# MCP Servers
+# -----------------------------------------------------------------------------
+mcp:
+  vectorSearch:
+    name: vector-search-mcp
+    image: vector_search_mcp
+    port: 9002
+    replicas: 1
+    secretEnv:
+      - EMBEDDING_BASE_URL
+      - EMBEDDING_API_KEY
+      - EMBEDDING_MODEL
+      - PGVECTOR_USER
+      - PGVECTOR_PASSWORD
+    configEnv:
+      - PGVECTOR_HOST
+      - PGVECTOR_PORT
+      - PGVECTOR_DB
+
+  webSearch:
+    name: web-search-mcp
+    image: web_search_mcp
+    port: 9003
+    replicas: 1
+    secretEnv: []
+    configEnv:
+      - SEARXNG_URL
+
+  verification:
+    name: verification-mcp
+    image: verification_mcp
+    port: 9004
+    replicas: 1
+    secretEnv:
+      - LLM_BASE_URL
+      - LLM_API_KEY
+      - LLM_MODEL
+      - MAAS_API_KEY
+    configEnv: []
+
+  observability:
+    name: observability-mcp
+    image: observability_mcp
+    port: 9005
+    replicas: 1
+    secretEnv:
+      - PGVECTOR_USER
+      - PGVECTOR_PASSWORD
+    configEnv:
+      - PGVECTOR_HOST
+      - PGVECTOR_PORT
+      - PGVECTOR_DB
+
+# -----------------------------------------------------------------------------
+# OpenShift Route
+# -----------------------------------------------------------------------------
+route:
+  enabled: true
+
+# -----------------------------------------------------------------------------
+# Default resource limits (applied to all components)
+# -----------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# -----------------------------------------------------------------------------
+# Secret data (sensitive — override via --set or external secret manager)
+# -----------------------------------------------------------------------------
+secret:
+  LLM_BASE_URL: ""
+  LLM_API_KEY: ""
+  LLM_MODEL: "granite-3.3-8b-instruct"
+  MAAS_API_KEY: ""
+  EMBEDDING_BASE_URL: ""
+  EMBEDDING_API_KEY: ""
+  EMBEDDING_MODEL: "granite-embedding-278m-multilingual"
+  PGVECTOR_USER: "postgres"
+  PGVECTOR_PASSWORD: "postgres"
+  MLFLOW_TRACKING_URI: ""
+  MLFLOW_EXPERIMENT_NAME: "deep-research-harness"
+
+# -----------------------------------------------------------------------------
+# ConfigMap data (non-sensitive)
+# -----------------------------------------------------------------------------
+config:
+  PGVECTOR_HOST: "postgresql"
+  PGVECTOR_PORT: "5432"
+  PGVECTOR_DB: "doc_research"
+  MINIO_ENDPOINT: "minio:9000"
+  SEARXNG_URL: "http://searxng:8888"
+  VECTOR_SEARCH_MCP_URL: "http://vector-search-mcp:9002/mcp/"
+  WEB_SEARCH_MCP_URL: "http://web-search-mcp:9003/mcp/"
+  VERIFICATION_MCP_URL: "http://verification-mcp:9004/mcp/"
+  OBSERVABILITY_MCP_URL: "http://observability-mcp:9005/mcp/"
+  QUALITY_THRESHOLD: "7.0"
+  MAX_ITERATIONS: "3"
+  VERIFY_SSL: "false"
+  PARALLEL_WORKERS: "4"

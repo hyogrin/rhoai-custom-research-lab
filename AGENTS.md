@@ -1,6 +1,6 @@
 # RHOAI Custom Deep Research Lab
 
-A multi-agent system that performs custom deep research on uploaded documents using
+A research system that performs custom deep research on uploaded documents using
 harness engineering — an iterative plan-execute-verify-reflect loop that evolves
 research quality through multiple passes.
 
@@ -15,8 +15,8 @@ User Query + Documents
 │                                                         │
 │   1. Plan        ─→  2. Execute   ─→  3. Verify        │
 │   generate plan      use MCP tools     quality scoring  │
-│   rewrite queries    (doc, search,     citation check   │
-│   load context        analysis)        fact check       │
+│   rewrite queries    (vector-search,   citation check   │
+│   load context        web-search)      fact check       │
 │        ↑                                   │            │
 │        └──── 4. Reflect (fix failures) ────┘            │
 │              trace collection                           │
@@ -54,28 +54,29 @@ for standardized, network-accessible, horizontally scalable access:
 
 | MCP Server | Port | Tools | Harness Phase |
 |------------|------|-------|---------------|
-| `doc-mcp` | 9001 | `ingest_document`, `get_document_status`, `list_documents` | Execute |
-| `search-mcp` | 9002 | `semantic_search`, `search_by_document`, `get_chunk_context`, `web_search` | Execute |
-| `analysis-mcp` | 9003 | `rewrite_query`, `synthesize_context`, `generate_research_plan`, `draft_report`, `generate_sectioned_plan`, `draft_section`, `assemble_report` | Plan + Execute |
+| `vector-search-mcp` | 9002 | `semantic_search`, `search_by_document`, `get_chunk_context` | Execute |
+| `web-search-mcp` | 9003 | `web_search` | Execute |
 | `verification-mcp` | 9004 | `quality_score`, `validate_citations`, `fact_check`, `llm_as_judge`, `run_verification` | Verify |
 | `observability-mcp` | 9005 | `record_trace`, `record_failure`, `get_metrics`, `get_failure_hints`, `get_past_failure_patterns` | Reflect |
+
+Document ingestion (Docling → embedding → pgvector) is handled directly by the backend API — no MCP indirection needed.
+Query rewriting, context synthesis, research planning, and report drafting are performed as direct LLM calls within the orchestrator (no MCP overhead for pure prompt operations).
 
 ### MCP Transport
 
 - **Protocol**: Streamable HTTP (`FastMCP` with `stateless_http=True`)
 - **Endpoint convention**: `http://<server>:<port>/mcp/`
 - **Client**: `mcp.client.streamable_http.streamablehttp_client` via `agents/orchestrator/layers/mcp_client.py`
-- **Feature flag**: `USE_MCP=true` in `.env` (set to `false` for legacy direct-call mode)
 
 ## Project Structure
 
 ```
 0_setup/                  — Environment and model setup
 1_document_processing/    — Docling + pgvector (data foundation)
-2_tool_layer/             — All MCP tools (doc, search, analysis, verification, observability)
+2_tool_layer/             — MCP tool servers (vector-search, web-search, verification, observability)
 3_harness_engineering/    — AGENTS.md concept + iterative inner loop + long transaction
-4_agent_orchestration/    — Kagenti + LangGraph + A2A multi-agent orchestration
-5_deployment/             — OpenShift + Kagenti deployment
+4_agent_orchestration/    — LangGraph orchestrator + system integration
+5_deployment/             — OpenShift deployment with Helm
 6_evaluation/             — Quality and performance evaluation
 ```
 
@@ -86,18 +87,17 @@ for standardized, network-accessible, horizontally scalable access:
 ```bash
 cp sample.env .env        # Configure model endpoints
 uv sync                   # Install dependencies
-make dev-up               # Start PostgreSQL+pgvector, MinIO
-make backend-start        # Start backend + auto-start all 5 MCP servers
+make dev-up               # Start PostgreSQL+pgvector, MinIO, SearXNG
+make backend-start        # Start backend + auto-start all 4 MCP servers
 make frontend-start       # Start Chainlit UI (separate terminal)
 ```
 
 ### Running a Research Query
 
 ```bash
-curl -X POST http://localhost:8100 \
+curl -X POST http://localhost:8000/research \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"message/send","id":"1",
-       "params":{"message":{"role":"user","parts":[{"kind":"text","text":"Your research query"}]}}}'
+  -d '{"query": "Your research query", "quality_threshold": 7.0, "max_iterations": 3}'
 ```
 
 ### Testing
@@ -119,6 +119,6 @@ make lint                 # Lint Python code
 
 - Do not hardcode cluster-specific values — derive from `oc` commands or `.env`
 - Do not skip `.env` updates after creating resources
-- Do not embed tool logic directly in agents — expose via MCP servers
+- Do not wrap pure LLM prompt calls in MCP — use MCP only for tools with external system integration
 - Do not use fixed iteration counts — use quality thresholds for termination
 - Do not discard accumulated context between iterations

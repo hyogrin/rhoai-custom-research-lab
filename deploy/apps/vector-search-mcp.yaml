@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vector-search-mcp
+  namespace: doc-research-lab
+  labels:
+    app: vector-search-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vector-search-mcp
+  template:
+    metadata:
+      labels:
+        app: vector-search-mcp
+    spec:
+      containers:
+        - name: vector-search-mcp
+          image: ${REGISTRY}/rhoai-custom-research-lab/vector_search_mcp:${IMAGE_TAG}
+          ports:
+            - name: http
+              containerPort: 9002
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /mcp/
+              port: 9002
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /mcp/
+              port: 9002
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          env:
+            - name: PGVECTOR_USER
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: PGVECTOR_USER
+            - name: PGVECTOR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: PGVECTOR_PASSWORD
+            - name: EMBEDDING_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: EMBEDDING_BASE_URL
+            - name: EMBEDDING_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: EMBEDDING_API_KEY
+            - name: EMBEDDING_MODEL
+              valueFrom:
+                secretKeyRef:
+                  name: doc-research-secret
+                  key: EMBEDDING_MODEL
+            - name: PGVECTOR_HOST
+              value: postgresql
+            - name: PGVECTOR_PORT
+              value: "5432"
+            - name: PGVECTOR_DB
+              value: doc_research
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vector-search-mcp
+  namespace: doc-research-lab
+  labels:
+    app: vector-search-mcp
+spec:
+  selector:
+    app: vector-search-mcp
+  ports:
+    - name: http
+      port: 9002
+      targetPort: 9002
+      protocol: TCP

@@ -86,12 +86,10 @@ spec:
               value: doc_research
             - name: MINIO_ENDPOINT
               value: minio:9000
-            - name: DOC_MCP_URL
-              value: http://doc-mcp:9001
-            - name: SEARCH_MCP_URL
-              value: http://search-mcp:9002
-            - name: ANALYSIS_MCP_URL
-              value: http://analysis-mcp:9003
+            - name: VECTOR_SEARCH_MCP_URL
+              value: http://vector-search-mcp:9002
+            - name: WEB_SEARCH_MCP_URL
+              value: http://web-search-mcp:9003
             - name: SEARXNG_URL
               value: http://searxng:8888
             - name: VERIFY_SSL

@@ -2,20 +2,19 @@
 
 ## What This Lab Does
 
-Build a **custom deep research system using multi-agent harness engineering** on Red Hat OpenShift AI that:
+Build a **custom deep research system using harness engineering** on Red Hat OpenShift AI that:
 1. Accepts document uploads (PDF, DOCX, PPTX, XLSX)
 2. Parses them with Docling and stores semantic chunks in pgvector
-3. Performs deep research using 5 collaborating AI agents
+3. Performs iterative deep research using a LangGraph orchestrator with MCP tools
 4. Delivers comprehensive analytical reports with citations
 
-The system uses **Kagenti** as the agent control plane, **LangGraph** for agent logic, the **A2A protocol** for inter-agent communication, and **AGENTS.md for harness engineering** to define the iterative plan-execute-verify-reflect loop.
+The system uses **LangGraph** for orchestration, **MCP (Model Context Protocol)** for tool standardization, and **AGENTS.md for harness engineering** to define the iterative plan-execute-verify-reflect loop.
 
 ## Required Access
 
 - [ ] Red Hat OpenShift cluster (4.17+) with admin access
 - [ ] OpenShift AI (RHOAI) 3.4+ installed
 - [ ] **LLM and embedding models already deployed** (or any OpenAI-compatible endpoint)
-- [ ] Kagenti operator installed (or access to install)
 
 > **Note:** This lab assumes models are pre-deployed. Fill in `LLM_BASE_URL` and `EMBEDDING_BASE_URL` in your `.env` before starting. The setup notebook verifies connectivity only — it does not deploy models.
 
@@ -32,7 +31,7 @@ The system uses **Kagenti** as the agent control plane, **LangGraph** for agent 
 ## Optional (for local development without cluster)
 
 For running the full system locally without an OpenShift cluster:
-- Podman Compose (for PostgreSQL + MinIO containers)
+- Podman Compose (for PostgreSQL + MinIO + SearXNG containers)
 - A local LLM server (e.g., LM Studio, Ollama) with OpenAI-compatible API
 
 ## Environment Setup
@@ -48,7 +47,7 @@ cp sample.env .env
 # 3. Install Python dependencies
 uv sync
 
-# 4. Start local services (PostgreSQL+pgvector, MinIO)
+# 4. Start local services (PostgreSQL+pgvector, MinIO, SearXNG)
 make dev-up
 
 # 5. Begin with Phase 0 notebooks
@@ -58,8 +57,8 @@ make dev-up
 
 If running on a cluster, ensure:
 - Outbound access to container registries (quay.io, registry.redhat.io)
-- Route access for agent endpoints
-- Internal service communication between agent pods
+- Route access for service endpoints
+- Internal service communication between pods
 
 ## Next Step
 

@@ -37,12 +37,9 @@ from backend.observability import init_mlflow
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-_USE_MCP = os.getenv("USE_MCP", "true").lower() in ("true", "1", "yes")
-
 MCP_SERVERS = [
-    ("doc-mcp", "mcp_servers.doc_mcp.server", 9001),
-    ("search-mcp", "mcp_servers.search_mcp.server", 9002),
-    ("analysis-mcp", "mcp_servers.analysis_mcp.server", 9003),
+    ("vector-search-mcp", "mcp_servers.vector_search_mcp.server", 9002),
+    ("web-search-mcp", "mcp_servers.web_search_mcp.server", 9003),
     ("verification-mcp", "mcp_servers.verification_mcp.server", 9004),
     ("observability-mcp", "mcp_servers.observability_mcp.server", 9005),
 ]
@@ -57,11 +54,7 @@ def _port_in_use(port: int) -> bool:
 
 
 def _start_mcp_servers():
-    """Start MCP servers as subprocesses if USE_MCP is enabled."""
-    if not _USE_MCP:
-        logger.info("USE_MCP=false — skipping MCP server startup")
-        return
-
+    """Start MCP servers as subprocesses."""
     for name, module, port in MCP_SERVERS:
         if _port_in_use(port):
             logger.info("MCP server %s already running on port %d — skipping", name, port)
@@ -673,8 +666,8 @@ _upload_status: dict[str, dict] = {}
 
 
 def _semantic_chunk_document(doc) -> list[dict]:
-    """Split a Docling document using the same logic as doc_processor."""
-    from agents.doc_processor.tools import semantic_chunk_document
+    """Split a Docling document using semantic chunking."""
+    from lib.document_processing import semantic_chunk_document
     return semantic_chunk_document(doc)
 
 
@@ -697,7 +690,7 @@ def _process_documents_background(upload_id: str, file_paths: list[str]):
 
     try:
         from docling.document_converter import DocumentConverter
-        from agents.doc_processor.tools import get_embeddings, get_db_connection
+        from lib.document_processing import get_embeddings, get_db_connection
         import psycopg2.extras
         import hashlib
 

@@ -1,0 +1,72 @@
+{{- range $key, $server := .Values.mcp }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $server.name }}
+  labels:
+    {{- include "doc-research.componentLabels" (dict "name" $server.name "root" $) | nindent 4 }}
+spec:
+  replicas: {{ $server.replicas | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "doc-research.selectorLabels" (dict "name" $server.name "root" $) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "doc-research.componentLabels" (dict "name" $server.name "root" $) | nindent 8 }}
+    spec:
+      containers:
+        - name: {{ $server.name }}
+          image: {{ include "doc-research.image" (dict "image" $server.image "root" $) }}
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: {{ $server.port }}
+              protocol: TCP
+          env:
+            {{- range $server.secretEnv }}
+            - name: {{ . }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "doc-research.secretName" $ }}
+                  key: {{ . }}
+            {{- end }}
+            {{- range $server.configEnv }}
+            - name: {{ . }}
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "doc-research.configMapName" $ }}
+                  key: {{ . }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /mcp/
+              port: {{ $server.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /mcp/
+              port: {{ $server.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml $.Values.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $server.name }}
+  labels:
+    {{- include "doc-research.componentLabels" (dict "name" $server.name "root" $) | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "doc-research.selectorLabels" (dict "name" $server.name "root" $) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $server.port }}
+      targetPort: {{ $server.port }}
+      protocol: TCP
+{{- end }}

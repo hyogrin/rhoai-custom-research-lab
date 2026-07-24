@@ -1,6 +1,6 @@
 # RHOAI Custom Deep Research Lab
 
-A hands-on lab for building **custom deep research systems** using **multi-agent harness engineering** on **Red Hat OpenShift AI (RHOAI)**. Upload documents, perform iterative deep research through collaborative AI agents with quality-driven feedback loops, and receive comprehensive analytical reports.
+A hands-on lab for building **custom deep research systems** using **harness engineering** on **Red Hat OpenShift AI (RHOAI)**. Upload documents, perform iterative deep research through a quality-driven feedback loop, and receive comprehensive analytical reports.
 
 ## Architecture
 
@@ -12,12 +12,11 @@ flowchart TB
         Backend["FastAPI Backend\n:8000\n(SSE Streaming)"]
     end
 
-    subgraph Agents ["Agent Layer · A2A Protocol · Kagenti"]
-        Orch["Orchestrator\n:8100\n(LangGraph)"]
-        DocProc["Doc Processor\n:8101\n(Docling)"]
-        Researcher["Researcher\n:8102\n(RAG)"]
-        Writer["Writer\n:8103\n(Report)"]
-        Reviewer["Reviewer\n:8104\n(QA)"]
+    subgraph Orchestrator ["LangGraph Orchestrator"]
+        Graph["StateGraph\n(harness controller)"]
+        MCPClient["MCP Client Layer"]
+        Context["Context Layer"]
+        Observability["Observability Layer"]
     end
 
     subgraph Harness ["AGENTS.md Harness — Iterative Inner Loop"]
@@ -31,9 +30,8 @@ flowchart TB
     end
 
     subgraph MCP ["MCP Tool Layer · FastMCP · Streamable HTTP"]
-        DocMCP["doc-mcp\n:9001\ningest, status, list"]
-        SearchMCP["search-mcp\n:9002\nsemantic, web search"]
-        AnalysisMCP["analysis-mcp\n:9003\nplan, draft, assemble"]
+        VectorMCP["vector-search-mcp\n:9002\nsemantic search"]
+        WebMCP["web-search-mcp\n:9003\nweb search (SearXNG)"]
         VerifMCP["verification-mcp\n:9004\nscore, cite, fact-check"]
         ObsMCP["observability-mcp\n:9005\ntrace, failure, metrics"]
     end
@@ -47,21 +45,14 @@ flowchart TB
     Browser -- "HTTP" --> Chainlit
     Chainlit -- "REST + SSE" --> Backend
     Backend -- "auto-start\nsubprocess" --> MCP
-    Backend -- "invoke" --> Orch
-    Orch -- "A2A\nJSON-RPC 2.0" --> DocProc & Researcher & Writer & Reviewer
-    Orch -.-> Harness
-    DocProc & Researcher & Writer & Reviewer -- "MCP\nstreamable-http" --> MCP
-    Orch -- "MCP client" --> MCP
-    DocMCP & SearchMCP --> PG
-    DocMCP --> MinIO
-    AnalysisMCP & VerifMCP --> vLLM
-    SearchMCP --> vLLM
-
-    style UI fill:#e8f4fd,stroke:#2196f3
-    style Agents fill:#fff3e0,stroke:#ff9800
-    style Harness fill:#fce4ec,stroke:#e91e63
-    style MCP fill:#e8f5e9,stroke:#4caf50
-    style Infra fill:#f3e5f5,stroke:#9c27b0
+    Backend -- "invoke graph" --> Graph
+    Backend -- "Docling direct" --> PG
+    Backend -- "file store" --> MinIO
+    Graph -.-> Harness
+    MCPClient -- "MCP\nstreamable-http" --> MCP
+    VectorMCP --> PG
+    WebMCP & VerifMCP --> vLLM
+    VectorMCP --> vLLM
 ```
 
 ### Harness Inner Loop Detail
@@ -86,14 +77,13 @@ flowchart TB
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
 | Harness Engineering | AGENTS.md | Project-specific agent instructions, inner loop definition |
-| Agent Control Plane | Kagenti | K8s-native agent lifecycle, identity, discovery |
-| Agent Framework | LangGraph | Stateful graph-based agent logic |
-| Inter-agent Protocol | A2A (Agent-to-Agent) | Standardized agent communication (JSON-RPC 2.0) |
+| Orchestration | LangGraph | Stateful graph-based harness controller |
 | Tool Protocol | MCP (Model Context Protocol) | Standardized tool exposure via FastMCP + streamable-http |
 | Document Intelligence | Docling | PDF/DOCX/PPTX parsing, table extraction, OCR |
 | Vector Store | PostgreSQL + pgvector | Semantic search over document embeddings |
 | Object Storage | MinIO | Document file storage |
 | Model Serving | RHOAI vLLM | LLM and embedding inference |
+| Web UI | Chainlit + FastAPI | Interactive research with real-time SSE progress |
 
 ## Lab Flow
 
@@ -101,10 +91,10 @@ flowchart TB
 |-------|--------|-------|-------------|
 | **0** | `0_setup/` | Environment & model setup | Cluster ready, model endpoints verified |
 | **1** | `1_document_processing/` | Docling + pgvector | Documents parsed, chunked, embedded |
-| **2** | `2_tool_layer/` | MCP tool servers | All MCP tools built and tested (doc, search, analysis, verification, observability) |
+| **2** | `2_tool_layer/` | MCP tool servers | All MCP tools built and tested (vector-search, web-search, verification, observability) |
 | **3** | `3_harness_engineering/` | AGENTS.md + inner loop | Iterative harness with quality-driven research |
-| **4** | `4_agent_orchestration/` | Kagenti + A2A orchestration | Multi-agent pipeline with harness integration |
-| **5** | `5_deployment/` | OpenShift deployment | Agents running on cluster via Kagenti |
+| **4** | `4_agent_orchestration/` | LangGraph system integration | Full pipeline wired and tested end-to-end |
+| **5** | `5_deployment/` | OpenShift deployment | System running on cluster via Helm |
 | **6** | `6_evaluation/` | Quality & performance | Research quality metrics validated |
 
 ## Quick Start
@@ -133,7 +123,7 @@ uv sync
 4. Start local services:
 
 ```bash
-make dev-up   # PostgreSQL+pgvector, MinIO
+make dev-up   # PostgreSQL+pgvector, MinIO, SearXNG
 ```
 
 5. Follow phases 0–6 in order.
@@ -146,22 +136,19 @@ The project includes a web UI (Chainlit frontend + FastAPI backend) for interact
 flowchart LR
     A["make dev-up"] --> B["make backend-start"]
     B --> C["make frontend-start"]
-    B -. "auto-starts\n5 MCP servers\nas subprocesses" .-> D["MCP :9001-9005"]
-
-    style B fill:#e8f5e9,stroke:#4caf50
-    style D fill:#e8f5e9,stroke:#4caf50,stroke-dasharray:5 5
+    B -. "auto-starts\n4 MCP servers\nas subprocesses" .-> D["MCP :9002-9005"]
 ```
 
 1. Start infrastructure (only once):
 
 ```bash
-make dev-up          # PostgreSQL+pgvector, MinIO
+make dev-up          # PostgreSQL+pgvector, MinIO, SearXNG
 ```
 
-2. Start the backend API (auto-starts all 5 MCP servers):
+2. Start the backend API (auto-starts all 4 MCP servers):
 
 ```bash
-make backend-start   # FastAPI :8000 + MCP :9001-9005
+make backend-start   # FastAPI :8000 + MCP :9002-9005
 ```
 
 3. Start the frontend (in a separate terminal):
@@ -184,22 +171,14 @@ To stop everything:
 make ui-stop         # Stops backend + frontend + MCP servers
 ```
 
-> Set `USE_MCP=false` in `.env` to disable automatic MCP server startup (legacy direct-call mode).
-
 ## System Ports
 
 | Service | Port | Protocol | Description |
 |---------|------|----------|-------------|
 | Chainlit Frontend | 7860 | HTTP | Web UI |
-| FastAPI Backend | 8000 | HTTP + SSE | API server (auto-starts MCP subprocesses) |
-| Orchestrator Agent | 8100 | A2A (JSON-RPC) | Harness inner loop coordinator |
-| Doc Processor Agent | 8101 | A2A | Document ingestion via Docling |
-| Researcher Agent | 8102 | A2A | RAG search + context synthesis |
-| Writer Agent | 8103 | A2A | Report generation |
-| Reviewer Agent | 8104 | A2A | Quality scoring + feedback |
-| doc-mcp | 9001 | MCP (streamable-http) | Document ingest, status, listing |
-| search-mcp | 9002 | MCP (streamable-http) | Semantic search, web search |
-| analysis-mcp | 9003 | MCP (streamable-http) | Plan, draft sections, assemble report |
+| FastAPI Backend | 8000 | HTTP + SSE | API server (auto-starts MCP subprocesses, Docling direct ingest) |
+| vector-search-mcp | 9002 | MCP (streamable-http) | Semantic search over pgvector |
+| web-search-mcp | 9003 | MCP (streamable-http) | Web search via SearXNG |
 | verification-mcp | 9004 | MCP (streamable-http) | Quality score, citation/fact check |
 | observability-mcp | 9005 | MCP (streamable-http) | Traces, failures, metrics |
 
@@ -209,7 +188,6 @@ make ui-stop         # Stops backend + frontend + MCP servers
 |-----------|---------|---------|
 | Red Hat OpenShift | 4.17+ | Container platform |
 | OpenShift AI (RHOAI) | 3.4+ | Model serving (vLLM) |
-| Kagenti | v0.2+ | Agent control plane |
 | Python | 3.11+ | Lab notebooks and agent code |
 | uv | 0.4+ | Python package manager |
 | Podman | 4+ | Container builds (optional) |
@@ -217,7 +195,7 @@ make ui-stop         # Stops backend + frontend + MCP servers
 ## References
 
 - [AGENTS.md](https://github.com/agentsmd/agents.md) — Open format for AI agent instructions
-- [Kagenti ADK](https://github.com/kagenti/adk) — Agent Development Kit
-- [Kagenti Platform](https://github.com/kagenti/kagenti) — K8s control plane
+- [LangGraph](https://langchain-ai.github.io/langgraph/) — Stateful graph-based agent framework
+- [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) — Tool protocol standard
 - [Docling](https://github.com/docling-project/docling) — Document intelligence
-- [A2A Protocol](https://google.github.io/A2A) — Agent-to-Agent standard
+- [FastMCP](https://github.com/jlowin/fastmcp) — Python MCP server framework

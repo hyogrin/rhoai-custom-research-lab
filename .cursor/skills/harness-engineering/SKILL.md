@@ -93,11 +93,11 @@ Instead of embedding tool logic directly into agents, expose capabilities as
 **Model Context Protocol (MCP) servers**. Each layer of the harness maps to one
 or more MCP tools:
 
-| Harness Phase | MCP Tools | Purpose |
-|---------------|-----------|---------|
-| Plan | `analysis-mcp` | Generate research plans, rewrite queries |
-| Execute | `doc-mcp`, `search-mcp` | Ingest documents, semantic search |
-| Execute | `analysis-mcp` | Synthesize context, draft reports |
+| Harness Phase | Tools | Purpose |
+|---------------|-------|---------|
+| Plan | Direct LLM calls | Generate research plans, rewrite queries |
+| Execute | `vector-search-mcp`, `web-search-mcp` | Semantic search, web search |
+| Execute | Direct LLM calls | Synthesize context, draft reports |
 | Verify | `verification-mcp` | Quality scoring, citation check, fact check, LLM-as-judge |
 | Reflect | `observability-mcp` | Trace collection, failure memory, metrics |
 
