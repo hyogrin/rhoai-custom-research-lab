@@ -1,14 +1,16 @@
 """Shared pytest fixtures for the RHOAI research lab test suite."""
 
 import os
+import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 
 @pytest.fixture(autouse=True)
-def env_setup(monkeypatch):
-    """Set environment variables for testing — mock LLM, PG, and MCP URLs."""
+def env_setup(monkeypatch, tmp_path):
+    """Set environment variables for testing — mock LLM, SQLite, and MCP URLs."""
+    db_path = str(tmp_path / "test_research.db")
     env_vars = {
         "LLM_BASE_URL": "http://localhost:8000/v1",
         "LLM_API_KEY": "test-key",
@@ -17,11 +19,7 @@ def env_setup(monkeypatch):
         "EMBEDDING_BASE_URL": "http://localhost:8000/v1",
         "EMBEDDING_API_KEY": "test-key",
         "EMBEDDING_MODEL": "test-embedding-model",
-        "PGVECTOR_HOST": "localhost",
-        "PGVECTOR_PORT": "5432",
-        "PGVECTOR_DB": "test_db",
-        "PGVECTOR_USER": "test_user",
-        "PGVECTOR_PASSWORD": "test_pass",
+        "SQLITE_DB_PATH": db_path,
         "VECTOR_SEARCH_MCP_URL": "http://localhost:9002",
         "WEB_SEARCH_MCP_URL": "http://localhost:9003",
         "VERIFICATION_MCP_URL": "http://localhost:9004",
@@ -60,17 +58,27 @@ def mock_llm_response():
 
 @pytest.fixture
 def mock_db_connection():
-    """Patch psycopg2.connect to return a mock database connection."""
-    mock_cursor = MagicMock()
-    mock_cursor.fetchall.return_value = []
-    mock_cursor.fetchone.return_value = (1,)
+    """Provide a real in-memory SQLite connection for testing.
 
-    mock_conn = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
+    Loads sqlite-vec if available; skips vec0 tables otherwise.
+    """
+    import sqlite3
 
-    with patch("psycopg2.connect", return_value=mock_conn) as mock_connect:
-        yield {
-            "connect": mock_connect,
-            "connection": mock_conn,
-            "cursor": mock_cursor,
-        }
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+
+    try:
+        import sqlite_vec
+
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+
+        init_sql = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts", "init-db.sql")
+        with open(init_sql) as f:
+            conn.executescript(f.read())
+    except (AttributeError, OSError, Exception):
+        pass
+
+    yield conn
+    conn.close()

@@ -1,4 +1,4 @@
-# Phase 6: Evaluation
+# Phase 6: Observability & Evaluation
 
 ## Overview
 
@@ -14,6 +14,47 @@ notebook with hands-on setup and visual results in RHOAI dashboards.
    Grafana            MLflow UI            MLflow GenAI            KFP on RHOAI
    LokiStack          autolog tracing      Prompt Registry         Scheduled eval
    Prometheus         span trees           Scorers + Judge         Pipeline runs
+```
+
+## Prerequisites
+
+### MLflow on RHOAI 3.4
+
+Starting with RHOAI 3.4, MLflow is a fully supported, managed component
+deployed via the MLflow Operator. A single cluster-scoped MLflow instance
+serves all projects, with each OpenShift project mapping to an MLflow workspace.
+
+> Ref: [Working with MLflow — RHOAI 3.4](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/working_with_mlflow/index)
+
+### Setting up MLFLOW_TRACKING_URI
+
+Get the tracking URI and token via CLI:
+
+```bash
+echo "$(oc get route rhods-dashboard -n redhat-ods-applications -o jsonpath='https://{.spec.host}')/mlflow"
+oc whoami --show-token
+```
+
+Then add the output values to `.env`:
+
+```bash
+MLFLOW_TRACKING_URI=<output-of-first-command>
+MLFLOW_TRACKING_TOKEN=<output-of-second-command>
+MLFLOW_WORKSPACE=<project-name>
+MLFLOW_EXPERIMENT_NAME=deep-research-harness
+```
+
+For self-signed certificates, also add:
+
+```bash
+MLFLOW_TRACKING_INSECURE_TLS=true
+```
+
+### Verify Connectivity
+
+```python
+import mlflow
+print(mlflow.list_workspaces())
 ```
 
 ## Notebooks

@@ -1,5 +1,5 @@
-.PHONY: help setup dev-up dev-down mcp-start mcp-stop test lint clean \
-	backend-start frontend-start ui-start ui-stop \
+.PHONY: help setup mcp-start mcp-stop test lint clean \
+	backend-start backend-stop backend-restart frontend-start start stop \
 	build-all push-all deploy deploy-infra deploy-apps deploy-mcp undeploy
 
 REGISTRY ?= quay.io/your-org
@@ -17,15 +17,6 @@ help: ## Show this help
 setup: ## Install all Python dependencies
 	uv sync
 
-dev-up: ## Start local dev services (PostgreSQL+pgvector, MinIO, SearXNG)
-	podman-compose -f compose.yml up -d
-
-dev-down: ## Stop local dev services
-	podman-compose -f compose.yml down
-
-dev-logs: ## Show logs from local dev services
-	podman-compose -f compose.yml logs -f
-
 mcp-start: ## Start all MCP servers locally
 	@echo "Starting vector-search-mcp on port 9002..."
 	@uv run python -m mcp_servers.vector_search_mcp.server &
@@ -38,7 +29,11 @@ mcp-start: ## Start all MCP servers locally
 	@echo "All MCP servers started (ports 9002-9005)."
 
 mcp-stop: ## Stop all locally running MCP servers
-	@pkill -f "mcp_servers\." || true
+	@for port in 9002 9003 9004 9005; do \
+		pid=$$(lsof -ti :$$port 2>/dev/null); \
+		if [ -n "$$pid" ]; then kill $$pid 2>/dev/null && echo "Killed PID $$pid on port $$port"; fi; \
+	done
+	@pkill -f "mcp_servers\." 2>/dev/null || true
 	@echo "All MCP servers stopped."
 
 test: ## Run all tests
@@ -61,19 +56,37 @@ backend-start: ## Start backend (auto-starts MCP servers as subprocesses)
 frontend-start: ## Start the Chainlit frontend UI
 	cd frontend && uv run chainlit run app.py --host 0.0.0.0 --port $${FRONTEND_PORT:-7860}
 
-ui-start: ## Start backend + frontend together
-	@echo "Starting backend on port $${BACKEND_PORT:-8000}..."
-	@uv run uvicorn backend.api:app --host 0.0.0.0 --port $${BACKEND_PORT:-8000} &
-	@sleep 2
-	@echo "Starting frontend on port $${FRONTEND_PORT:-7860}..."
-	@cd frontend && uv run chainlit run app.py --host 0.0.0.0 --port $${FRONTEND_PORT:-7860} &
-	@echo "UI started: http://localhost:$${FRONTEND_PORT:-7860}"
+start: ## Show how to start all services
+	@echo "========================================="
+	@echo " Start services in separate terminals:"
+	@echo "========================================="
+	@echo ""
+	@echo "  Terminal 1 — Backend + MCP servers:"
+	@echo "    make backend-start"
+	@echo ""
+	@echo "  Terminal 2 — Frontend UI:"
+	@echo "    make frontend-start"
+	@echo ""
+	@echo "  Then open: http://localhost:$${FRONTEND_PORT:-7860}"
+	@echo "========================================="
 
-ui-stop: ## Stop UI processes (MCP subprocesses auto-terminate with backend)
-	@pkill -f "uvicorn backend.api" || true
-	@pkill -f "chainlit run" || true
-	@pkill -f "mcp_servers\." || true
-	@echo "UI stopped."
+backend-stop: ## Stop backend + MCP servers (port-based, reliable)
+	@echo "Stopping backend..."
+	@pid=$$(lsof -ti :$${BACKEND_PORT:-8000} 2>/dev/null); \
+		if [ -n "$$pid" ]; then kill $$pid 2>/dev/null; echo "Killed backend PID $$pid"; \
+		else echo "Backend not running"; fi
+	@sleep 1
+	@$(MAKE) --no-print-directory mcp-stop
+
+backend-restart: ## Clean stop + start backend (use instead of Ctrl+C)
+	@$(MAKE) --no-print-directory backend-stop
+	@sleep 1
+	@$(MAKE) --no-print-directory backend-start
+
+stop: ## Stop all services
+	@$(MAKE) --no-print-directory backend-stop
+	@pkill -f "chainlit run" 2>/dev/null || true
+	@echo "All services stopped."
 
 sse-test: ## Run SSE smoke test
 	uv run python backend/test_sse.py
@@ -103,7 +116,7 @@ push-all: ## Push ALL images to $(REGISTRY)
 deploy: deploy-infra deploy-apps deploy-mcp ## Deploy all components to OpenShift
 	@echo "=== Deployment complete ==="
 
-deploy-infra: ## Deploy namespace, secret, PostgreSQL, MinIO
+deploy-infra: ## Deploy namespace + secrets
 	@echo "=== Deploying infrastructure ==="
 	oc apply -f deploy/namespace.yaml
 	@. ./.env 2>/dev/null; export $$(grep -v '^#' .env | xargs) 2>/dev/null; \
@@ -111,8 +124,6 @@ deploy-infra: ## Deploy namespace, secret, PostgreSQL, MinIO
 	oc create configmap init-db-sql --from-file=scripts/init-db.sql \
 		-n $(NAMESPACE) --dry-run=client -o yaml | oc apply -f -
 	oc apply -f deploy/infra/ -n $(NAMESPACE)
-	@echo "Waiting for PostgreSQL to be ready..."
-	oc wait --for=condition=ready pod -l app=postgresql -n $(NAMESPACE) --timeout=120s
 	@echo "Waiting for MinIO to be ready..."
 	oc wait --for=condition=ready pod -l app=minio -n $(NAMESPACE) --timeout=120s
 

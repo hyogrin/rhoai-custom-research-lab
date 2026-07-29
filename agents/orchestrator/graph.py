@@ -12,17 +12,18 @@ import sys
 import uuid
 
 from langgraph.graph import StateGraph, END
-from typing import Literal
+from langgraph.types import StreamWriter
+from typing import Callable, Literal
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from agents.orchestrator.state import ResearchState
 from agents.orchestrator.layers.context import gather_context, load_past_failure_memory
-from agents.orchestrator.layers.mcp_client import (
+from agents.orchestrator.layers.tools import (
     semantic_search,
     web_search,
     synthesize_context,
@@ -33,6 +34,8 @@ from agents.orchestrator.layers.mcp_client import (
     assemble_report,
     run_verification,
     verify_sections,
+    classify_intent,
+    direct_response,
 )
 from agents.orchestrator.layers.observability import HarnessObserver
 from harness.failure import FailureCategory
@@ -59,7 +62,7 @@ def _get_session_mgr() -> SessionManager:
 
 
 def checkpoint_session(state: ResearchState):
-    """Persist the current graph state to PostgreSQL for frontend resume."""
+    """Persist the current graph state to SQLite for frontend resume."""
     try:
         mgr = _get_session_mgr()
         session = ResearchSession(
@@ -108,6 +111,55 @@ def normalize_node(state: ResearchState) -> dict:
         "iteration": 1,
         "status": "planning",
         "failure_hints": past_memory,
+    }
+    checkpoint_session({**state, **update})
+    return update
+
+
+def classify_intent_node(state: ResearchState) -> dict:
+    """Classify query intent and route accordingly."""
+    observer = _get_observer(state["session_id"])
+    result = classify_intent(state["query"])
+    observer.trace_tool_call(
+        iteration=state["iteration"],
+        operation="classify_intent",
+        input_summary=state["query"][:200],
+        output_summary=f"intent={result.get('intent')}, reason={result.get('reason', '')}",
+        tokens_used=result.get("tokens_used", 0),
+    )
+    intent = result.get("intent", "research")
+    update = {
+        "status": "responding" if intent == "casual" else "planning",
+        "intent": intent,
+        "total_tokens": state.get("total_tokens", 0) + result.get("tokens_used", 0),
+    }
+    checkpoint_session({**state, **update})
+    return update
+
+
+def route_by_intent(state: ResearchState) -> Literal["plan", "direct_response"]:
+    """Route based on classified intent."""
+    if state.get("intent") == "casual":
+        return "direct_response"
+    return "plan"
+
+
+def direct_response_node(state: ResearchState) -> dict:
+    """Generate a direct conversational response for non-research queries."""
+    observer = _get_observer(state["session_id"])
+    result = direct_response(state["query"], state.get("language_instruction", ""))
+    observer.trace_tool_call(
+        iteration=state["iteration"],
+        operation="direct_response",
+        input_summary=state["query"][:200],
+        output_summary=result.get("response", "")[:200],
+        tokens_used=result.get("tokens_used", 0),
+    )
+    update = {
+        "current_draft": result.get("response", ""),
+        "quality_score": 10.0,
+        "status": "complete",
+        "total_tokens": state.get("total_tokens", 0) + result.get("tokens_used", 0),
     }
     checkpoint_session({**state, **update})
     return update
@@ -192,17 +244,18 @@ def plan_node(state: ResearchState) -> dict:
 _PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "4"))
 
 
-def _process_one_section(
+def _search_section(
     topic: dict, query: str, iteration: int, ws_flag: bool, parallel: bool,
-    previous_content: str, failure_hints: str, language_instruction: str,
 ) -> dict:
-    """Search and draft a single section. Thread-safe — called from ThreadPoolExecutor."""
+    """Run search queries for a single section and return context + counts."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     title = topic.get("title", "Untitled")
     queries = topic.get("queries", [query])
 
     section_context: list[dict] = []
+    semantic_count = 0
+    web_count = 0
 
     if parallel:
         futures_map: dict = {}
@@ -219,23 +272,46 @@ def _process_one_section(
                     for r in results:
                         r.setdefault("metadata", {})["sub_topic"] = title
                     section_context.extend(results)
+                    if kind == "semantic":
+                        semantic_count += len(results)
+                    else:
+                        web_count += len(results)
                 except Exception as e:
-                    logger.error("Section '%s' search (%s) failed: %s", title, kind, e)
+                    logger.error("Section '%s' search (%s) failed: %s", title, kind, e, exc_info=True)
     else:
         for idx, q in enumerate(queries[:3]):
             for r in _run_semantic(q, iteration):
                 r.setdefault("metadata", {})["sub_topic"] = title
                 section_context.append(r)
+                semantic_count += 1
             if ws_flag and idx == 0:
                 for r in _run_web(q, iteration):
                     r.setdefault("metadata", {})["sub_topic"] = title
                     section_context.append(r)
+                    web_count += 1
+
+    return {
+        "context": section_context,
+        "semantic_count": semantic_count,
+        "web_count": web_count,
+    }
+
+
+def _draft_and_build_section(
+    topic: dict, query: str, search_result: dict,
+    previous_content: str, failure_hints: str, language_instruction: str,
+    stream_callback: Callable[[str], None] | None = None,
+) -> dict:
+    """Draft a section from search results and return the section data."""
+    title = topic.get("title", "Untitled")
+    section_context = search_result["context"]
 
     result = draft_section(
         query, topic, section_context,
         previous_content=previous_content,
         improvement_hints=failure_hints,
         language_instruction=language_instruction,
+        stream_callback=stream_callback,
     )
 
     section_data = {
@@ -250,12 +326,21 @@ def _process_one_section(
         "context": section_context,
         "tokens_used": result.get("tokens_used", 0),
         "title": title,
+        "semantic_count": search_result["semantic_count"],
+        "web_count": search_result["web_count"],
     }
 
 
-def _execute_sections(state: ResearchState) -> dict:
-    """Per-section execute path: search and draft sub-topics in parallel."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+def _execute_sections(state: ResearchState, writer: StreamWriter) -> dict:
+    """Per-section execute path: process sections sequentially, parallelize MCP calls within each.
+
+    Uses writer() for real-time SSE progress between search and draft phases.
+    """
+    try:
+        import mlflow
+        _mlflow = mlflow
+    except Exception:
+        _mlflow = None
 
     observer = _get_observer(state["session_id"])
     iteration = state["iteration"]
@@ -280,13 +365,7 @@ def _execute_sections(state: ResearchState) -> dict:
         previous_contents[title] = existing.get("content", "") if existing else ""
         topics_to_process.append(topic)
 
-    def _run_section(topic):
-        return _process_one_section(
-            topic, state["query"], iteration, ws_flag, parallel,
-            previous_contents.get(topic.get("title", ""), ""),
-            state.get("failure_hints", ""),
-            state.get("language_instruction", ""),
-        )
+    total_sections = len(topics_to_process)
 
     def _collect_section(topic, out):
         nonlocal total_tokens
@@ -307,32 +386,99 @@ def _execute_sections(state: ResearchState) -> dict:
         )
         logger.info("Drafted section '%s' (%d chars)", title, len(out["section_data"]["content"]))
 
-    if parallel:
-        with ThreadPoolExecutor(max_workers=min(_PARALLEL_WORKERS, len(topics_to_process) or 1)) as pool:
-            futures = {pool.submit(_run_section, t): t for t in topics_to_process}
-            for future in as_completed(futures):
-                topic = futures[future]
-                try:
-                    _collect_section(topic, future.result())
-                except Exception as e:
-                    title = topic.get("title", "Untitled")
-                    logger.error("Section '%s' failed: %s", title, e)
-                    sections.append({
-                        "sub_topic": title, "content": "",
-                        "search_context": [], "score": 0.0, "status": "failed",
-                    })
-    else:
-        for topic in topics_to_process:
-            try:
-                _collect_section(topic, _run_section(topic))
-            except Exception as e:
-                title = topic.get("title", "Untitled")
-                logger.error("Section '%s' failed: %s", title, e)
-                sections.append({
-                    "sub_topic": title, "content": "",
-                    "search_context": [], "score": 0.0, "status": "failed",
-                })
+    for idx, topic in enumerate(topics_to_process, 1):
+        title = topic.get("title", "Untitled")
+        evt_base = {"section_title": title, "section_index": idx, "total_sections": total_sections}
 
+        # --- Phase 1: Search ---
+        writer({"progress": "section_start", **evt_base})
+
+        try:
+            search_result = _search_section(topic, state["query"], iteration, ws_flag, parallel)
+        except Exception as e:
+            logger.error("Section '%s' search failed: %s", title, e, exc_info=True)
+            sections.append({"sub_topic": title, "content": "", "search_context": [], "score": 0.0, "status": "failed"})
+            writer({"progress": "section_failed", **evt_base})
+            continue
+
+        sem = search_result["semantic_count"]
+        web = search_result["web_count"]
+
+        if sem == 0 and web == 0:
+            err_msg = f"No search results for section '{title}' — check document ingestion and DB connection"
+            logger.error("Aborting execution: %s", err_msg)
+            writer({"progress": "section_failed", **evt_base})
+            return {
+                "accumulated_context": new_context,
+                "report_sections": sections,
+                "current_draft": "",
+                "status": "error",
+                "error": err_msg,
+                "total_tokens": total_tokens,
+            }
+
+        doc_sources: set[str] = set()
+        web_urls: list[str] = []
+        for ctx in search_result["context"]:
+            src = ctx.get("source", "")
+            if src.startswith("web:"):
+                url = ctx.get("metadata", {}).get("url", src[4:])
+                if url and url not in web_urls:
+                    web_urls.append(url)
+            elif src:
+                doc_name = src.split("[")[0] if "[" in src else src
+                doc_sources.add(doc_name)
+
+        writer({
+            "progress": "search_done",
+            "semantic_count": sem, "web_count": web,
+            "doc_sources": list(doc_sources),
+            "web_urls": web_urls[:5],
+            **evt_base,
+        })
+
+        # --- Phase 2: Draft (with token streaming) ---
+        writer({"progress": "drafting", **evt_base})
+
+        def _on_draft_chunk(text: str) -> None:
+            writer({"progress": "draft_chunk", "text": text, **evt_base})
+
+        try:
+            span_ctx = _mlflow.start_span(name=f"section:{title}") if _mlflow else None
+            span = span_ctx.__enter__() if span_ctx else None
+            try:
+                if span:
+                    span.set_inputs({"title": title, "queries": topic.get("queries", [])[:3], "iteration": iteration})
+
+                out = _draft_and_build_section(
+                    topic, state["query"], search_result,
+                    previous_contents.get(title, ""),
+                    state.get("failure_hints", ""),
+                    state.get("language_instruction", ""),
+                    stream_callback=_on_draft_chunk,
+                )
+
+                if span:
+                    span.set_outputs({
+                        "mcp_calls": [f"vector-search/semantic_search x{sem}", f"web-search/web_search x{web}"],
+                        "semantic_chunks": sem, "web_results": web,
+                        "content_length": len(out.get("section_data", {}).get("content", "")),
+                        "tokens_used": out.get("tokens_used", 0),
+                    })
+            finally:
+                if span_ctx:
+                    span_ctx.__exit__(None, None, None)
+
+            _collect_section(topic, out)
+            section_content = out.get("section_data", {}).get("content", "")
+            writer({"progress": "section_done", "content": section_content, **evt_base})
+
+        except Exception as e:
+            logger.error("Section '%s' draft failed: %s", title, e, exc_info=True)
+            sections.append({"sub_topic": title, "content": "", "search_context": [], "score": 0.0, "status": "failed"})
+            writer({"progress": "section_failed", **evt_base})
+
+    writer({"progress": "assembling_report", "total_sections": total_sections})
     report_result = assemble_report(
         sections, section_order, state["query"],
         language_instruction=state.get("language_instruction", ""),
@@ -350,11 +496,22 @@ def _execute_sections(state: ResearchState) -> dict:
     return update
 
 
+def _format_context_entry(ctx: dict) -> str:
+    """Format a context entry for LLM prompt, including source URL when available."""
+    metadata = ctx.get("metadata") or {}
+    source = ctx.get("source", "unknown")
+    url = metadata.get("source_url", "")
+    content = ctx.get("content", "")[:500]
+    if url and url.startswith("http"):
+        return f"[{source}]({url})\n{content}"
+    return f"[{source}]\n{content}"
+
+
 def _run_semantic(query: str, iteration: int) -> list[dict]:
     """Run a single semantic_search and return context entries. Thread-safe."""
     seen: set = set()
     entries: list[dict] = []
-    for r in semantic_search(query, top_k=5):
+    for r in semantic_search(query, top_k=3):
         key = (r.get("document_id", ""), r.get("chunk_index", 0))
         if key not in seen:
             seen.add(key)
@@ -362,7 +519,12 @@ def _run_semantic(query: str, iteration: int) -> list[dict]:
                 "iteration": iteration,
                 "source": f"{r.get('document_name', 'unknown')}[{r.get('chunk_index', 0)}]",
                 "content": r.get("content", ""),
-                "metadata": {"similarity": r.get("similarity", 0)},
+                "metadata": {
+                    "similarity": r.get("similarity", 0),
+                    "source_url": r.get("source_url", ""),
+                    "document_name": r.get("document_name", ""),
+                    "chunk_index": r.get("chunk_index", 0),
+                },
             })
     return entries
 
@@ -370,7 +532,7 @@ def _run_semantic(query: str, iteration: int) -> list[dict]:
 def _run_web(query: str, iteration: int) -> list[dict]:
     """Run a single web_search and return context entries. Thread-safe."""
     entries: list[dict] = []
-    for wr in web_search(query, num_results=3):
+    for wr in web_search(query, num_results=2):
         entries.append({
             "iteration": iteration,
             "source": f"web:{wr.get('url', '')}",
@@ -380,7 +542,7 @@ def _run_web(query: str, iteration: int) -> list[dict]:
     return entries
 
 
-def execute_node(state: ResearchState) -> dict:
+def execute_node(state: ResearchState, writer: StreamWriter) -> dict:
     """Execute research: fan-out all searches (semantic + web) in parallel."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -389,7 +551,7 @@ def execute_node(state: ResearchState) -> dict:
         and bool(state.get("section_order"))
     )
     if use_sections:
-        return _execute_sections(state)
+        return _execute_sections(state, writer)
 
     observer = _get_observer(state["session_id"])
     iteration = state["iteration"]
@@ -426,7 +588,7 @@ def execute_node(state: ResearchState) -> dict:
                         tokens_used=0,
                     )
                 except Exception as e:
-                    logger.error("Search (%s) failed for '%s': %s", kind, q[:80], e)
+                    logger.error("Search (%s) failed for '%s': %s", kind, q[:80], e, exc_info=True)
     else:
         for step in search_steps:
             q = step.get("query", state["query"])
@@ -458,8 +620,8 @@ def execute_node(state: ResearchState) -> dict:
                 tokens_used=synthesis.get("tokens_used", 0),
             )
 
-    # Draft or improve the report
-    context_text = "\n\n".join(c.get("content", "")[:500] for c in new_context[-10:])
+    # Draft or improve the report (include source URLs for citation linking)
+    context_text = "\n\n".join(_format_context_entry(c) for c in new_context[-10:])
     plan_text = json.dumps(plan)
 
     logger.info(
@@ -495,8 +657,10 @@ def execute_node(state: ResearchState) -> dict:
     return update
 
 
-def verify_node(state: ResearchState) -> dict:
+def verify_node(state: ResearchState, writer: StreamWriter) -> dict:
     """Run verification checks on the current draft."""
+    time.sleep(1)
+    writer({"progress": "verifying"})
     observer = _get_observer(state["session_id"])
     iteration = state["iteration"]
     draft = state.get("current_draft", "")
@@ -607,6 +771,27 @@ def iterate_node(state: ResearchState) -> dict:
     return update
 
 
+def _build_references(accumulated_context: list[dict]) -> str:
+    """Build a markdown references section from context entries with source URLs."""
+    seen_urls: dict[str, str] = {}
+    for ctx in accumulated_context:
+        metadata = ctx.get("metadata") or {}
+        url = metadata.get("source_url", "")
+        if not url or url.startswith("/"):
+            continue
+        doc_name = metadata.get("document_name", "") or ctx.get("source", "unknown")
+        if url not in seen_urls:
+            seen_urls[url] = doc_name
+
+    if not seen_urls:
+        return ""
+
+    lines = []
+    for idx, (url, name) in enumerate(seen_urls.items(), 1):
+        lines.append(f"{idx}. [{name}]({url})")
+    return "\n".join(lines)
+
+
 def finalize_node(state: ResearchState) -> dict:
     """Finalize the research output.
 
@@ -653,6 +838,11 @@ def finalize_node(state: ResearchState) -> dict:
     else:
         output = state.get("current_draft", "")
 
+    # Build references section from accumulated context source URLs
+    references = _build_references(state.get("accumulated_context") or [])
+    if references:
+        output += f"\n\n---\n\n## References\n\n{references}"
+
     output += (
         f"\n\n---\n"
         f"*Research completed in {iterations} iteration(s) | "
@@ -678,6 +868,8 @@ def build_graph():
     graph = StateGraph(ResearchState)
 
     graph.add_node("normalize", normalize_node)
+    graph.add_node("classify_intent", classify_intent_node)
+    graph.add_node("direct_response", direct_response_node)
     graph.add_node("plan", plan_node)
     graph.add_node("execute", execute_node)
     graph.add_node("verify", verify_node)
@@ -686,7 +878,12 @@ def build_graph():
     graph.add_node("finalize", finalize_node)
 
     graph.set_entry_point("normalize")
-    graph.add_edge("normalize", "plan")
+    graph.add_edge("normalize", "classify_intent")
+    graph.add_conditional_edges(
+        "classify_intent", route_by_intent,
+        {"plan": "plan", "direct_response": "direct_response"},
+    )
+    graph.add_edge("direct_response", "finalize")
     graph.add_edge("plan", "execute")
     graph.add_edge("execute", "verify")
     graph.add_edge("verify", "observe")

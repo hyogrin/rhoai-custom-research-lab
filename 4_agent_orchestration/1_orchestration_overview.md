@@ -22,7 +22,7 @@ This phase integrates all components into a working research system: the **LangG
 │              ┌───────────┼───────────┐                       │
 │              ▼           ▼           ▼                        │
 │     MCP Client    Context Layer   Observability              │
-│     (mcp_client.py) (context.py)  (harness/)                 │
+│     (tools.py)      (context.py)  (harness/)                 │
 └──────────────┬───────────────────────────────────────────────┘
                │ streamable-http
     ┌──────────┼──────────┬──────────┬──────────┐
@@ -36,9 +36,9 @@ This phase integrates all components into a working research system: the **LangG
 
 | Module | Path | Purpose |
 |--------|------|---------|
-| Orchestrator Graph | `agents/orchestrator/agent.py` | LangGraph harness controller (7 nodes) |
+| Orchestrator Graph | `agents/orchestrator/graph.py` | LangGraph harness controller (7 nodes) |
 | Research State | `agents/orchestrator/state.py` | TypedDict for long-transaction state |
-| MCP Client | `agents/orchestrator/layers/mcp_client.py` | Calls 4 MCP servers + direct LLM for planning/drafting |
+| Tools | `agents/orchestrator/layers/tools.py` | Calls 4 MCP servers + direct LLM for planning/drafting |
 | Context Layer | `agents/orchestrator/layers/context.py` | Gathers iteration context + past failure memory |
 | Observability | `agents/orchestrator/layers/observability.py` | HarnessObserver wrapping trace/failure/metrics |
 | Session Manager | `harness/session.py` | PostgreSQL-persisted research sessions |

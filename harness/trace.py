@@ -2,15 +2,18 @@
 
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Any
 
-import psycopg2
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from db import get_connection
 
 
 @dataclass
@@ -112,52 +115,26 @@ class TraceCollector:
         }
 
     def persist(self, session_id: str):
-        """Save trace events to PostgreSQL."""
+        """Save trace events to SQLite."""
         events = self.get_events(session_id)
         if not events:
             return
 
-        conn = psycopg2.connect(
-            host=os.getenv("PGVECTOR_HOST", "localhost"),
-            port=os.getenv("PGVECTOR_PORT", "5432"),
-            dbname=os.getenv("PGVECTOR_DB", "doc_research"),
-            user=os.getenv("PGVECTOR_USER", "postgres"),
-            password=os.getenv("PGVECTOR_PASSWORD", "postgres"),
-        )
-        cur = conn.cursor()
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS trace_events (
-                id SERIAL PRIMARY KEY,
-                session_id VARCHAR(20) NOT NULL,
-                iteration INTEGER,
-                layer VARCHAR(50),
-                operation VARCHAR(100),
-                input_summary TEXT,
-                output_summary TEXT,
-                tokens_used INTEGER DEFAULT 0,
-                latency_ms INTEGER DEFAULT 0,
-                success BOOLEAN DEFAULT TRUE,
-                failure_category VARCHAR(100),
-                metadata JSONB DEFAULT '{}',
-                timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_traces_session ON trace_events(session_id);
-        """)
+        conn = get_connection()
 
         for event in events:
-            cur.execute("""
-                INSERT INTO trace_events
+            conn.execute(
+                """INSERT INTO trace_events
                     (session_id, iteration, layer, operation, input_summary, output_summary,
                      tokens_used, latency_ms, success, failure_category, metadata, timestamp)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
-            """, (
-                event.session_id, event.iteration, event.layer, event.operation,
-                event.input_summary, event.output_summary, event.tokens_used,
-                event.latency_ms, event.success, event.failure_category,
-                json.dumps(event.metadata), event.timestamp,
-            ))
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event.session_id, event.iteration, event.layer, event.operation,
+                    event.input_summary, event.output_summary, event.tokens_used,
+                    event.latency_ms, 1 if event.success else 0, event.failure_category,
+                    json.dumps(event.metadata), event.timestamp,
+                ),
+            )
 
         conn.commit()
-        cur.close()
         conn.close()

@@ -2,14 +2,17 @@
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
-import psycopg2
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from db import get_connection
 
 
 class FailureCategory(str, Enum):
@@ -111,67 +114,45 @@ class FailureLog:
         return "\n".join(f"- {h}" for h in hints)
 
     def persist(self, session_id: str):
-        """Save failures to PostgreSQL for cross-session learning."""
+        """Save failures to SQLite for cross-session learning."""
         entries = self.get_failures(session_id)
         if not entries:
             return
 
-        conn = psycopg2.connect(
-            host=os.getenv("PGVECTOR_HOST", "localhost"),
-            port=os.getenv("PGVECTOR_PORT", "5432"),
-            dbname=os.getenv("PGVECTOR_DB", "doc_research"),
-            user=os.getenv("PGVECTOR_USER", "postgres"),
-            password=os.getenv("PGVECTOR_PASSWORD", "postgres"),
-        )
-        cur = conn.cursor()
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS failure_log (
-                id SERIAL PRIMARY KEY,
-                session_id VARCHAR(20) NOT NULL,
-                iteration INTEGER,
-                category VARCHAR(100),
-                description TEXT,
-                context TEXT,
-                resolution TEXT DEFAULT '',
-                timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_failures_session ON failure_log(session_id);
-            CREATE INDEX IF NOT EXISTS idx_failures_category ON failure_log(category);
-        """)
+        conn = get_connection()
 
         for entry in entries:
-            cur.execute("""
-                INSERT INTO failure_log (session_id, iteration, category, description, context, timestamp)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (entry.session_id, entry.iteration, entry.category.value,
-                  entry.description, entry.context, entry.timestamp))
+            conn.execute(
+                """INSERT INTO failure_log (session_id, iteration, category, description, context, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (entry.session_id, entry.iteration, entry.category.value,
+                 entry.description, entry.context, entry.timestamp),
+            )
 
         conn.commit()
-        cur.close()
         conn.close()
 
     def load_past_failures(self, limit: int = 50) -> list[dict]:
         """Load past failure patterns for cross-session learning."""
         try:
-            conn = psycopg2.connect(
-                host=os.getenv("PGVECTOR_HOST", "localhost"),
-                port=os.getenv("PGVECTOR_PORT", "5432"),
-                dbname=os.getenv("PGVECTOR_DB", "doc_research"),
-                user=os.getenv("PGVECTOR_USER", "postgres"),
-                password=os.getenv("PGVECTOR_PASSWORD", "postgres"),
-            )
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT category, COUNT(*) as count, array_agg(DISTINCT description) as descriptions
+            conn = get_connection()
+            rows = conn.execute(
+                """SELECT category, COUNT(*) as count,
+                          GROUP_CONCAT(DISTINCT description) as descriptions
                 FROM failure_log
                 GROUP BY category
                 ORDER BY count DESC
-                LIMIT %s
-            """, (limit,))
-            rows = cur.fetchall()
-            cur.close()
+                LIMIT ?""",
+                (limit,),
+            ).fetchall()
             conn.close()
-            return [{"category": r[0], "count": r[1], "examples": r[2][:3]} for r in rows]
+            return [
+                {
+                    "category": r["category"],
+                    "count": r["count"],
+                    "examples": r["descriptions"].split(",")[:3] if r["descriptions"] else [],
+                }
+                for r in rows
+            ]
         except Exception:
             return []

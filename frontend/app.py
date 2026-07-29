@@ -23,7 +23,7 @@ from app_utils import (
 )
 from i18n import SUPPORTED_LANGUAGES, STARTERS, SYSTEM_PROMPT_LANGUAGE
 
-load_dotenv()
+load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -305,22 +305,24 @@ async def stream_research(query: str, settings: ChatSettings, file_path: str = "
 
     step_mgr: StepNameManager = cl.user_session.get("step_mgr") or StepNameManager()
     step_mgr.reset()
+    cl.user_session.set("_sections_map", {})
+    cl.user_session.set("_sections_order", [])
 
-    timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=600)
+    timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=900)
     current_phase_step: cl.Step | None = None
     stop_event = asyncio.Event()
     last_activity = asyncio.get_event_loop().time()
 
     async def keepalive_monitor():
-        """Warn if the SSE stream goes silent for too long."""
+        """Warn if the SSE stream goes silent for too long (no heartbeat or data)."""
         nonlocal last_activity
         while not stop_event.is_set():
             await asyncio.sleep(30)
             if last_activity:
                 idle = asyncio.get_event_loop().time() - last_activity
-                if idle > 120:
+                if idle > 60:
                     logger.warning(
-                        "No SSE data for %.0fs (harness may be processing)", idle
+                        "No SSE data for %.0fs (backend may have lost connection)", idle
                     )
 
     keepalive_task = asyncio.create_task(keepalive_monitor())
@@ -359,7 +361,11 @@ async def stream_research(query: str, settings: ChatSettings, file_path: str = "
                         line, buffer = buffer.split("\n", 1)
                         line = line.strip()
 
-                        if not line or line.startswith(":"):
+                        if not line:
+                            continue
+
+                        # SSE comments (heartbeat keepalives from backend)
+                        if line.startswith(":"):
                             continue
 
                         if line.startswith("data:"):
@@ -479,21 +485,30 @@ async def _handle_event(
             detail = data.get("detail", "")
             status_msg.content = f"{icon} {title}" + (f"\n_{detail}_" if detail else "")
             await safe_update_message(status_msg)
+        elif event_type == "stream":
+            text = data.get("text", "")
+            if text:
+                await safe_stream_token(msg, text)
         elif event_type == "section":
             section_content = data.get("content", "")
             if section_content:
                 sub_topic = data.get("sub_topic", "")
-                status_msg.content = f"📝 Writing section: {sub_topic}"
-                await safe_update_message(status_msg)
-                await safe_stream_token(msg, section_content + "\n\n")
+                sections_map = cl.user_session.get("_sections_map") or {}
+                sections_order = cl.user_session.get("_sections_order") or []
+                sections_map[sub_topic] = section_content
+                if sub_topic not in sections_order:
+                    sections_order.append(sub_topic)
+                cl.user_session.set("_sections_map", sections_map)
+                cl.user_session.set("_sections_order", sections_order)
+                msg.content = "\n\n".join(sections_map[t] for t in sections_order if t in sections_map) + "\n\n"
+                await safe_update_message(msg)
         elif event_type == "content":
             text = data.get("text", "")
-            if text:
+            if text and not msg.content.strip():
                 status_msg.content = ""
                 await safe_update_message(status_msg)
-                if len(text) >= len(msg.content):
-                    msg.content = text
-                    await safe_update_message(msg)
+                msg.content = text
+                await safe_update_message(msg)
         elif event_type == "metadata":
             meta_md = _format_metadata(data)
             if meta_md:
@@ -519,21 +534,32 @@ async def _handle_event(
             await safe_send_step(step)
     elif event_type == "step":
         current_phase_step = await _handle_step_event(data, msg, current_phase_step, step_mgr, settings)
+    elif event_type == "stream":
+        text = data.get("text", "")
+        if text:
+            await safe_stream_token(msg, text)
     elif event_type == "section":
         section_content = data.get("content", "")
         sub_topic = data.get("sub_topic", "")
         if section_content:
+            sections_map = cl.user_session.get("_sections_map") or {}
+            sections_order = cl.user_session.get("_sections_order") or []
+            sections_map[sub_topic] = section_content
+            if sub_topic not in sections_order:
+                sections_order.append(sub_topic)
+            cl.user_session.set("_sections_map", sections_map)
+            cl.user_session.set("_sections_order", sections_order)
+            msg.content = "\n\n".join(sections_map[t] for t in sections_order if t in sections_map) + "\n\n"
+            await safe_update_message(msg)
             step_name = step_mgr.get_unique_name(f"📝 Section: {sub_topic}")
             step = cl.Step(name=step_name, type="tool")
             step.output = section_content[:300] + ("..." if len(section_content) > 300 else "")
             await safe_send_step(step)
-            await safe_stream_token(msg, section_content + "\n\n")
     elif event_type == "content":
         text = data.get("text", "")
-        if text:
-            if len(text) >= len(msg.content):
-                msg.content = text
-                await safe_update_message(msg)
+        if text and not msg.content.strip():
+            msg.content = text
+            await safe_update_message(msg)
     elif event_type == "metadata":
         meta_md = _format_metadata(data)
         if meta_md:
@@ -569,6 +595,8 @@ async def _handle_step_event(
 
     phase_type_map = {
         "normalize": "tool",
+        "classify_intent": "tool",
+        "direct_response": "llm",
         "plan": "tool",
         "execute": "retrieval",
         "verify": "tool",

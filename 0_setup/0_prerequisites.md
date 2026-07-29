@@ -4,7 +4,7 @@
 
 Build a **custom deep research system using harness engineering** on Red Hat OpenShift AI that:
 1. Accepts document uploads (PDF, DOCX, PPTX, XLSX)
-2. Parses them with Docling and stores semantic chunks in pgvector
+2. Parses them with Docling and stores semantic chunks in SQLite + sqlite-vec
 3. Performs iterative deep research using a LangGraph orchestrator with MCP tools
 4. Delivers comprehensive analytical reports with citations
 
@@ -22,17 +22,21 @@ The system uses **LangGraph** for orchestration, **MCP (Model Context Protocol)*
 
 | Tool | Version | Install |
 |------|---------|---------|
-| Python | 3.11+ | `brew install python@3.11` or system package |
+| Python | 3.11–3.13 | `brew install python@3.13` (Homebrew required — python.org builds lack SQLite extension support) |
 | uv | 0.4+ | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | oc CLI | 4.14+ | [Download](https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/) |
-| Podman | 4+ | `brew install podman` or system package |
+| Podman | 4+ | `brew install podman` or system package (optional — for MinIO/SearXNG) |
 | Git | 2.x | System package |
 
 ## Optional (for local development without cluster)
 
 For running the full system locally without an OpenShift cluster:
-- Podman Compose (for PostgreSQL + MinIO + SearXNG containers)
+- Podman Compose (for MinIO + SearXNG containers)
 - A local LLM server (e.g., LM Studio, Ollama) with OpenAI-compatible API
+
+> **macOS note:** The python.org installer builds Python without SQLite extension loading support.
+> Use Homebrew Python (`brew install python@3.13`) and create your venv with it:
+> `$(brew --prefix python@3.13)/bin/python3.13 -m venv .venv`
 
 ## Environment Setup
 
@@ -44,11 +48,11 @@ cd rhoai-custom-research-lab
 # 2. Create environment file
 cp sample.env .env
 
-# 3. Install Python dependencies
-uv sync
+# 3. Create venv with Homebrew Python (macOS)
+uv venv --python $(brew --prefix python@3.13)/bin/python3.13
 
-# 4. Start local services (PostgreSQL+pgvector, MinIO, SearXNG)
-make dev-up
+# 4. Install Python dependencies
+uv sync
 
 # 5. Begin with Phase 0 notebooks
 ```

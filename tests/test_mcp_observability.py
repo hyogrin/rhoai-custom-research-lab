@@ -9,17 +9,16 @@ import pytest
 def mock_obs_db():
     """Mock the database connection for observability MCP server."""
     mock_cursor = MagicMock()
+    mock_cursor.lastrowid = 42
     mock_conn = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
+    mock_conn.execute.return_value = mock_cursor
 
-    with patch("mcp_servers.observability_mcp.server._get_db", return_value=mock_conn):
+    with patch("mcp_servers.observability_mcp.server.get_connection", return_value=mock_conn):
         yield {"connection": mock_conn, "cursor": mock_cursor}
 
 
 class TestRecordTrace:
     def test_stores_trace_data(self, mock_obs_db):
-        mock_obs_db["cursor"].fetchone.return_value = (42,)
-
         from mcp_servers.observability_mcp.server import record_trace
 
         result = record_trace(
@@ -36,11 +35,11 @@ class TestRecordTrace:
 
         assert result["status"] == "recorded"
         assert result["trace_id"] == 42
-        mock_obs_db["cursor"].execute.assert_called_once()
+        mock_obs_db["connection"].execute.assert_called_once()
         mock_obs_db["connection"].commit.assert_called_once()
 
     def test_handles_db_error_gracefully(self, mock_obs_db):
-        mock_obs_db["cursor"].execute.side_effect = Exception("DB connection lost")
+        mock_obs_db["connection"].execute.side_effect = Exception("DB connection lost")
 
         from mcp_servers.observability_mcp.server import record_trace
 
@@ -55,8 +54,6 @@ class TestRecordTrace:
         assert "error" in result
 
     def test_truncates_long_summaries(self, mock_obs_db):
-        mock_obs_db["cursor"].fetchone.return_value = (1,)
-
         from mcp_servers.observability_mcp.server import record_trace
 
         long_text = "x" * 1000
@@ -69,19 +66,30 @@ class TestRecordTrace:
             output_summary=long_text,
         )
 
-        call_args = mock_obs_db["cursor"].execute.call_args[0][1]
+        call_args = mock_obs_db["connection"].execute.call_args[0][1]
         assert len(call_args[4]) <= 500
         assert len(call_args[5]) <= 500
 
 
 class TestGetMetrics:
     def test_returns_valid_metrics(self, mock_obs_db):
-        mock_obs_db["cursor"].fetchone.return_value = (15, 3000, 4500, 2, 3)
-        mock_obs_db["cursor"].fetchall.return_value = [
-            ("execute", 8),
-            ("verify", 4),
-            ("observe", 3),
-        ]
+        mock_row = MagicMock()
+        mock_row.__getitem__ = lambda self, i: (15, 3000, 4500, 2, 3)[i]
+
+        mock_layer_rows = [("execute", 8), ("verify", 4), ("observe", 3)]
+
+        call_count = [0]
+        orig_execute = mock_obs_db["connection"].execute
+
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            result = MagicMock()
+            if call_count[0] == 1:
+                result.fetchone.return_value = mock_row
+            else:
+                result.fetchall.return_value = mock_layer_rows
+            return result
+        mock_obs_db["connection"].execute.side_effect = side_effect
 
         from mcp_servers.observability_mcp.server import get_metrics
 
@@ -97,8 +105,9 @@ class TestGetMetrics:
         assert result["events_by_layer"]["verify"] == 4
 
     def test_returns_zero_metrics_for_unknown_session(self, mock_obs_db):
-        mock_obs_db["cursor"].fetchone.return_value = None
-        mock_obs_db["cursor"].fetchall.return_value = []
+        mock_result = MagicMock()
+        mock_result.fetchone.return_value = None
+        mock_obs_db["connection"].execute.return_value = mock_result
 
         from mcp_servers.observability_mcp.server import get_metrics
 
@@ -108,7 +117,7 @@ class TestGetMetrics:
         assert result["total_events"] == 0
 
     def test_handles_db_error(self, mock_obs_db):
-        mock_obs_db["cursor"].execute.side_effect = Exception("Connection refused")
+        mock_obs_db["connection"].execute.side_effect = Exception("Connection refused")
 
         from mcp_servers.observability_mcp.server import get_metrics
 
@@ -119,10 +128,12 @@ class TestGetMetrics:
 
 class TestGetFailureHints:
     def test_returns_hints_for_known_categories(self, mock_obs_db):
-        mock_obs_db["cursor"].fetchall.return_value = [
+        mock_result = MagicMock()
+        mock_result.fetchall.return_value = [
             ("insufficient_depth",),
             ("missing_citations",),
         ]
+        mock_obs_db["connection"].execute.return_value = mock_result
 
         from mcp_servers.observability_mcp.server import get_failure_hints
 
@@ -136,7 +147,9 @@ class TestGetFailureHints:
         assert "citation" in result["hints"].lower() or "source" in result["hints"].lower()
 
     def test_returns_empty_hints_for_no_failures(self, mock_obs_db):
-        mock_obs_db["cursor"].fetchall.return_value = []
+        mock_result = MagicMock()
+        mock_result.fetchall.return_value = []
+        mock_obs_db["connection"].execute.return_value = mock_result
 
         from mcp_servers.observability_mcp.server import get_failure_hints
 
@@ -146,7 +159,7 @@ class TestGetFailureHints:
         assert result["categories"] == []
 
     def test_handles_db_error(self, mock_obs_db):
-        mock_obs_db["cursor"].execute.side_effect = Exception("Timeout")
+        mock_obs_db["connection"].execute.side_effect = Exception("Timeout")
 
         from mcp_servers.observability_mcp.server import get_failure_hints
 
@@ -159,7 +172,9 @@ class TestGetFailureHints:
 
 class TestRecordFailure:
     def test_stores_failure_record(self, mock_obs_db):
-        mock_obs_db["cursor"].fetchone.return_value = (7,)
+        mock_cursor = MagicMock()
+        mock_cursor.lastrowid = 7
+        mock_obs_db["connection"].execute.return_value = mock_cursor
 
         from mcp_servers.observability_mcp.server import record_failure
 

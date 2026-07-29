@@ -1,32 +1,35 @@
-"""Vector Search MCP Server — pgvector semantic search tools."""
+"""Vector Search MCP Server — sqlite-vec semantic search tools."""
 
+import json
 import os
+import sys
 
 import httpx
-import psycopg2
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from openai import OpenAI
+from sqlite_vec import serialize_float32
 
-load_dotenv()
+load_dotenv(override=True)
 
-PG_HOST = os.getenv("PGVECTOR_HOST", "localhost")
-PG_PORT = os.getenv("PGVECTOR_PORT", "5432")
-PG_DB = os.getenv("PGVECTOR_DB", "doc_research")
-PG_USER = os.getenv("PGVECTOR_USER", "postgres")
-PG_PASSWORD = os.getenv("PGVECTOR_PASSWORD", "postgres")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+from db import get_connection
 
-EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "http://localhost:8000/v1")
+
+def _ensure_v1(url: str) -> str:
+    """Append /v1 if missing — RHOAI dashboard URLs omit it."""
+    if url and not url.rstrip("/").endswith("/v1"):
+        return url.rstrip("/") + "/v1"
+    return url
+
+
+EMBEDDING_BASE_URL = _ensure_v1(os.getenv("EMBEDDING_BASE_URL", "http://localhost:8000/v1"))
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "not-needed")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "granite-embedding-278m-multilingual")
 _VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() not in ("false", "0", "no")
 _HTTP_CLIENT = None if _VERIFY_SSL else httpx.Client(verify=False, timeout=httpx.Timeout(300.0))
 
 mcp = FastMCP("vector-search-mcp", host="0.0.0.0", port=9002, stateless_http=True)
-
-
-def _get_db():
-    return psycopg2.connect(host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASSWORD)
 
 
 def _get_embedding(text: str) -> list[float]:
@@ -36,69 +39,88 @@ def _get_embedding(text: str) -> list[float]:
 
 
 @mcp.tool()
-def semantic_search(query: str, top_k: int = 5, min_similarity: float = 0.3) -> list[dict]:
-    """Search for semantically similar document chunks using pgvector."""
-    embedding = _get_embedding(query)
-    conn = _get_db()
-    cur = conn.cursor()
+def semantic_search(query: str, top_k: int = 5, min_similarity: float = 0.0) -> list[dict]:
+    """Search for semantically similar document chunks using sqlite-vec.
 
-    cur.execute(
-        """SELECT id, document_id, document_name, chunk_index, content, metadata,
-                  1 - (embedding <=> %s::vector) as similarity
-           FROM document_chunks
-           WHERE 1 - (embedding <=> %s::vector) >= %s
-           ORDER BY embedding <=> %s::vector
-           LIMIT %s""",
-        (str(embedding), str(embedding), min_similarity, str(embedding), top_k),
-    )
+    Returns chunks with source_url linking to the original document in object storage.
+    """
+    embedding = _get_embedding(query)
+    conn = get_connection()
+
+    rows = conn.execute(
+        """SELECT vc.chunk_id, vc.distance,
+                  dc.document_id, dc.document_name, dc.chunk_index, dc.content, dc.metadata,
+                  d.object_store_path
+           FROM vec_chunks vc
+           JOIN document_chunks dc ON dc.id = vc.chunk_id
+           LEFT JOIN documents d ON dc.document_id = d.id
+           WHERE vc.embedding MATCH ? AND vc.k = ?
+           ORDER BY vc.distance""",
+        (serialize_float32(embedding), top_k),
+    ).fetchall()
 
     results = []
-    for row in cur.fetchall():
+    for row in rows:
+        similarity = 1.0 - float(row["distance"])
+        if similarity < min_similarity:
+            continue
+        meta = row["metadata"]
         results.append({
-            "id": row[0],
-            "document_id": row[1],
-            "document_name": row[2],
-            "chunk_index": row[3],
-            "content": row[4],
-            "metadata": row[5] if row[5] else {},
-            "similarity": round(float(row[6]), 4),
+            "id": row["chunk_id"],
+            "document_id": row["document_id"],
+            "document_name": row["document_name"],
+            "chunk_index": row["chunk_index"],
+            "content": row["content"],
+            "metadata": json.loads(meta) if meta else {},
+            "similarity": round(similarity, 4),
+            "source_url": row["object_store_path"] or "",
         })
 
-    cur.close()
     conn.close()
     return results
 
 
 @mcp.tool()
 def search_by_document(query: str, document_id: str, top_k: int = 5) -> list[dict]:
-    """Search within a specific document by document_id."""
-    embedding = _get_embedding(query)
-    conn = _get_db()
-    cur = conn.cursor()
+    """Search within a specific document by document_id.
 
-    cur.execute(
-        """SELECT id, document_id, document_name, chunk_index, content, metadata,
-                  1 - (embedding <=> %s::vector) as similarity
-           FROM document_chunks
-           WHERE document_id = %s
-           ORDER BY embedding <=> %s::vector
-           LIMIT %s""",
-        (str(embedding), document_id, str(embedding), top_k),
-    )
+    Returns chunks with source_url linking to the original document in object storage.
+    """
+    embedding = _get_embedding(query)
+    conn = get_connection()
+
+    rows = conn.execute(
+        """SELECT sub.chunk_id, sub.distance,
+                  dc.document_id, dc.document_name, dc.chunk_index, dc.content, dc.metadata,
+                  d.object_store_path
+           FROM (
+               SELECT chunk_id, distance
+               FROM vec_chunks
+               WHERE embedding MATCH ? AND k = ?
+               ORDER BY distance
+           ) sub
+           JOIN document_chunks dc ON dc.id = sub.chunk_id
+           LEFT JOIN documents d ON dc.document_id = d.id
+           WHERE dc.document_id = ?
+           ORDER BY sub.distance""",
+        (serialize_float32(embedding), top_k * 10, document_id),
+    ).fetchall()
 
     results = []
-    for row in cur.fetchall():
+    for row in rows:
+        similarity = 1.0 - float(row["distance"])
+        meta = row["metadata"]
         results.append({
-            "id": row[0],
-            "document_id": row[1],
-            "document_name": row[2],
-            "chunk_index": row[3],
-            "content": row[4],
-            "metadata": row[5] if row[5] else {},
-            "similarity": round(float(row[6]), 4),
+            "id": row["chunk_id"],
+            "document_id": row["document_id"],
+            "document_name": row["document_name"],
+            "chunk_index": row["chunk_index"],
+            "content": row["content"],
+            "metadata": json.loads(meta) if meta else {},
+            "similarity": round(similarity, 4),
+            "source_url": row["object_store_path"] or "",
         })
 
-    cur.close()
     conn.close()
     return results
 
@@ -106,27 +128,26 @@ def search_by_document(query: str, document_id: str, top_k: int = 5) -> list[dic
 @mcp.tool()
 def get_chunk_context(document_id: str, chunk_index: int, window: int = 2) -> list[dict]:
     """Get surrounding chunks for a given chunk to provide broader context."""
-    conn = _get_db()
-    cur = conn.cursor()
+    conn = get_connection()
 
-    cur.execute(
+    rows = conn.execute(
         """SELECT chunk_index, content, metadata
            FROM document_chunks
-           WHERE document_id = %s AND chunk_index BETWEEN %s AND %s
+           WHERE document_id = ? AND chunk_index BETWEEN ? AND ?
            ORDER BY chunk_index""",
         (document_id, chunk_index - window, chunk_index + window),
-    )
+    ).fetchall()
 
     results = []
-    for row in cur.fetchall():
+    for row in rows:
+        meta = row["metadata"]
         results.append({
-            "chunk_index": row[0],
-            "content": row[1],
-            "metadata": row[2] if row[2] else {},
-            "is_center": row[0] == chunk_index,
+            "chunk_index": row["chunk_index"],
+            "content": row["content"],
+            "metadata": json.loads(meta) if meta else {},
+            "is_center": row["chunk_index"] == chunk_index,
         })
 
-    cur.close()
     conn.close()
     return results
 

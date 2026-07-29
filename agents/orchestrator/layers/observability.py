@@ -130,7 +130,7 @@ class HarnessObserver:
         }
 
     def persist(self):
-        """Persist all observability data to PostgreSQL."""
+        """Persist all observability data to SQLite."""
         try:
             self.traces.persist(self.session_id)
             self.failures.persist(self.session_id)

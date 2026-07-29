@@ -49,6 +49,9 @@ class ResearchState(TypedDict):
     section_order: list[str]      # sub_topic titles in planned order
     failing_sections: list[str]   # sub_topics to rewrite on next iteration
 
+    # Intent classification
+    intent: str  # "research" | "casual" — set by classify_intent node
+
     # Control flow
     status: str  # normalizing|planning|researching|writing|verifying|observing|complete|failed
     final_output: str

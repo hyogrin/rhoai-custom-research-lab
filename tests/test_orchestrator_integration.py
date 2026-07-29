@@ -1,4 +1,4 @@
-"""Integration tests for agents/orchestrator/agent.py."""
+"""Integration tests for agents/orchestrator/graph.py."""
 
 from unittest.mock import MagicMock, patch
 
@@ -10,49 +10,49 @@ def mock_mcp_functions():
     """Patch all MCP client functions at the point of use in the orchestrator module."""
     patches = {
         "semantic_search": patch(
-            "agents.orchestrator.agent.semantic_search",
+            "agents.orchestrator.graph.semantic_search",
             return_value=[
                 {"document_id": "doc-1", "document_name": "paper.pdf", "chunk_index": 0, "content": "AI research findings", "similarity": 0.9},
             ],
         ),
         "web_search": patch(
-            "agents.orchestrator.agent.web_search",
+            "agents.orchestrator.graph.web_search",
             return_value=[
                 {"title": "AI Overview", "url": "https://example.com/ai", "content": "AI is transforming the world"},
             ],
         ),
         "synthesize_context": patch(
-            "agents.orchestrator.agent.synthesize_context",
+            "agents.orchestrator.graph.synthesize_context",
             return_value={"synthesis": "AI research synthesis", "citations": [], "tokens_used": 100},
         ),
         "generate_plan": patch(
-            "agents.orchestrator.agent.generate_plan",
+            "agents.orchestrator.graph.generate_plan",
             return_value={
                 "plan": [{"action": "search", "query": "AI fundamentals", "purpose": "Basic research"}],
                 "tokens_used": 50,
             },
         ),
         "generate_sectioned_plan": patch(
-            "agents.orchestrator.agent.generate_sectioned_plan",
+            "agents.orchestrator.graph.generate_sectioned_plan",
             return_value={
                 "sub_topics": [{"title": "Overview", "queries": ["AI overview"], "purpose": "Introduction"}],
                 "tokens_used": 50,
             },
         ),
         "draft_report": patch(
-            "agents.orchestrator.agent.draft_report",
+            "agents.orchestrator.graph.draft_report",
             return_value={"draft": "# Research Report\n\nAI is important [Source 1].", "tokens_used": 200},
         ),
         "draft_section": patch(
-            "agents.orchestrator.agent.draft_section",
+            "agents.orchestrator.graph.draft_section",
             return_value={"content": "## Overview\n\nAI section content", "tokens_used": 150},
         ),
         "assemble_report": patch(
-            "agents.orchestrator.agent.assemble_report",
+            "agents.orchestrator.graph.assemble_report",
             return_value={"draft": "# Executive Summary\n\nFull report assembled.", "tokens_used": 100},
         ),
         "run_verification": patch(
-            "agents.orchestrator.agent.run_verification",
+            "agents.orchestrator.graph.run_verification",
             return_value={
                 "quality_score": 8,
                 "quality_details": {"completeness": 8, "accuracy": 8, "clarity": 8, "structure": 8},
@@ -65,7 +65,7 @@ def mock_mcp_functions():
             },
         ),
         "verify_sections": patch(
-            "agents.orchestrator.agent.verify_sections",
+            "agents.orchestrator.graph.verify_sections",
             return_value=[],
         ),
     }
@@ -83,7 +83,7 @@ def mock_mcp_functions():
 @pytest.fixture
 def mock_session_manager():
     """Patch SessionManager to avoid real DB calls."""
-    with patch("agents.orchestrator.agent.SessionManager") as mock_cls:
+    with patch("agents.orchestrator.graph.SessionManager") as mock_cls:
         mock_mgr = MagicMock()
         mock_cls.return_value = mock_mgr
         yield mock_mgr
@@ -92,7 +92,7 @@ def mock_session_manager():
 @pytest.fixture
 def mock_observer():
     """Patch HarnessObserver to avoid real observability calls."""
-    with patch("agents.orchestrator.agent.HarnessObserver") as mock_cls:
+    with patch("agents.orchestrator.graph.HarnessObserver") as mock_cls:
         mock_obs = MagicMock()
         mock_obs.get_improvement_hints.return_value = ""
         mock_obs.get_summary.return_value = {"metrics": {}, "total_cost": 0.0}
@@ -103,20 +103,20 @@ def mock_observer():
 @pytest.fixture
 def mock_checkpoint():
     """Patch checkpoint_session to avoid DB writes."""
-    with patch("agents.orchestrator.agent.checkpoint_session"):
+    with patch("agents.orchestrator.graph.checkpoint_session"):
         yield
 
 
 @pytest.fixture
 def mock_failure_memory():
     """Patch load_past_failure_memory."""
-    with patch("agents.orchestrator.agent.load_past_failure_memory", return_value=""):
+    with patch("agents.orchestrator.graph.load_past_failure_memory", return_value=""):
         yield
 
 
 class TestBuildGraph:
     def test_returns_compiled_graph(self, mock_session_manager, mock_checkpoint, mock_failure_memory):
-        from agents.orchestrator.agent import build_graph
+        from agents.orchestrator.graph import build_graph
 
         graph = build_graph()
 
@@ -125,7 +125,7 @@ class TestBuildGraph:
         assert hasattr(graph, "astream")
 
     def test_graph_has_expected_nodes(self, mock_session_manager, mock_checkpoint, mock_failure_memory):
-        from agents.orchestrator.agent import build_graph
+        from agents.orchestrator.graph import build_graph
 
         graph = build_graph()
 
@@ -136,7 +136,7 @@ class TestBuildGraph:
 
 class TestShouldIterate:
     def test_finalizes_when_quality_above_threshold(self):
-        from agents.orchestrator.agent import should_iterate
+        from agents.orchestrator.graph import should_iterate
 
         state = {"quality_score": 8.0, "quality_threshold": 7.0, "iteration": 1, "max_iterations": 3}
         result = should_iterate(state)
@@ -144,7 +144,7 @@ class TestShouldIterate:
         assert result == "finalize"
 
     def test_finalizes_when_max_iterations_reached(self):
-        from agents.orchestrator.agent import should_iterate
+        from agents.orchestrator.graph import should_iterate
 
         state = {"quality_score": 4.0, "quality_threshold": 7.0, "iteration": 3, "max_iterations": 3}
         result = should_iterate(state)
@@ -152,7 +152,7 @@ class TestShouldIterate:
         assert result == "finalize"
 
     def test_continues_when_below_threshold_and_iterations_remain(self):
-        from agents.orchestrator.agent import should_iterate
+        from agents.orchestrator.graph import should_iterate
 
         state = {"quality_score": 5.0, "quality_threshold": 7.0, "iteration": 1, "max_iterations": 3}
         result = should_iterate(state)
@@ -160,7 +160,7 @@ class TestShouldIterate:
         assert result == "plan"
 
     def test_uses_default_threshold(self):
-        from agents.orchestrator.agent import should_iterate
+        from agents.orchestrator.graph import should_iterate
 
         state = {"quality_score": 7.0, "iteration": 1, "max_iterations": 5}
         result = should_iterate(state)
@@ -168,7 +168,7 @@ class TestShouldIterate:
         assert result == "finalize"
 
     def test_uses_default_max_iterations(self):
-        from agents.orchestrator.agent import should_iterate
+        from agents.orchestrator.graph import should_iterate
 
         state = {"quality_score": 3.0, "quality_threshold": 7.0, "iteration": 5}
         result = should_iterate(state)
@@ -181,7 +181,7 @@ class TestGraphInvocation:
     async def test_graph_runs_to_completion(
         self, mock_mcp_functions, mock_observer, mock_checkpoint, mock_failure_memory
     ):
-        from agents.orchestrator.agent import build_graph
+        from agents.orchestrator.graph import build_graph
 
         graph = build_graph()
 

@@ -1,12 +1,12 @@
-"""Research session state management with PostgreSQL persistence.
+"""Research session state management with SQLite persistence.
 
-Falls back to in-memory storage when PostgreSQL is unavailable,
-allowing local development without running dev-up containers.
+Falls back to in-memory storage when SQLite is unavailable.
 """
 
 import json
 import logging
 import os
+import sys
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -14,17 +14,17 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 try:
-    import psycopg2
-    import psycopg2.extras
+    from db import get_connection, init_db
 
-    _HAS_PSYCOPG2 = True
-except ImportError:
-    _HAS_PSYCOPG2 = False
+    _HAS_DB = True
+except Exception:
+    _HAS_DB = False
 
 
 @dataclass
@@ -143,62 +143,48 @@ class ResearchSession:
 class SessionManager:
     """Persist and retrieve research sessions.
 
-    Uses PostgreSQL when available, falls back to in-memory dict otherwise.
+    Uses SQLite when available, falls back to in-memory dict otherwise.
     """
 
-    def __init__(self, connection_string: str | None = None):
-        self._conn_str = connection_string or self._build_conn_str()
+    def __init__(self):
         self._use_db = False
         self._memory: dict[str, ResearchSession] = {}
         self._try_connect()
 
-    @staticmethod
-    def _build_conn_str() -> str:
-        return (
-            f"host={os.getenv('PGVECTOR_HOST', 'localhost')} "
-            f"port={os.getenv('PGVECTOR_PORT', '5432')} "
-            f"dbname={os.getenv('PGVECTOR_DB', 'doc_research')} "
-            f"user={os.getenv('PGVECTOR_USER', 'postgres')} "
-            f"password={os.getenv('PGVECTOR_PASSWORD', 'postgres')}"
-        )
-
     def _try_connect(self):
-        """Probe PostgreSQL; fall back to in-memory if unavailable."""
-        if not _HAS_PSYCOPG2:
-            logger.info("psycopg2 not installed — using in-memory session storage")
+        """Probe SQLite; fall back to in-memory if unavailable."""
+        if not _HAS_DB:
+            logger.info("db module not available — using in-memory session storage")
             return
         try:
-            conn = psycopg2.connect(self._conn_str, connect_timeout=3)
+            conn = get_connection()
             conn.close()
             self._use_db = True
-            logger.info("Connected to PostgreSQL for session storage")
+            logger.info("Connected to SQLite for session storage")
         except Exception as e:
-            logger.warning("PostgreSQL unavailable (%s) — using in-memory session storage", e)
+            logger.warning("SQLite unavailable (%s) — using in-memory session storage", e)
 
     def _get_conn(self):
-        return psycopg2.connect(self._conn_str)
+        return get_connection()
 
     def ensure_table(self):
         """Create the sessions table if it doesn't exist."""
         if not self._use_db:
             return
         conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("""
+        conn.executescript("""
             CREATE TABLE IF NOT EXISTS research_sessions (
-                session_id VARCHAR(20) PRIMARY KEY,
+                session_id TEXT PRIMARY KEY,
                 query TEXT NOT NULL,
                 iteration INTEGER DEFAULT 0,
-                status VARCHAR(50) DEFAULT 'initialized',
+                status TEXT DEFAULT 'initialized',
                 quality_score REAL DEFAULT 0.0,
-                state JSONB NOT NULL DEFAULT '{}',
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                state TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_sessions_status ON research_sessions(status);
         """)
-        conn.commit()
-        cur.close()
         conn.close()
 
     def save(self, session: ResearchSession):
@@ -207,21 +193,21 @@ class SessionManager:
             self._memory[session.session_id] = session
             return
         conn = self._get_conn()
-        cur = conn.cursor()
         state_json = json.dumps(session.to_dict())
-        cur.execute("""
-            INSERT INTO research_sessions (session_id, query, iteration, status, quality_score, state, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s::jsonb, NOW())
+        now = datetime.utcnow().isoformat()
+        conn.execute(
+            """INSERT INTO research_sessions (session_id, query, iteration, status, quality_score, state, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (session_id) DO UPDATE SET
-                iteration = EXCLUDED.iteration,
-                status = EXCLUDED.status,
-                quality_score = EXCLUDED.quality_score,
-                state = EXCLUDED.state,
-                updated_at = NOW()
-        """, (session.session_id, session.query, session.iteration,
-              session.status, session.quality_score, state_json))
+                iteration = excluded.iteration,
+                status = excluded.status,
+                quality_score = excluded.quality_score,
+                state = excluded.state,
+                updated_at = ?""",
+            (session.session_id, session.query, session.iteration,
+             session.status, session.quality_score, state_json, now, now),
+        )
         conn.commit()
-        cur.close()
         conn.close()
 
     def load(self, session_id: str) -> ResearchSession | None:
@@ -229,13 +215,12 @@ class SessionManager:
         if not self._use_db:
             return self._memory.get(session_id)
         conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT state FROM research_sessions WHERE session_id = %s", (session_id,))
-        row = cur.fetchone()
-        cur.close()
+        row = conn.execute(
+            "SELECT state FROM research_sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
         conn.close()
         if row:
-            return ResearchSession.from_dict(row[0])
+            return ResearchSession.from_dict(json.loads(row["state"]))
         return None
 
     def get_progress(self, session_id: str) -> dict | None:
@@ -244,18 +229,14 @@ class SessionManager:
             session = self._memory.get(session_id)
             return session.get_progress() if session else None
         conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT session_id, query, iteration, status, quality_score, state, created_at, updated_at "
-            "FROM research_sessions WHERE session_id = %s",
+        row = conn.execute(
+            "SELECT state FROM research_sessions WHERE session_id = ?",
             (session_id,),
-        )
-        row = cur.fetchone()
-        cur.close()
+        ).fetchone()
         conn.close()
         if not row:
             return None
-        session = ResearchSession.from_dict(row[5])
+        session = ResearchSession.from_dict(json.loads(row["state"]))
         return session.get_progress()
 
     def list_sessions(self, status: str | None = None, limit: int = 20) -> list[dict]:
@@ -271,24 +252,21 @@ class SessionManager:
                 for s in sessions[:limit]
             ]
         conn = self._get_conn()
-        cur = conn.cursor()
         if status:
-            cur.execute(
+            rows = conn.execute(
                 "SELECT session_id, query, iteration, status, quality_score, created_at "
-                "FROM research_sessions WHERE status = %s ORDER BY updated_at DESC LIMIT %s",
+                "FROM research_sessions WHERE status = ? ORDER BY updated_at DESC LIMIT ?",
                 (status, limit),
-            )
+            ).fetchall()
         else:
-            cur.execute(
+            rows = conn.execute(
                 "SELECT session_id, query, iteration, status, quality_score, created_at "
-                "FROM research_sessions ORDER BY updated_at DESC LIMIT %s",
+                "FROM research_sessions ORDER BY updated_at DESC LIMIT ?",
                 (limit,),
-            )
-        rows = cur.fetchall()
-        cur.close()
+            ).fetchall()
         conn.close()
         return [
-            {"session_id": r[0], "query": r[1], "iteration": r[2],
-             "status": r[3], "quality_score": r[4], "created_at": str(r[5])}
+            {"session_id": r["session_id"], "query": r["query"], "iteration": r["iteration"],
+             "status": r["status"], "quality_score": r["quality_score"], "created_at": r["created_at"]}
             for r in rows
         ]

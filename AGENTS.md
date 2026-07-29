@@ -66,7 +66,7 @@ Query rewriting, context synthesis, research planning, and report drafting are p
 
 - **Protocol**: Streamable HTTP (`FastMCP` with `stateless_http=True`)
 - **Endpoint convention**: `http://<server>:<port>/mcp/`
-- **Client**: `mcp.client.streamable_http.streamablehttp_client` via `agents/orchestrator/layers/mcp_client.py`
+- **Client**: `mcp.client.streamable_http.streamable_http_client` via `agents/orchestrator/layers/tools.py`
 
 ## Project Structure
 
@@ -85,9 +85,8 @@ Query rewriting, context synthesis, research planning, and report drafting are p
 ### Local Development
 
 ```bash
-cp sample.env .env        # Configure model endpoints
+cp sample.env .env        # Configure model endpoints + infra URLs
 uv sync                   # Install dependencies
-make dev-up               # Start PostgreSQL+pgvector, MinIO, SearXNG
 make backend-start        # Start backend + auto-start all 4 MCP servers
 make frontend-start       # Start Chainlit UI (separate terminal)
 ```

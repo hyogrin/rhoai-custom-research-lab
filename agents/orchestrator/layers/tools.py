@@ -9,15 +9,16 @@ import json
 import logging
 import os
 import re
-from typing import Any
+from typing import Any, Callable
 
+import time
 import httpx
 from dotenv import load_dotenv
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
-from openai import OpenAI
+from mcp.client.streamable_http import streamable_http_client
+from openai import APIConnectionError, APITimeoutError, OpenAI
 
-load_dotenv()
+load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,14 @@ WEB_SEARCH_MCP_URL = os.getenv("WEB_SEARCH_MCP_URL", "http://127.0.0.1:9003")
 VERIFICATION_MCP_URL = os.getenv("VERIFICATION_MCP_URL", "http://127.0.0.1:9004")
 OBSERVABILITY_MCP_URL = os.getenv("OBSERVABILITY_MCP_URL", "http://127.0.0.1:9005")
 
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
+def _ensure_v1(url: str) -> str:
+    """Append /v1 if missing — RHOAI dashboard URLs omit it."""
+    if url and not url.rstrip("/").endswith("/v1"):
+        return url.rstrip("/") + "/v1"
+    return url
+
+
+LLM_BASE_URL = _ensure_v1(os.getenv("LLM_BASE_URL", "http://localhost:8000/v1"))
 LLM_API_KEY = os.getenv("LLM_API_KEY", "not-needed")
 LLM_MODEL = os.getenv("LLM_MODEL", "granite-3.3-8b-instruct")
 MAAS_API_KEY = os.getenv("MAAS_API_KEY", "")
@@ -51,38 +59,82 @@ SERVER_URLS = {
 # ---------------------------------------------------------------------------
 
 
+_MCP_TIMEOUT = int(os.getenv("MCP_TIMEOUT", "90"))
+_MCP_MAX_RETRIES = int(os.getenv("MCP_MAX_RETRIES", "2"))
+
+
 async def _call_mcp_tool(server: str, tool_name: str, arguments: dict) -> Any:
     """Call a tool on a remote MCP server via streamable-http transport."""
     url = SERVER_URLS[server]
-    async with streamablehttp_client(url) as (read_stream, write_stream, _):
+    async with streamable_http_client(url) as (read_stream, write_stream, _):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             result = await session.call_tool(tool_name, arguments)
+
+            # Prefer structuredContent (FastMCP returns this for typed results)
+            if hasattr(result, "structuredContent") and result.structuredContent is not None:
+                return result.structuredContent.get("result", result.structuredContent)
+
             if result.content and len(result.content) > 0:
                 text = result.content[0].text
                 try:
                     return json.loads(text)
                 except (json.JSONDecodeError, TypeError):
                     return text
+
             return None
 
 
 def _call_mcp_sync(server: str, tool_name: str, arguments: dict) -> Any:
-    """Synchronous wrapper for MCP tool calls. Thread-safe."""
+    """Synchronous wrapper for MCP tool calls with retry on transient failures."""
+    last_err: Exception | None = None
+
+    for attempt in range(_MCP_MAX_RETRIES + 1):
+        try:
+            return _run_mcp_in_new_loop(server, tool_name, arguments)
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            is_transient = any(k in err_str for k in ("TaskGroup", "ConnectionRefused", "timeout", "ConnectError"))
+            if is_transient and attempt < _MCP_MAX_RETRIES:
+                wait = 2 ** attempt
+                logger.warning(
+                    "MCP call %s/%s attempt %d failed (%s), retrying in %ds...",
+                    server, tool_name, attempt + 1, err_str[:120], wait,
+                )
+                time.sleep(wait)
+                continue
+            break
+
+    logger.error("MCP call %s/%s failed after %d attempts: %s", server, tool_name, _MCP_MAX_RETRIES + 1, last_err)
+    raise last_err  # type: ignore[misc]
+
+
+def _run_mcp_in_new_loop(server: str, tool_name: str, arguments: dict) -> Any:
+    """Run MCP call in a fresh event loop. Always safe from any thread."""
+    import concurrent.futures
+
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
 
     if loop and loop.is_running():
-        import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(
-                asyncio.run, _call_mcp_tool(server, tool_name, arguments)
+                asyncio.run, asyncio.wait_for(
+                    _call_mcp_tool(server, tool_name, arguments),
+                    timeout=_MCP_TIMEOUT,
+                )
             )
-            return future.result(timeout=120)
+            return future.result(timeout=_MCP_TIMEOUT + 10)
     else:
-        return asyncio.run(_call_mcp_tool(server, tool_name, arguments))
+        return asyncio.run(
+            asyncio.wait_for(
+                _call_mcp_tool(server, tool_name, arguments),
+                timeout=_MCP_TIMEOUT,
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -90,25 +142,113 @@ def _call_mcp_sync(server: str, tool_name: str, arguments: dict) -> Any:
 # ---------------------------------------------------------------------------
 
 
+_LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
+
+
 def _get_llm() -> OpenAI:
     http_client = None
     if not _VERIFY_SSL:
         http_client = httpx.Client(verify=False, timeout=httpx.Timeout(300.0))
-    return OpenAI(base_url=LLM_BASE_URL, api_key=_EFFECTIVE_LLM_KEY, http_client=http_client)
+    return OpenAI(
+        base_url=LLM_BASE_URL,
+        api_key=_EFFECTIVE_LLM_KEY,
+        http_client=http_client,
+        max_retries=_LLM_MAX_RETRIES,
+    )
 
 
 def _call_llm(messages: list[dict], max_tokens: int = 1024, temperature: float = 0.3) -> tuple[str, int]:
-    """Call LLM and return (content, tokens_used)."""
+    """Call LLM and return (content, tokens_used) with retry on connection errors."""
     client = _get_llm()
-    response = client.chat.completions.create(
+    last_err: Exception | None = None
+
+    for attempt in range(_LLM_MAX_RETRIES + 1):
+        try:
+            response = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+            content = response.choices[0].message.content or ""
+            tokens = response.usage.total_tokens if response.usage else 0
+            return content, tokens
+        except (APIConnectionError, APITimeoutError) as e:
+            last_err = e
+            if attempt < _LLM_MAX_RETRIES:
+                wait = 2 ** attempt
+                logger.warning(
+                    "LLM call attempt %d/%d failed (%s), retrying in %ds...",
+                    attempt + 1, _LLM_MAX_RETRIES + 1, type(e).__name__, wait,
+                )
+                time.sleep(wait)
+                continue
+            break
+
+    logger.error("LLM call failed after %d attempts: %s", _LLM_MAX_RETRIES + 1, last_err)
+    raise last_err  # type: ignore[misc]
+
+
+def _call_llm_streaming(
+    messages: list[dict],
+    max_tokens: int = 1024,
+    temperature: float = 0.3,
+    on_chunk: Callable[[str], None] | None = None,
+) -> tuple[str, int]:
+    """Call LLM with streaming, invoking *on_chunk* for each token delta.
+
+    Returns the same ``(content, tokens_used)`` tuple as ``_call_llm``.
+    ``tokens_used`` is estimated from the accumulated text when the API
+    does not provide usage in streaming mode.
+    """
+    client = _get_llm()
+    chunks: list[str] = []
+
+    stream = client.chat.completions.create(
         model=LLM_MODEL,
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
+        stream=True,
+        stream_options={"include_usage": True},
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
-    content = response.choices[0].message.content or ""
-    tokens = response.usage.total_tokens if response.usage else 0
-    return content, tokens
+
+    tokens_used = 0
+    for event in stream:
+        if event.usage:
+            tokens_used = event.usage.total_tokens
+        if not event.choices:
+            continue
+        delta = event.choices[0].delta
+        if delta and delta.content:
+            chunks.append(delta.content)
+            if on_chunk:
+                on_chunk(delta.content)
+
+    content = "".join(chunks)
+    if tokens_used == 0:
+        tokens_used = max(len(content) // 4, 1)
+    return content, tokens_used
+
+
+def _length_guidance(max_tokens: int, language_instruction: str = "") -> str:
+    """Generate a length constraint instruction scaled to token budget and language.
+
+    Korean text typically consumes ~1.8x tokens vs English for equivalent content,
+    so we reduce the word budget accordingly and express it in characters.
+    """
+    is_korean = "한국어" in language_instruction or "Korean" in language_instruction
+    safety_factor = 0.85
+    usable_tokens = int(max_tokens * safety_factor)
+
+    if is_korean:
+        char_budget = int(usable_tokens * 1.2)
+        return f"\n\nLENGTH CONSTRAINT: Keep your response under approximately {char_budget} characters ({usable_tokens} tokens). Be concise and prioritize depth over breadth. Truncation will occur if you exceed this limit."
+    else:
+        word_budget = int(usable_tokens * 0.75)
+        return f"\n\nLENGTH CONSTRAINT: Keep your response under approximately {word_budget} words ({usable_tokens} tokens). Be concise and prioritize depth over breadth. Truncation will occur if you exceed this limit."
 
 
 def _extract_json(text: str) -> Any:
@@ -189,6 +329,55 @@ def rewrite_query(query: str) -> list[str]:
         if isinstance(parsed, list):
             return [query] + parsed[:3]
     return [query]
+
+
+def classify_intent(query: str) -> dict:
+    """Classify query intent: 'research' or 'casual'."""
+    content, tokens = _call_llm(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You are a query intent classifier. Classify the user's message into one of two categories:\n"
+                    "- \"research\": The user wants in-depth research, analysis, or information retrieval on a topic.\n"
+                    "- \"casual\": The user is making a greeting, small talk, asking a simple non-research question, "
+                    "or the message is too short/vague to be a research query.\n\n"
+                    "Return ONLY a JSON object: {\"intent\": \"research\" or \"casual\", \"reason\": \"brief explanation\"}\n"
+                    "When in doubt, classify as \"research\"."
+                ),
+            },
+            {"role": "user", "content": query},
+        ],
+        max_tokens=64,
+        temperature=0.0,
+    )
+    if content:
+        parsed = _extract_json(content)
+        if isinstance(parsed, dict) and parsed.get("intent") in ("research", "casual"):
+            return {**parsed, "tokens_used": tokens}
+    return {"intent": "research", "reason": "default", "tokens_used": tokens}
+
+
+def direct_response(query: str, language_instruction: str = "") -> dict:
+    """Generate a direct conversational response (no research pipeline)."""
+    lang_hint = f"\n{language_instruction}" if language_instruction else ""
+    content, tokens = _call_llm(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You are a friendly research assistant. The user sent a casual message "
+                    "(greeting, simple question, or small talk). Respond naturally and briefly. "
+                    "If they seem to want research help, suggest they ask a specific research question."
+                    f"{lang_hint}"
+                ),
+            },
+            {"role": "user", "content": query},
+        ],
+        max_tokens=_MAX_TOKEN_SMALL,
+        temperature=0.7,
+    )
+    return {"response": content, "tokens_used": tokens}
 
 
 def synthesize_context(query: str, passages: list[dict]) -> dict:
@@ -272,7 +461,7 @@ def generate_sectioned_plan(
     language_instruction: str = "",
     enable_web_search: bool = False,
 ) -> dict:
-    """Decompose a research query into 2-5 sub-topics via direct LLM call."""
+    """Decompose a research query into 1-3 sub-topics via direct LLM call."""
     web_note = ""
     if enable_web_search:
         web_note = (
@@ -281,14 +470,22 @@ def generate_sectioned_plan(
         )
     system_content = (
         "You are a research planner. Given a research question, decompose it into "
-        "2-5 sub-topics for a structured report. "
+        "sub-topics for a structured report. "
+        "Choose the MINIMUM number of sections needed:\n"
+        "- Pros/cons, comparisons, simple factual questions: strictly 1-2 sections (e.g. 'Advantages' and 'Disadvantages')\n"
+        "- Moderate multi-faceted topics: 2-3 sections\n"
+        "- Complex broad research requiring deep analysis: 3-5 sections\n\n"
+        "IMPORTANT: Fewer sections is better. Do NOT create separate sections for 'introduction', "
+        "'overview', 'background', or 'conclusion' — integrate them into the main topic sections.\n\n"
         "Return ONLY a JSON object (no other text) with this shape:\n"
-        '{"sub_topics": [{"title": "...", "queries": ["search query 1", "..."], "purpose": "..."}], '
+        '{"sub_topics": [{"section_number": 1, "title": "...", "queries": ["search query 1", "..."], "purpose": "..."}, '
+        '{"section_number": 2, "title": "...", "queries": [...], "purpose": "..."}], '
         '"summary_query": "one-line summary of the full research"}\n\n'
         "Rules:\n"
-        "- Each sub_topic has a clear title, 1-3 search queries, and a purpose\n"
+        "- Each sub_topic MUST have section_number (starting from 1), title, 1-3 search queries, and a purpose\n"
+        "- Return sub_topics in ascending section_number order\n"
+        "- Use ONLY as many sections as the query genuinely requires — do NOT pad with unnecessary sections\n"
         "- Sub-topics should cover the question comprehensively without overlap\n"
-        "- Order sub-topics logically (background first, analysis later)\n"
         f"{web_note}"
         f"- This is iteration {iteration}. Adjust the plan based on any hints below."
     )
@@ -306,16 +503,20 @@ def generate_sectioned_plan(
         ],
         max_tokens=_MAX_TOKEN_MEDIUM,
     )
+    def _sort_by_section_number(topics: list[dict]) -> list[dict]:
+        return sorted(topics, key=lambda t: t.get("section_number", 99))
+
     if content:
         parsed = _extract_json(content)
         if isinstance(parsed, dict) and "sub_topics" in parsed:
-            return {"sub_topics": parsed["sub_topics"], "summary_query": parsed.get("summary_query", query), "tokens_used": tokens}
+            sub_topics = _sort_by_section_number(parsed["sub_topics"])
+            return {"sub_topics": sub_topics, "summary_query": parsed.get("summary_query", query), "tokens_used": tokens}
         if isinstance(parsed, list):
             sub_topics = [item for item in parsed if isinstance(item, dict) and "title" in item]
             if sub_topics:
-                return {"sub_topics": sub_topics, "summary_query": query, "tokens_used": tokens}
+                return {"sub_topics": _sort_by_section_number(sub_topics), "summary_query": query, "tokens_used": tokens}
     return {
-        "sub_topics": [{"title": "Research Report", "queries": [query], "purpose": "Comprehensive analysis"}],
+        "sub_topics": [{"section_number": 1, "title": "Research Report", "queries": [query], "purpose": "Comprehensive analysis"}],
         "summary_query": query,
         "tokens_used": tokens,
     }
@@ -335,6 +536,7 @@ def draft_report(
         "based on the provided context and research plan. Include citations as [Source N]. "
         "Structure: Executive Summary, Key Findings, Detailed Analysis, Conclusion."
     )
+    system_prompt += _length_guidance(_MAX_TOKEN_LARGE, language_instruction)
     if language_instruction:
         system_prompt += f"\n\n{language_instruction}"
 
@@ -354,6 +556,17 @@ def draft_report(
     return {"draft": content, "tokens_used": tokens}
 
 
+def _format_source_entry(idx: int, ctx: dict) -> str:
+    """Format a single context entry for LLM prompt, including source URL if available."""
+    name = ctx.get("document_name", ctx.get("source", "unknown"))
+    metadata = ctx.get("metadata") or {}
+    url = metadata.get("source_url", "")
+    header = f"[Source {idx+1}: {name}]"
+    if url and url.startswith("http"):
+        header = f"[Source {idx+1}: {name}]({url})"
+    return f"{header}\n{ctx.get('content', '')[:400]}"
+
+
 def draft_section(
     query: str,
     sub_topic: dict,
@@ -361,8 +574,13 @@ def draft_section(
     previous_content: str = "",
     improvement_hints: str = "",
     language_instruction: str = "",
+    stream_callback: Callable[[str], None] | None = None,
 ) -> dict:
-    """Draft a single report section via direct LLM call."""
+    """Draft a single report section via direct LLM call.
+
+    If *stream_callback* is provided, tokens are streamed to the caller
+    in real-time via ``_call_llm_streaming``.
+    """
     sub_topic_title = sub_topic.get("title", "Section")
     sub_topic_purpose = sub_topic.get("purpose", "")
 
@@ -377,12 +595,12 @@ def draft_section(
         "- Be thorough but focused on this sub-topic only\n"
         "- Use clear structure with sub-headings (###) if needed"
     )
+    system_prompt += _length_guidance(_MAX_TOKEN_LARGE, language_instruction)
     if language_instruction:
         system_prompt += f"\n\n{language_instruction}"
 
     context_text = "\n\n".join(
-        f"[Source {i+1}: {c.get('document_name', c.get('source', 'unknown'))}]\n{c.get('content', '')[:600]}"
-        for i, c in enumerate(search_context[:8])
+        _format_source_entry(i, c) for i, c in enumerate(search_context[:4])
     )
 
     user_content = f"Research Question: {query}\n\nSection: {sub_topic_title}\n\nContext:\n{context_text}"
@@ -391,13 +609,18 @@ def draft_section(
     if improvement_hints:
         user_content += f"\n\nImprovements needed:\n{improvement_hints[:300]}"
 
-    content, tokens = _call_llm(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        max_tokens=_MAX_TOKEN_LARGE,
-    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+    if stream_callback:
+        content, tokens = _call_llm_streaming(
+            messages, max_tokens=_MAX_TOKEN_LARGE, on_chunk=stream_callback,
+        )
+    else:
+        content, tokens = _call_llm(messages, max_tokens=_MAX_TOKEN_LARGE)
+
     if content.strip():
         return {"content": content, "tokens_used": tokens}
     return {"content": f"## {sub_topic_title}\n\nSection generation failed.", "tokens_used": 0}
@@ -409,7 +632,13 @@ def assemble_report(
     query: str,
     language_instruction: str = "",
 ) -> dict:
-    """Concatenate completed sections and generate executive summary via direct LLM call."""
+    """Concatenate completed sections and append a citation reference list.
+
+    No LLM call — sections are already drafted individually, so we only
+    need to join them and collect ``[Source N]`` references into a footer.
+    """
+    import re
+
     ordered_contents = []
     for title in section_order:
         section = next((s for s in sections if s.get("sub_topic") == title), None)
@@ -421,28 +650,25 @@ def assemble_report(
 
     body = "\n\n".join(ordered_contents)
 
-    system_prompt = (
-        "You are a research report editor. Given the section contents below, "
-        "write ONLY a brief Executive Summary (3-5 sentences) that synthesizes "
-        "the key findings across all sections. Do NOT repeat the sections."
-    )
-    if language_instruction:
-        system_prompt += f"\n\n{language_instruction}"
+    ref_numbers = sorted(set(int(m) for m in re.findall(r"\[Source\s+(\d+)\]", body)))
 
-    summary_content, tokens = _call_llm(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Research Question: {query}\n\nSections:\n{body[:3000]}"},
-        ],
-        max_tokens=_MAX_TOKEN_MEDIUM,
-    )
+    all_contexts: list[dict] = []
+    for sec in sections:
+        all_contexts.extend(sec.get("search_context") or [])
 
-    if summary_content.strip():
-        full_report = f"# Executive Summary\n\n{summary_content}\n\n{body}"
-    else:
-        full_report = body
+    if ref_numbers and all_contexts:
+        lines = ["\n\n---\n\n**References**\n"]
+        for n in ref_numbers:
+            if n < len(all_contexts):
+                ctx = all_contexts[n]
+                src = ctx.get("source", f"Source {n}")
+                preview = ctx.get("content", "")[:120].replace("\n", " ")
+                lines.append(f"- **[Source {n}]** {src}: {preview}")
+            else:
+                lines.append(f"- **[Source {n}]** (reference)")
+        body += "\n".join(lines)
 
-    return {"draft": full_report, "tokens_used": tokens}
+    return {"draft": body, "tokens_used": 0}
 
 
 # ---------------------------------------------------------------------------

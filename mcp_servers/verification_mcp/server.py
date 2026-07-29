@@ -12,9 +12,16 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from openai import OpenAI
 
-load_dotenv()
+load_dotenv(override=True)
 
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
+def _ensure_v1(url: str) -> str:
+    """Append /v1 if missing — RHOAI dashboard URLs omit it."""
+    if url and not url.rstrip("/").endswith("/v1"):
+        return url.rstrip("/") + "/v1"
+    return url
+
+
+LLM_BASE_URL = _ensure_v1(os.getenv("LLM_BASE_URL", "http://localhost:8000/v1"))
 LLM_API_KEY = os.getenv("LLM_API_KEY", "not-needed")
 LLM_MODEL = os.getenv("LLM_MODEL", "granite-3.3-8b-instruct")
 MAAS_API_KEY = os.getenv("MAAS_API_KEY", "")

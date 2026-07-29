@@ -1,11 +1,14 @@
 """Context Layer — Gathers context from agent configs, past failures, and accumulated research."""
 
 import os
+import sys
 from typing import Any
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 
 def gather_context(state: dict) -> dict:
@@ -55,29 +58,21 @@ def gather_context(state: dict) -> dict:
 def load_past_failure_memory() -> str:
     """Load failure patterns from past sessions (if available)."""
     try:
-        import psycopg2
-        conn = psycopg2.connect(
-            host=os.getenv("PGVECTOR_HOST", "localhost"),
-            port=os.getenv("PGVECTOR_PORT", "5432"),
-            dbname=os.getenv("PGVECTOR_DB", "doc_research"),
-            user=os.getenv("PGVECTOR_USER", "postgres"),
-            password=os.getenv("PGVECTOR_PASSWORD", "postgres"),
-        )
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT category, COUNT(*) as cnt
+        from db import get_connection
+
+        conn = get_connection()
+        rows = conn.execute(
+            """SELECT category, COUNT(*) as cnt
             FROM failure_log
-            WHERE timestamp > NOW() - INTERVAL '7 days'
+            WHERE timestamp > datetime('now', '-7 days')
             GROUP BY category
             ORDER BY cnt DESC
-            LIMIT 5
-        """)
-        rows = cur.fetchall()
-        cur.close()
+            LIMIT 5"""
+        ).fetchall()
         conn.close()
 
         if rows:
-            hints = [f"- {r[0]} (occurred {r[1]} times recently)" for r in rows]
+            hints = [f"- {r['category']} (occurred {r['cnt']} times recently)" for r in rows]
             return "Common failure patterns to watch for:\n" + "\n".join(hints)
     except Exception:
         pass

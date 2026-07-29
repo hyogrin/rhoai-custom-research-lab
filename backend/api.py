@@ -1,5 +1,6 @@
 """FastAPI backend API with SSE streaming for the research harness."""
 
+import asyncio
 import json
 import os
 import signal
@@ -20,12 +21,12 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from prometheus_fastapi_instrumentator import Instrumentator
 
-load_dotenv()
+load_dotenv(override=True)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from harness.session import SessionManager, ResearchSession
-from agents.orchestrator.agent import orchestrator_graph
+from agents.orchestrator.graph import orchestrator_graph
 from backend.metrics import (
     active_research_sessions,
     research_sessions_total,
@@ -180,6 +181,30 @@ def _emit_sub_events(node_name: str, state_update: dict, session: ResearchSessio
                 "detail": hints[:200],
             })
 
+    elif node_name == "classify_intent":
+        intent = state_update.get("intent", "research")
+        icon = "💬" if intent == "casual" else "🔬"
+        label = "casual conversation" if intent == "casual" else "research query"
+        events.append({
+            "event": "step",
+            "phase": "classify_intent",
+            "icon": icon,
+            "title": f"[Harness][Orchestrator] Query classified as {label}",
+            "agent": "Orchestrator",
+            "detail": f"Intent: {intent}",
+        })
+
+    elif node_name == "direct_response":
+        response = state_update.get("current_draft", "")
+        events.append({
+            "event": "step",
+            "phase": "direct_response",
+            "icon": "💬",
+            "title": "[Harness][Orchestrator] Direct response generated",
+            "agent": "Orchestrator",
+            "detail": response[:150].replace("\n", " "),
+        })
+
     elif node_name == "plan":
         plan = state_update.get("research_plan", [])
         section_order = state_update.get("section_order", [])
@@ -196,14 +221,13 @@ def _emit_sub_events(node_name: str, state_update: dict, session: ResearchSessio
             })
             for i, topic in enumerate(plan, 1):
                 title = topic.get("title", "Untitled")
-                queries = topic.get("queries", [])
                 events.append({
                     "event": "step",
                     "phase": "plan",
                     "icon": "📑",
                     "title": f"[Plan][Planner] Section {i}: {title}",
                     "agent": "Planner",
-                    "detail": f"Queries: {', '.join(q[:60] for q in queries[:3])} | {topic.get('purpose', '')}",
+                    "detail": topic.get("purpose", ""),
                 })
         else:
             events.append({
@@ -228,6 +252,18 @@ def _emit_sub_events(node_name: str, state_update: dict, session: ResearchSessio
                 })
 
     elif node_name == "execute":
+        error_msg = state_update.get("error", "")
+        if error_msg:
+            events.append({
+                "event": "error",
+                "phase": "execute",
+                "icon": "🚫",
+                "title": "[Execute][Error] Search failed",
+                "agent": "Researcher",
+                "detail": error_msg,
+            })
+            return events
+
         report_sections = state_update.get("report_sections", [])
         is_sectioned = bool(report_sections)
 
@@ -264,31 +300,13 @@ def _emit_sub_events(node_name: str, state_update: dict, session: ResearchSessio
                     "detail": ", ".join(urls[:3]),
                 })
 
-            for section in report_sections:
-                if section.get("status") == "drafted":
-                    sub_topic = section.get("sub_topic", "")
-                    content = section.get("content", "")
-                    events.append({
-                        "event": "step",
-                        "phase": "execute",
-                        "icon": "📝",
-                        "title": f"[Writing][Writer] Section drafted: {sub_topic}",
-                        "agent": "Writer",
-                        "detail": content[:150].replace("\n", " "),
-                    })
-                    events.append({
-                        "event": "section",
-                        "sub_topic": sub_topic,
-                        "content": content,
-                    })
-
             draft = state_update.get("current_draft", "")
             if draft:
                 events.append({
                     "event": "step",
                     "phase": "execute",
                     "icon": "📋",
-                    "title": f"[Writing][Writer] Full report assembled ({len(draft):,} chars, {len(report_sections)} sections)",
+                    "title": f"[Writing][Writer] Report ready ({len(draft):,} chars, {len(report_sections)} sections)",
                     "agent": "Writer",
                     "detail": "",
                 })
@@ -477,8 +495,15 @@ def _collect_sources(accumulated_context: list[dict]) -> list[dict]:
     return sources
 
 
+_SSE_HEARTBEAT_INTERVAL = 15  # seconds between keepalive comments
+
+
 async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None]:
-    """Run the orchestrator graph and yield rich SSE events for each phase."""
+    """Run the orchestrator graph and yield rich SSE events for each phase.
+
+    Sends SSE comment heartbeats every 15s to prevent connection timeouts
+    while graph nodes are processing.
+    """
     initial_state = {
         "session_id": session.session_id,
         "query": session.query,
@@ -505,6 +530,7 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
         "report_sections": [],
         "section_order": [],
         "failing_sections": [],
+        "intent": "",
         "status": "normalizing",
         "final_output": "",
         "error": "",
@@ -513,10 +539,165 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
     yield _sse({"event": "status", "message": "[Harness] 🚀 Starting deep research...", "phase": "start"})
 
     state_update = {}
+    event_queue: asyncio.Queue[dict | None] = asyncio.Queue()
+
+    async def _run_graph():
+        """Run the graph and push completed node updates into the queue."""
+        try:
+            async for mode, chunk in orchestrator_graph.astream(
+                initial_state, stream_mode=["updates", "custom"]
+            ):
+                await event_queue.put((mode, chunk))
+        except Exception as exc:
+            await event_queue.put(("error", {"__error__": str(exc)}))
+        finally:
+            await event_queue.put(None)
+
+    graph_task = asyncio.create_task(_run_graph())
+
     try:
-        async for chunk in orchestrator_graph.astream(
-            initial_state, stream_mode="updates"
-        ):
+        while True:
+            try:
+                item = await asyncio.wait_for(
+                    event_queue.get(), timeout=_SSE_HEARTBEAT_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                yield ": heartbeat\n\n"
+                continue
+
+            if item is None:
+                break
+
+            mode, chunk = item
+
+            if mode == "error" or (isinstance(chunk, dict) and "__error__" in chunk):
+                raise RuntimeError(chunk["__error__"])
+
+            if mode == "custom":
+                progress = chunk.get("progress", "")
+                title = chunk.get("section_title", "")
+                idx = chunk.get("section_index", 0)
+                total = chunk.get("total_sections", 0)
+                if progress == "section_start":
+                    evt = {
+                        "event": "step",
+                        "phase": "execute",
+                        "icon": "🔎",
+                        "title": f"[Execute][Researcher] ({idx}/{total}) Searching: {title}",
+                        "agent": "Researcher",
+                        "detail": f"Running semantic search & web search for section {idx} of {total}...",
+                        "iteration": session.iteration,
+                        "max_iterations": session.max_iterations,
+                        "quality_score": session.quality_score,
+                    }
+                    yield _sse(evt)
+                elif progress == "draft_chunk":
+                    yield _sse({"event": "stream", "text": chunk.get("text", "")})
+                elif progress == "section_done":
+                    evt = {
+                        "event": "step",
+                        "phase": "execute",
+                        "icon": "✅",
+                        "title": f"[Execute][Writer] ({idx}/{total}) Done: {title}",
+                        "agent": "Writer",
+                        "detail": "",
+                        "iteration": session.iteration,
+                        "max_iterations": session.max_iterations,
+                        "quality_score": session.quality_score,
+                    }
+                    yield _sse(evt)
+                    content = chunk.get("content", "")
+                    if content:
+                        yield _sse({
+                            "event": "section",
+                            "sub_topic": title,
+                            "content": content,
+                            "section_index": idx,
+                            "total_sections": total,
+                        })
+                elif progress == "section_failed":
+                    evt = {
+                        "event": "step",
+                        "phase": "execute",
+                        "icon": "❌",
+                        "title": f"[Execute][Researcher] ({idx}/{total}) Failed: {title}",
+                        "agent": "Researcher",
+                        "detail": "",
+                        "iteration": session.iteration,
+                        "max_iterations": session.max_iterations,
+                        "quality_score": session.quality_score,
+                    }
+                    yield _sse(evt)
+                elif progress == "assembling_report":
+                    evt = {
+                        "event": "step",
+                        "phase": "execute",
+                        "icon": "📋",
+                        "title": f"[Execute][Writer] Assembling final report ({total} sections)",
+                        "agent": "Writer",
+                        "detail": "",
+                        "iteration": session.iteration,
+                        "max_iterations": session.max_iterations,
+                        "quality_score": session.quality_score,
+                    }
+                    yield _sse(evt)
+                elif progress == "search_done":
+                    sem = chunk.get("semantic_count", 0)
+                    web = chunk.get("web_count", 0)
+                    doc_sources = chunk.get("doc_sources", [])
+                    web_urls = chunk.get("web_urls", [])
+                    _iter_meta = {
+                        "iteration": session.iteration,
+                        "max_iterations": session.max_iterations,
+                        "quality_score": session.quality_score,
+                    }
+                    if sem:
+                        yield _sse({
+                            "event": "step",
+                            "phase": "execute",
+                            "icon": "🔍",
+                            "title": f"[Tool-Search][Researcher] {sem} chunks retrieved",
+                            "agent": "Researcher",
+                            "detail": f"Sources: {', '.join(doc_sources[:5])}" if doc_sources else "",
+                            **_iter_meta,
+                        })
+                    if web:
+                        yield _sse({
+                            "event": "step",
+                            "phase": "execute",
+                            "icon": "🌐",
+                            "title": f"[Web Search][Researcher] Web search: {web} results",
+                            "agent": "Researcher",
+                            "detail": ", ".join(web_urls[:3]),
+                            **_iter_meta,
+                        })
+                elif progress == "drafting":
+                    evt = {
+                        "event": "step",
+                        "phase": "execute",
+                        "icon": "✍️",
+                        "title": f"[Execute][Writer] ({idx}/{total}) Drafting: {title}",
+                        "agent": "Writer",
+                        "detail": "",
+                        "iteration": session.iteration,
+                        "max_iterations": session.max_iterations,
+                        "quality_score": session.quality_score,
+                    }
+                    yield _sse(evt)
+                elif progress == "verifying":
+                    yield _sse({
+                        "event": "step",
+                        "phase": "verify",
+                        "icon": "📊",
+                        "title": "[Reviewing][Reviewer] Quality scoring & token calculation...",
+                        "agent": "Reviewer",
+                        "detail": "",
+                        "iteration": session.iteration,
+                        "max_iterations": session.max_iterations,
+                        "quality_score": session.quality_score,
+                    })
+                continue
+
             node_name = next(iter(chunk))
             state_update = chunk[node_name]
             iteration = state_update.get("iteration", session.iteration)
@@ -544,7 +725,6 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
 
             session_mgr.save(session)
 
-            # Emit rich sub-events for this node
             sub_events = _emit_sub_events(node_name, state_update, session)
             for evt in sub_events:
                 evt["iteration"] = session.iteration
@@ -580,6 +760,13 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
         session.status = "failed"
         session_mgr.save(session)
         yield _sse({"event": "error", "message": f"Research error: {exc}", "phase": "error"})
+    finally:
+        if not graph_task.done():
+            graph_task.cancel()
+            try:
+                await graph_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     yield "data: [DONE]\n\n"
 
@@ -691,8 +878,10 @@ def _process_documents_background(upload_id: str, file_paths: list[str]):
     try:
         from docling.document_converter import DocumentConverter
         from lib.document_processing import get_embeddings, get_db_connection
-        import psycopg2.extras
+        from lib.object_store import upload_document, get_document_url
+        from sqlite_vec import serialize_float32
         import hashlib
+        import json as _json
 
         converter = DocumentConverter()
         total_chunks_stored = 0
@@ -733,27 +922,44 @@ def _process_documents_background(upload_id: str, file_paths: list[str]):
             _update(f"💾 [Docling] Storing {len(chunks)} chunks: {filename}", file_base_pct + 85 // total)
 
             document_id = hashlib.sha256(path.encode()).hexdigest()[:16]
+
+            # Upload original file to MinIO for permanent storage + reference links
+            try:
+                object_key = upload_document(path, document_id)
+                object_store_path = get_document_url(object_key)
+                logger.info("Uploaded to MinIO: %s → %s", filename, object_store_path)
+            except Exception as e:
+                logger.warning("MinIO upload failed (using local path): %s", e)
+                object_store_path = path
+
             conn = get_db_connection()
             cur = conn.cursor()
 
             cur.execute(
                 """INSERT INTO documents (id, name, file_type, chunk_count, status, object_store_path)
-                   VALUES (%s, %s, %s, %s, 'completed', %s)
+                   VALUES (?, ?, ?, ?, 'completed', ?)
                    ON CONFLICT (id) DO UPDATE SET
-                       chunk_count = EXCLUDED.chunk_count,
-                       status = EXCLUDED.status,
-                       updated_at = NOW()""",
-                (document_id, filename, os.path.splitext(path)[1], len(chunks), path),
+                       chunk_count = excluded.chunk_count,
+                       status = excluded.status,
+                       object_store_path = excluded.object_store_path,
+                       updated_at = datetime('now')""",
+                (document_id, filename, os.path.splitext(path)[1], len(chunks), object_store_path),
             )
-            cur.execute("DELETE FROM document_chunks WHERE document_id = %s", (document_id,))
+            cur.execute("DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM document_chunks WHERE document_id = ?)", (document_id,))
+            cur.execute("DELETE FROM document_chunks WHERE document_id = ?", (document_id,))
 
             for idx, (chunk, embedding) in enumerate(zip(chunks, all_embeddings)):
                 metadata = chunk.get("metadata", {})
                 cur.execute(
-                    """INSERT INTO document_chunks (document_id, document_name, chunk_index, content, metadata, embedding)
-                       VALUES (%s, %s, %s, %s, %s::jsonb, %s::vector)""",
+                    """INSERT INTO document_chunks (document_id, document_name, chunk_index, content, metadata)
+                       VALUES (?, ?, ?, ?, ?)""",
                     (document_id, filename, idx, chunk["text"],
-                     psycopg2.extras.Json(metadata) if metadata else "{}", str(embedding)),
+                     _json.dumps(metadata) if metadata else "{}"),
+                )
+                chunk_id = cur.lastrowid
+                cur.execute(
+                    "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
+                    (chunk_id, serialize_float32(embedding)),
                 )
 
             conn.commit()
@@ -791,6 +997,35 @@ async def get_upload_status(upload_id: str):
     if upload_id in _upload_status:
         return _upload_status[upload_id]
     return {"upload_id": upload_id, "status": "processing", "message": "Still processing..."}
+
+
+@app.get("/documents/{document_id}/download_url")
+async def get_document_download_url(document_id: str):
+    """Generate a presigned download URL for a stored document."""
+    from lib.document_processing import get_db_connection
+
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT object_store_path, name FROM documents WHERE id = ?", (document_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    object_store_path = row["object_store_path"]
+    doc_name = row["name"]
+    if not object_store_path or not object_store_path.startswith("http"):
+        raise HTTPException(status_code=404, detail="Document not in object storage")
+
+    try:
+        from lib.object_store import get_presigned_url
+        object_key = f"{document_id}/{doc_name}"
+        url = get_presigned_url(object_key)
+        return {"document_id": document_id, "name": doc_name, "download_url": url}
+    except Exception as e:
+        logger.warning("Presigned URL generation failed: %s", e)
+        return {"document_id": document_id, "name": doc_name, "download_url": object_store_path}
 
 
 @app.get("/health")
