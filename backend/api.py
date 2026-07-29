@@ -614,6 +614,7 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
                             "content": content,
                             "section_index": idx,
                             "total_sections": total,
+                            "iteration": session.iteration,
                         })
                 elif progress == "section_failed":
                     evt = {

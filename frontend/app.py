@@ -493,8 +493,14 @@ async def _handle_event(
             section_content = data.get("content", "")
             if section_content:
                 sub_topic = data.get("sub_topic", "")
+                cur_iter = data.get("iteration", 1)
+                prev_iter = cl.user_session.get("_sections_iter", 0)
                 sections_map = cl.user_session.get("_sections_map") or {}
                 sections_order = cl.user_session.get("_sections_order") or []
+                if cur_iter != prev_iter:
+                    sections_map = {}
+                    sections_order = []
+                    cl.user_session.set("_sections_iter", cur_iter)
                 sections_map[sub_topic] = section_content
                 if sub_topic not in sections_order:
                     sections_order.append(sub_topic)
@@ -542,8 +548,14 @@ async def _handle_event(
         section_content = data.get("content", "")
         sub_topic = data.get("sub_topic", "")
         if section_content:
+            cur_iter = data.get("iteration", 1)
+            prev_iter = cl.user_session.get("_sections_iter", 0)
             sections_map = cl.user_session.get("_sections_map") or {}
             sections_order = cl.user_session.get("_sections_order") or []
+            if cur_iter != prev_iter:
+                sections_map = {}
+                sections_order = []
+                cl.user_session.set("_sections_iter", cur_iter)
             sections_map[sub_topic] = section_content
             if sub_topic not in sections_order:
                 sections_order.append(sub_topic)
