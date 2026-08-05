@@ -1,0 +1,65 @@
+{
+  "app": {
+    "title": "딥 리서치 랩",
+    "description": "Red Hat OpenShift AI 기반 멀티 에이전트 하네스 엔지니어링으로 구동되는 AI 맞춤형 심층 연구"
+  },
+  "sidebar": {
+    "history": "대화 기록",
+    "newChat": "새 대화",
+    "noConversations": "아직 대화가 없습니다"
+  },
+  "header": {
+    "settings": "설정",
+    "language": "언어"
+  },
+  "settings": {
+    "title": "연구 설정",
+    "qualityThreshold": "품질 임계값",
+    "qualityThresholdDesc": "반복 중단을 위한 최소 품질 점수 (1-10)",
+    "maxIterations": "최대 반복 횟수",
+    "maxIterationsDesc": "하네스 최대 반복 횟수",
+    "webSearch": "웹 검색",
+    "webSearchDesc": "최신 정보를 위한 웹 검색 허용",
+    "planning": "연구 계획",
+    "planningDesc": "실행 전 구조화된 연구 계획 생성",
+    "factCheck": "팩트 체크",
+    "factCheckDesc": "원본 문서와 주장 교차 검증",
+    "parallel": "병렬 처리",
+    "parallelDesc": "검색 및 검증을 동시에 실행",
+    "sectioned": "섹션별 보고서",
+    "sectionedDesc": "하위 주제로 분해하여 독립적으로 작성"
+  },
+  "chat": {
+    "verbose": "상세 출력",
+    "stepHistory": "단계 기록",
+    "placeholder": "연구 질문을 입력하거나 문서를 업로드하세요...",
+    "upload": "문서 업로드"
+  },
+  "starters": {
+    "upload": {
+      "label": "문서 업로드",
+      "message": "리서치를 위한 문서를 업로드합니다"
+    },
+    "summarize": {
+      "label": "인용 포함 요약",
+      "message": "핵심 내용을 분석하고 사업적, 기술적 가치 두 측면에 대해 인용을 포함한 종합적인 요약을 제공해주세요."
+    },
+    "compare": {
+      "label": "논점 비교",
+      "message": "업로드된 문서에 제시된 주요 논점들을 사업적, 기술적 가치 두 측면에 대해 비교 분석해주세요."
+    }
+  },
+  "review": {
+    "title": "사람 검토 필요",
+    "qualityScore": "품질 점수",
+    "threshold": "임계값",
+    "belowTarget": "목표 대비 {points}점 부족",
+    "iterations": "{max}회 중 {current}회 반복 완료",
+    "suggestions": "개선 제안",
+    "accept": "결과 수락",
+    "continue": "계속 반복"
+  },
+  "language": {
+    "instruction": "반드시 한국어로 답변하세요."
+  }
+}

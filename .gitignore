@@ -212,6 +212,11 @@ frontend/.chainlit/translations/
 frontend/.chainlit/.langchain.db
 frontend/.files/
 
+# Node / Next.js
+node_modules/
+.next/
+out/
+
 # Project-specific
 data/sample_docs/*.pdf
 data/sample_docs/*.docx

@@ -1,0 +1,65 @@
+{
+  "app": {
+    "title": "Deep Research Lab",
+    "description": "AI-powered custom deep research with multi-agent harness engineering"
+  },
+  "sidebar": {
+    "history": "Chat History",
+    "newChat": "New Chat",
+    "noConversations": "No conversations yet"
+  },
+  "header": {
+    "settings": "Settings",
+    "language": "Language"
+  },
+  "settings": {
+    "title": "Research Settings",
+    "qualityThreshold": "Quality Threshold",
+    "qualityThresholdDesc": "Minimum quality score (1-10) before stopping",
+    "maxIterations": "Max Iterations",
+    "maxIterationsDesc": "Maximum harness iterations",
+    "webSearch": "Web Search",
+    "webSearchDesc": "Search the web for up-to-date information",
+    "planning": "Research Planning",
+    "planningDesc": "Generate structured plan before executing",
+    "factCheck": "Fact Check",
+    "factCheckDesc": "Cross-reference claims against sources",
+    "parallel": "Parallel Processing",
+    "parallelDesc": "Run searches and verifications concurrently",
+    "sectioned": "Sectioned Report",
+    "sectionedDesc": "Decompose into sub-topics with independent sections"
+  },
+  "chat": {
+    "verbose": "Verbose",
+    "stepHistory": "Step History",
+    "placeholder": "Ask a research question or upload a document...",
+    "upload": "Upload Document"
+  },
+  "starters": {
+    "upload": {
+      "label": "Upload a document",
+      "message": "Upload a document for research"
+    },
+    "summarize": {
+      "label": "Summarize with citations",
+      "message": "Analyze the key findings and provide a comprehensive, business and technical value-added summary with citations."
+    },
+    "compare": {
+      "label": "Compare arguments",
+      "message": "Compare and contrast the main arguments presented, business and technical value-added in the uploaded documents."
+    }
+  },
+  "review": {
+    "title": "Human Review Required",
+    "qualityScore": "Quality Score",
+    "threshold": "Threshold",
+    "belowTarget": "Below target by {points} points",
+    "iterations": "Completed {current} of {max} iterations",
+    "suggestions": "Suggested Improvements",
+    "accept": "Accept Result",
+    "continue": "Continue Iterating"
+  },
+  "language": {
+    "instruction": "You MUST respond entirely in English."
+  }
+}

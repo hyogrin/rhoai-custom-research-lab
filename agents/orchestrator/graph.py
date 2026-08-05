@@ -9,10 +9,11 @@ import json
 import logging
 import os
 import sys
+import time
 import uuid
 
 from langgraph.graph import StateGraph, END
-from langgraph.types import StreamWriter
+from langgraph.types import interrupt, Command, StreamWriter
 from typing import Callable, Literal
 
 from dotenv import load_dotenv
@@ -139,7 +140,7 @@ def classify_intent_node(state: ResearchState) -> dict:
 
 def route_by_intent(state: ResearchState) -> Literal["plan", "direct_response"]:
     """Route based on classified intent."""
-    if state.get("intent") == "casual":
+    if state.get("intent") in ("casual", "needs_clarification"):
         return "direct_response"
     return "plan"
 
@@ -147,7 +148,8 @@ def route_by_intent(state: ResearchState) -> Literal["plan", "direct_response"]:
 def direct_response_node(state: ResearchState) -> dict:
     """Generate a direct conversational response for non-research queries."""
     observer = _get_observer(state["session_id"])
-    result = direct_response(state["query"], state.get("language_instruction", ""))
+    intent = state.get("intent", "casual")
+    result = direct_response(state["query"], state.get("language_instruction", ""), intent=intent)
     observer.trace_tool_call(
         iteration=state["iteration"],
         operation="direct_response",
@@ -155,8 +157,9 @@ def direct_response_node(state: ResearchState) -> dict:
         output_summary=result.get("response", "")[:200],
         tokens_used=result.get("tokens_used", 0),
     )
+    response_text = result.get("response", "")
     update = {
-        "current_draft": result.get("response", ""),
+        "current_draft": response_text,
         "quality_score": 10.0,
         "status": "complete",
         "total_tokens": state.get("total_tokens", 0) + result.get("tokens_used", 0),
@@ -189,15 +192,20 @@ def plan_node(state: ResearchState) -> dict:
         c.get("content", "")[:200] for c in (state.get("accumulated_context") or [])[-5:]
     )
 
+    failure_hints = state.get("failure_hints", "")
+    human_direction = state.get("human_direction", "")
+    if human_direction:
+        failure_hints += f"\n\n[User direction]: {human_direction}"
+
     use_sections = state.get("enable_sectioned", False)
 
-    ws_flag = state.get("enable_web_search", False)
+    ws_flag = state.get("enable_web_search", True)
 
     if use_sections:
         result = generate_sectioned_plan(
             state["query"],
             iteration,
-            state.get("failure_hints", ""),
+            failure_hints,
             existing_context,
             language_instruction=state.get("language_instruction", ""),
             enable_web_search=ws_flag,
@@ -221,7 +229,7 @@ def plan_node(state: ResearchState) -> dict:
         result = generate_plan(
             state["query"],
             iteration,
-            state.get("failure_hints", ""),
+            failure_hints,
             existing_context,
             enable_web_search=ws_flag,
         )
@@ -405,17 +413,10 @@ def _execute_sections(state: ResearchState, writer: StreamWriter) -> dict:
         web = search_result["web_count"]
 
         if sem == 0 and web == 0:
-            err_msg = f"No search results for section '{title}' — check document ingestion and DB connection"
-            logger.error("Aborting execution: %s", err_msg)
+            logger.warning("No search results for section '%s' — skipping (MCP servers may be unavailable)", title)
+            sections.append({"sub_topic": title, "content": "", "search_context": [], "score": 0.0, "status": "no_results"})
             writer({"progress": "section_failed", **evt_base})
-            return {
-                "accumulated_context": new_context,
-                "report_sections": sections,
-                "current_draft": "",
-                "status": "error",
-                "error": err_msg,
-                "total_tokens": total_tokens,
-            }
+            continue
 
         doc_sources: set[str] = set()
         web_urls: list[str] = []
@@ -743,18 +744,65 @@ def observe_node(state: ResearchState) -> dict:
     return update
 
 
-def should_iterate(state: ResearchState) -> Literal["plan", "finalize"]:
-    """Decide whether to iterate or finalize."""
-    quality_score = state.get("quality_score", 0)
-    threshold = state.get("quality_threshold", 7.0)
+def should_iterate(state: ResearchState) -> Literal["iteration_review", "finalize"]:
+    """Always route to iteration_review — the card handles both pass and fail states."""
+    return "iteration_review"
+
+
+def iteration_review_node(state: ResearchState) -> dict:
+    """Pause for human-in-the-loop review before each iteration.
+
+    Shows the LLM's quality assessment and improvement suggestions.
+    The user can provide additional direction or accept the current result.
+    Uses LangGraph's interrupt() to pause the graph.
+    """
     iteration = state.get("iteration", 0)
     max_iterations = state.get("max_iterations", 5)
+    verification = state.get("verification_result", {})
 
-    if quality_score >= threshold:
+    quality_score = state.get("quality_score", 0)
+    quality_threshold = state.get("quality_threshold", 7.0)
+    quality_met = quality_score >= quality_threshold
+
+    review_data = {
+        "quality_score": quality_score,
+        "quality_threshold": quality_threshold,
+        "iteration": iteration,
+        "max_iterations": max_iterations,
+        "improvements": verification.get("improvements", []),
+        "can_iterate": not quality_met and iteration < max_iterations,
+        "quality_met": quality_met,
+    }
+
+    user_response = interrupt(review_data)
+
+    if quality_met:
+        return {"status": "finalizing", "human_direction": ""}
+
+    action = "accept"
+    direction = ""
+    if isinstance(user_response, dict):
+        action = user_response.get("action", "accept")
+        direction = user_response.get("direction", "")
+    elif isinstance(user_response, str):
+        raw = user_response.strip()
+        if raw == "__accept__" or raw.lower() == "accept":
+            action = "accept"
+        elif raw:
+            action = "continue"
+            direction = raw
+
+    if action == "accept" or iteration >= max_iterations:
+        return {"status": "finalizing", "human_direction": direction}
+
+    return {"status": "planning", "human_direction": direction}
+
+
+def route_after_review(state: ResearchState) -> Literal["iterate", "finalize"]:
+    """Route after human review: iterate if user wants to continue, else finalize."""
+    if state.get("status") == "finalizing":
         return "finalize"
-    if iteration >= max_iterations:
-        return "finalize"
-    return "plan"
+    return "iterate"
 
 
 def iterate_node(state: ResearchState) -> dict:
@@ -771,25 +819,58 @@ def iterate_node(state: ResearchState) -> dict:
     return update
 
 
-def _build_references(accumulated_context: list[dict]) -> str:
-    """Build a markdown references section from context entries with source URLs."""
-    seen_urls: dict[str, str] = {}
+def _dedup_sources(accumulated_context: list[dict]) -> list[dict]:
+    """Deduplicate sources from accumulated context into a list of dicts.
+
+    Returns a 1-indexed list: [{"index": 1, "name": ..., "snippet": ..., "url": ..., "domain": ...}, ...]
+    The index matches the [Source N] numbering used in LLM prompts.
+    """
+    import re as _re
+    from urllib.parse import urlparse
+
+    seen: dict[str, dict] = {}
     for ctx in accumulated_context:
         metadata = ctx.get("metadata") or {}
         url = metadata.get("source_url", "")
-        if not url or url.startswith("/"):
+        raw_name = ctx.get("document_name", ctx.get("source", "")) or ""
+        doc_name = _re.sub(r"\[\d+\]$", "", raw_name).strip()
+        if not doc_name:
             continue
-        doc_name = metadata.get("document_name", "") or ctx.get("source", "unknown")
-        if url not in seen_urls:
-            seen_urls[url] = doc_name
+        key = url if (url and url.startswith("http")) else doc_name
+        if key not in seen:
+            snippet = (ctx.get("content", "") or "")[:150].strip()
+            domain = ""
+            if url and url.startswith("http"):
+                try:
+                    domain = urlparse(url).netloc
+                except Exception:
+                    domain = url[:40]
+            seen[key] = {"name": doc_name, "url": url if url.startswith("http") else "", "snippet": snippet, "domain": domain}
 
-    if not seen_urls:
+    result = []
+    for idx, entry in enumerate(seen.values(), 1):
+        result.append({"index": idx, **entry})
+    return result
+
+
+def _build_references(accumulated_context: list[dict]) -> str:
+    """Build a markdown references section from context entries.
+
+    Each entry shows the citation badge number linked to #cite-N
+    followed by the document name (with URL if available).
+    """
+    sources = _dedup_sources(accumulated_context)
+    if not sources:
         return ""
 
     lines = []
-    for idx, (url, name) in enumerate(seen_urls.items(), 1):
-        lines.append(f"{idx}. [{name}]({url})")
-    return "\n".join(lines)
+    for s in sources:
+        badge = f"[{s['index']}](#cite-{s['index']})"
+        if s["url"]:
+            lines.append(f"{badge} [{s['name']}]({s['url']})")
+        else:
+            lines.append(f"{badge} {s['name']}")
+    return "\n\n".join(lines)
 
 
 def finalize_node(state: ResearchState) -> dict:
@@ -852,8 +933,13 @@ def finalize_node(state: ResearchState) -> dict:
 
     _observers.pop(state.get("session_id", ""), None)
 
+    output = _fix_markdown_output(output)
+
+    sources_list = _dedup_sources(state.get("accumulated_context") or [])
+
     update = {
         "final_output": output,
+        "sources": sources_list,
         "total_cost": total_cost,
         "status": "complete",
     }
@@ -861,10 +947,30 @@ def finalize_node(state: ResearchState) -> dict:
     return update
 
 
+def _fix_markdown_output(text: str) -> str:
+    """Ensure blank lines before headings, fix table formatting, convert citations to links."""
+    import re
+    text = re.sub(r"(\])\.(#{1,6}\s)", r"\1.\n\n\2", text)
+    text = re.sub(r"(\|)\s*(#{1,6}\s)", r"\1\n\n\2", text)
+    text = re.sub(r"([^\n])\n(#{1,6}\s)", r"\1\n\n\2", text)
+    text = re.sub(r"([^\n#])(#{1,6}\s)", r"\1\n\n\2", text)
+    text = re.sub(r" \| \| ", " |\n| ", text)
+    text = re.sub(r"(\| :?-+:? (?:\| :?-+:? )*\|) (\|)", r"\1\n\2", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    # Convert [Source N] and [Source 1, Source 2] into citation badge links.
+    # Negative lookahead avoids transforming [Source N](url) which is already a link.
+    def _expand_cite(m: re.Match) -> str:
+        nums = re.findall(r"\d+", m.group(1))
+        return "".join(f"[{n}](#cite-{n})" for n in nums)
+
+    text = re.sub(r"\[Source (\d+(?:,\s*(?:Source\s*)?\d+)*)\](?!\()", _expand_cite, text)
+    return text
+
+
 # --- Build the Graph ---
 
 
-def build_graph():
+def build_graph(checkpointer=None):
     graph = StateGraph(ResearchState)
 
     graph.add_node("normalize", normalize_node)
@@ -874,6 +980,7 @@ def build_graph():
     graph.add_node("execute", execute_node)
     graph.add_node("verify", verify_node)
     graph.add_node("observe", observe_node)
+    graph.add_node("iteration_review", iteration_review_node)
     graph.add_node("iterate", iterate_node)
     graph.add_node("finalize", finalize_node)
 
@@ -887,11 +994,20 @@ def build_graph():
     graph.add_edge("plan", "execute")
     graph.add_edge("execute", "verify")
     graph.add_edge("verify", "observe")
-    graph.add_conditional_edges("observe", should_iterate, {"plan": "iterate", "finalize": "finalize"})
+    graph.add_conditional_edges(
+        "observe", should_iterate,
+        {"iteration_review": "iteration_review", "finalize": "finalize"},
+    )
+    graph.add_conditional_edges(
+        "iteration_review", route_after_review,
+        {"iterate": "iterate", "finalize": "finalize"},
+    )
     graph.add_edge("iterate", "plan")
     graph.add_edge("finalize", END)
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
-orchestrator_graph = build_graph()
+from langgraph.checkpoint.memory import MemorySaver
+
+orchestrator_graph = build_graph(checkpointer=MemorySaver())

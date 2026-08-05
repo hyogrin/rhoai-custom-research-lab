@@ -332,18 +332,31 @@ def rewrite_query(query: str) -> list[str]:
 
 
 def classify_intent(query: str) -> dict:
-    """Classify query intent: 'research' or 'casual'."""
+    """Classify query intent: 'research', 'casual', or 'needs_clarification'."""
     content, tokens = _call_llm(
         [
             {
                 "role": "system",
                 "content": (
-                    "You are a query intent classifier. Classify the user's message into one of two categories:\n"
-                    "- \"research\": The user wants in-depth research, analysis, or information retrieval on a topic.\n"
-                    "- \"casual\": The user is making a greeting, small talk, asking a simple non-research question, "
-                    "or the message is too short/vague to be a research query.\n\n"
-                    "Return ONLY a JSON object: {\"intent\": \"research\" or \"casual\", \"reason\": \"brief explanation\"}\n"
-                    "When in doubt, classify as \"research\"."
+                    "You are a query intent classifier for a document research system.\n"
+                    "Classify the user's message into one of three categories:\n\n"
+                    "- \"research\": The user wants in-depth research, analysis, or summary. "
+                    "This includes:\n"
+                    "  * Requests that name a specific document or file "
+                    "(e.g. 'Analyze the document \"report.pdf\" and summarize key findings')\n"
+                    "  * Requests with a clear topic or subject "
+                    "(e.g. 'How does the layout analysis model handle table detection?')\n"
+                    "  * Any request to summarize, compare, or analyze uploaded documents\n"
+                    "- \"needs_clarification\": The message looks like a research request but is too vague — "
+                    "it lacks BOTH a concrete topic AND a document reference. Examples:\n"
+                    "  * 'Summarize something for me' (no topic, no document)\n"
+                    "  * 'Analyze this' (no specifics at all)\n"
+                    "- \"casual\": Greeting, small talk, or a simple non-research question.\n\n"
+                    "IMPORTANT: If the query mentions a specific document name or filename, "
+                    "always classify as \"research\" — the document itself provides the concrete subject.\n\n"
+                    "Return ONLY a JSON object: "
+                    "{\"intent\": \"research\" or \"needs_clarification\" or \"casual\", "
+                    "\"reason\": \"brief explanation\"}"
                 ),
             },
             {"role": "user", "content": query},
@@ -351,27 +364,40 @@ def classify_intent(query: str) -> dict:
         max_tokens=64,
         temperature=0.0,
     )
+    valid_intents = ("research", "casual", "needs_clarification")
     if content:
         parsed = _extract_json(content)
-        if isinstance(parsed, dict) and parsed.get("intent") in ("research", "casual"):
+        if isinstance(parsed, dict) and parsed.get("intent") in valid_intents:
             return {**parsed, "tokens_used": tokens}
     return {"intent": "research", "reason": "default", "tokens_used": tokens}
 
 
-def direct_response(query: str, language_instruction: str = "") -> dict:
+def direct_response(query: str, language_instruction: str = "", intent: str = "casual") -> dict:
     """Generate a direct conversational response (no research pipeline)."""
     lang_hint = f"\n{language_instruction}" if language_instruction else ""
+
+    if intent == "needs_clarification":
+        system_prompt = (
+            "You are a research assistant. The user's query is too vague to start a meaningful "
+            "document research — it lacks a specific topic or subject.\n\n"
+            "Your task:\n"
+            "1. Briefly acknowledge their request.\n"
+            "2. Explain that a specific research topic is needed for the system to search documents effectively.\n"
+            "3. Suggest 2-3 example queries they could try, based on what they seem to want.\n\n"
+            "Keep the response concise and helpful."
+            f"{lang_hint}"
+        )
+    else:
+        system_prompt = (
+            "You are a friendly research assistant. The user sent a casual message "
+            "(greeting, simple question, or small talk). Respond naturally and briefly. "
+            "If they seem to want research help, suggest they ask a specific research question."
+            f"{lang_hint}"
+        )
+
     content, tokens = _call_llm(
         [
-            {
-                "role": "system",
-                "content": (
-                    "You are a friendly research assistant. The user sent a casual message "
-                    "(greeting, simple question, or small talk). Respond naturally and briefly. "
-                    "If they seem to want research help, suggest they ask a specific research question."
-                    f"{lang_hint}"
-                ),
-            },
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": query},
         ],
         max_tokens=_MAX_TOKEN_SMALL,
@@ -430,16 +456,25 @@ def generate_plan(
     if failure_hints:
         failure_info = f"\n\nPrevious issues to avoid:\n{failure_hints}"
 
+    web_note = ""
+    if enable_web_search:
+        web_note = (
+            "\n\nIMPORTANT: You have access to web search. When the user asks about "
+            "'latest trends', 'industry news', 'recent developments', or anything requiring "
+            "up-to-date information, include steps with action 'web_search' to gather current data. "
+            "Use 'search' for document-based retrieval and 'web_search' for web-based retrieval."
+        )
+
     content, tokens = _call_llm(
         [
             {
                 "role": "system",
                 "content": (
                     "You are a research planner. Create a structured research plan as a JSON array of steps. "
-                    "Each step should have: 'action' (search|analyze|compare|validate), "
+                    "Each step should have: 'action' (search|web_search|analyze|compare|validate), "
                     "'query' (specific search or analysis query), 'purpose' (why this step). "
                     f"This is iteration {iteration}."
-                    f"{failure_info}{context_info}"
+                    f"{web_note}{failure_info}{context_info}"
                 ),
             },
             {"role": "user", "content": query},
@@ -522,6 +557,33 @@ def generate_sectioned_plan(
     }
 
 
+def _fix_markdown_formatting(text: str) -> str:
+    """Post-process LLM output to ensure valid markdown formatting.
+
+    Fixes common issues:
+    - Missing blank line before headings
+    - Citation glued to heading on same line
+    - Table rows collapsed onto a single line
+    - Table end glued to next heading
+    """
+    # Fix citation glued to heading: "].## Title" → "].\n\n## Title"
+    text = re.sub(r"(\])\.(#{1,6}\s)", r"\1.\n\n\2", text)
+    # Fix pipe (table end) glued to heading: " |## Title" → " |\n\n## Title"
+    text = re.sub(r"(\|)\s*(#{1,6}\s)", r"\1\n\n\2", text)
+    # Ensure blank line before any heading
+    text = re.sub(r"([^\n])\n(#{1,6}\s)", r"\1\n\n\2", text)
+
+    # Fix collapsed table rows: split "| ... | | ... |" into separate lines.
+    # Markdown tables require each row on its own line.
+    # Pattern: " | | " where the double-pipe signals a row boundary.
+    text = re.sub(r" \| \| ", " |\n| ", text)
+    # Handle separator row collapsed inline: "| :--- | :--- | | " → newline
+    text = re.sub(r"(\| :?-+:? (?:\| :?-+:? )*\|) (\|)", r"\1\n\2", text)
+
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
 def draft_report(
     query: str,
     context: str,
@@ -533,7 +595,20 @@ def draft_report(
     """Draft report via direct LLM call."""
     system_prompt = (
         "You are a research report writer. Write a comprehensive, well-structured research report "
-        "based on the provided context and research plan. Include citations as [Source N]. "
+        "based on the provided context and research plan.\n\n"
+        "Citation rules (STRICT):\n"
+        "- Cite sources as [N](#cite-N) where N is the source number. Example: [1](#cite-1)\n"
+        "- For multiple sources: [1](#cite-1)[2](#cite-2) — each in its own bracket.\n"
+        "- Place citations at the END of the relevant sentence, before the period.\n"
+        "- NEVER use the format [Source N] — always use [N](#cite-N).\n"
+        "- NEVER place a citation immediately before a heading or on the same line as a heading.\n\n"
+        "Markdown formatting rules (STRICT):\n"
+        "- ALWAYS insert a blank line before ANY heading (##, ###, etc.).\n"
+        "- ALWAYS insert a blank line after a heading before the body text.\n"
+        "- NEVER concatenate a citation and a heading on the same line.\n"
+        "- Each section must be separated by a blank line.\n"
+        "- Do NOT truncate sections mid-sentence.\n"
+        "- Tables: each row MUST be on its own line. Add a blank line before and after the table.\n\n"
         "Structure: Executive Summary, Key Findings, Detailed Analysis, Conclusion."
     )
     system_prompt += _length_guidance(_MAX_TOKEN_LARGE, language_instruction)
@@ -553,12 +628,13 @@ def draft_report(
         ],
         max_tokens=_MAX_TOKEN_LARGE,
     )
-    return {"draft": content, "tokens_used": tokens}
+    return {"draft": _fix_markdown_formatting(content), "tokens_used": tokens}
 
 
 def _format_source_entry(idx: int, ctx: dict) -> str:
     """Format a single context entry for LLM prompt, including source URL if available."""
-    name = ctx.get("document_name", ctx.get("source", "unknown"))
+    raw_name = ctx.get("document_name", ctx.get("source", "unknown"))
+    name = re.sub(r"\[\d+\]$", "", raw_name).strip()
     metadata = ctx.get("metadata") or {}
     url = metadata.get("source_url", "")
     header = f"[Source {idx+1}: {name}]"
@@ -591,9 +667,23 @@ def draft_section(
         "Guidelines:\n"
         "- Write ONLY this section (do not include executive summary or conclusion for the whole report)\n"
         "- Start with a ## heading matching the section title\n"
-        "- Include citations as [Source N] referencing the provided context\n"
         "- Be thorough but focused on this sub-topic only\n"
-        "- Use clear structure with sub-headings (###) if needed"
+        "- Use clear structure with sub-headings (###) if needed\n"
+        "- Complete every sentence — NEVER truncate mid-sentence or mid-word\n\n"
+        "Citation rules (STRICT):\n"
+        "- Cite sources as [N](#cite-N) where N is the source number. Example: [1](#cite-1)\n"
+        "- For multiple sources: [1](#cite-1)[2](#cite-2) — each in its own bracket.\n"
+        "- Place citations at the END of the relevant sentence, before the period.\n"
+        "- NEVER use the format [Source N] — always use [N](#cite-N).\n"
+        "- NEVER place a citation immediately before a heading or on the same line as a heading.\n\n"
+        "Markdown formatting rules (STRICT):\n"
+        "- ALWAYS insert a blank line before ANY heading (##, ###, etc.).\n"
+        "- ALWAYS insert a blank line after a heading before the body text.\n"
+        "- NEVER concatenate a citation and a heading on the same line.\n"
+        "- Each paragraph and section must be separated by a blank line.\n"
+        "- Do NOT truncate sections mid-sentence or mid-word.\n"
+        "- Tables: each row MUST be on its own line. Header row, separator row (| :--- |), "
+        "and each data row must each start on a new line. Add a blank line before and after the table."
     )
     system_prompt += _length_guidance(_MAX_TOKEN_LARGE, language_instruction)
     if language_instruction:
@@ -622,7 +712,7 @@ def draft_section(
         content, tokens = _call_llm(messages, max_tokens=_MAX_TOKEN_LARGE)
 
     if content.strip():
-        return {"content": content, "tokens_used": tokens}
+        return {"content": _fix_markdown_formatting(content), "tokens_used": tokens}
     return {"content": f"## {sub_topic_title}\n\nSection generation failed.", "tokens_used": 0}
 
 
@@ -635,7 +725,7 @@ def assemble_report(
     """Concatenate completed sections and append a citation reference list.
 
     No LLM call — sections are already drafted individually, so we only
-    need to join them and collect ``[Source N]`` references into a footer.
+    need to join them and collect citation references into a footer.
     """
     import re
 
@@ -650,23 +740,30 @@ def assemble_report(
 
     body = "\n\n".join(ordered_contents)
 
-    ref_numbers = sorted(set(int(m) for m in re.findall(r"\[Source\s+(\d+)\]", body)))
+    # Collect cited source numbers from both formats: [N](#cite-N) and legacy [Source N]
+    cite_nums = set(int(m) for m in re.findall(r"\[(\d+)\]\(#cite-\1\)", body))
+    cite_nums |= set(int(m) for m in re.findall(r"\[Source\s+(\d+)\]", body))
+    ref_numbers = sorted(cite_nums)
 
     all_contexts: list[dict] = []
     for sec in sections:
         all_contexts.extend(sec.get("search_context") or [])
 
     if ref_numbers and all_contexts:
-        lines = ["\n\n---\n\n**References**\n"]
+        seen_refs: list[tuple[int, str, str]] = []
         for n in ref_numbers:
             if n < len(all_contexts):
                 ctx = all_contexts[n]
-                src = ctx.get("source", f"Source {n}")
-                preview = ctx.get("content", "")[:120].replace("\n", " ")
-                lines.append(f"- **[Source {n}]** {src}: {preview}")
+                raw = ctx.get("document_name", ctx.get("source", f"Source {n}"))
+                clean = re.sub(r"\[\d+\]$", "", raw).strip()
+                metadata = ctx.get("metadata") or {}
+                url = metadata.get("source_url", "")
+                seen_refs.append((n, clean, url if url.startswith("http") else ""))
             else:
-                lines.append(f"- **[Source {n}]** (reference)")
-        body += "\n".join(lines)
+                seen_refs.append((n, f"Source {n}", ""))
+
+        # Do NOT append inline references — finalize_node handles the References section.
+        # This keeps the assembled body clean for verification scoring.
 
     return {"draft": body, "tokens_used": 0}
 

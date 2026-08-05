@@ -86,10 +86,40 @@ Query rewriting, context synthesis, research planning, and report drafting are p
 
 ```bash
 cp sample.env .env        # Configure model endpoints + infra URLs
-uv sync                   # Install dependencies
+uv sync                   # Install Python dependencies
+docker compose up -d      # Start PostgreSQL + pgvector
+cd frontend-next && npm install && cd ..  # Install frontend dependencies
 make backend-start        # Start backend + auto-start all 4 MCP servers
-make frontend-start       # Start Chainlit UI (separate terminal)
+make frontend-start       # Start Next.js UI (separate terminal)
 ```
+
+### Frontend-Backend Protocol
+
+The frontend communicates with the backend using the **AG-UI (Agent-User Interaction)
+protocol** over SSE. The `ag-ui-langgraph` adapter exposes the orchestrator graph at
+`/agent`, translating LangGraph stream events into AG-UI events:
+
+- `TEXT_MESSAGE_START/CONTENT/END` — streaming research output
+- `TOOL_CALL_START/ARGS/END` — MCP tool invocations
+- `THINKING_START/CONTENT/END` — reasoning visibility
+- `STATE_SNAPSHOT` — full state synchronization
+- `RUN_FINISHED(outcome="interrupted")` — human-in-the-loop pause
+
+The legacy `/research` SSE endpoint is preserved for backward compatibility with notebooks.
+
+### Human-in-the-Loop
+
+When `MAX_ITERATIONS` is reached without meeting the quality threshold, the graph
+pauses at a `human_review` interrupt node. The AG-UI protocol surfaces this as a
+`RUN_FINISHED` event with `outcome: "interrupted"`. The frontend renders a review
+component showing quality score, iteration info, and improvement suggestions.
+The user can accept the result or trigger additional iterations.
+
+### Persistence
+
+- **PostgreSQL checkpointer** (`AsyncPostgresSaver`) — LangGraph graph state persistence
+- **pgvector** — semantic search embeddings (consolidated with checkpointer DB)
+- **Thread management** — `GET/POST/DELETE /threads` endpoints for chat history
 
 ### Running a Research Query
 

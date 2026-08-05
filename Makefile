@@ -53,7 +53,10 @@ clean: ## Remove build artifacts
 backend-start: ## Start backend (auto-starts MCP servers as subprocesses)
 	uv run uvicorn backend.api:app --host 0.0.0.0 --port $${BACKEND_PORT:-8000} --reload
 
-frontend-start: ## Start the Chainlit frontend UI
+frontend-start: ## Start the Next.js frontend UI
+	cd frontend-next && npm run dev
+
+frontend-start-legacy: ## Start the legacy Chainlit frontend UI
 	cd frontend && uv run chainlit run app.py --host 0.0.0.0 --port $${FRONTEND_PORT:-7860}
 
 start: ## Show how to start all services
@@ -61,13 +64,16 @@ start: ## Show how to start all services
 	@echo " Start services in separate terminals:"
 	@echo "========================================="
 	@echo ""
+	@echo "  Terminal 0 — PostgreSQL (if not running):"
+	@echo "    docker compose up -d"
+	@echo ""
 	@echo "  Terminal 1 — Backend + MCP servers:"
 	@echo "    make backend-start"
 	@echo ""
 	@echo "  Terminal 2 — Frontend UI:"
 	@echo "    make frontend-start"
 	@echo ""
-	@echo "  Then open: http://localhost:$${FRONTEND_PORT:-7860}"
+	@echo "  Then open: http://localhost:3000"
 	@echo "========================================="
 
 backend-stop: ## Stop backend + MCP servers (port-based, reliable)
@@ -85,8 +91,15 @@ backend-restart: ## Clean stop + start backend (use instead of Ctrl+C)
 
 stop: ## Stop all services
 	@$(MAKE) --no-print-directory backend-stop
+	@pkill -f "next dev" 2>/dev/null || true
 	@pkill -f "chainlit run" 2>/dev/null || true
 	@echo "All services stopped."
+
+ui-stop: stop ## Alias for stop
+
+dev-up: ## Start infrastructure (PostgreSQL + pgvector)
+	docker compose up -d
+	@echo "PostgreSQL + pgvector started on port 5432"
 
 sse-test: ## Run SSE smoke test
 	uv run python backend/test_sse.py

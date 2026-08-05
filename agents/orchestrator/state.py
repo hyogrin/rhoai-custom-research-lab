@@ -37,7 +37,7 @@ class ResearchState(TypedDict):
     total_cost: float
     failure_hints: str
 
-    # Tool toggles (controlled from Chainlit settings panel)
+    # Tool toggles (controlled from frontend settings panel)
     enable_web_search: bool
     enable_planning: bool
     enable_fact_check: bool
@@ -51,6 +51,12 @@ class ResearchState(TypedDict):
 
     # Intent classification
     intent: str  # "research" | "casual" — set by classify_intent node
+
+    # Human-in-the-loop direction for next iteration
+    human_direction: str
+
+    # Structured sources for frontend citation badges
+    sources: list[dict]
 
     # Control flow
     status: str  # normalizing|planning|researching|writing|verifying|observing|complete|failed

@@ -61,7 +61,8 @@ def semantic_search(query: str, top_k: int = 5, min_similarity: float = 0.0) -> 
 
     results = []
     for row in rows:
-        similarity = 1.0 - float(row["distance"])
+        dist = float(row["distance"])
+        similarity = 1.0 / (1.0 + dist)
         if similarity < min_similarity:
             continue
         meta = row["metadata"]
@@ -108,7 +109,8 @@ def search_by_document(query: str, document_id: str, top_k: int = 5) -> list[dic
 
     results = []
     for row in rows:
-        similarity = 1.0 - float(row["distance"])
+        dist = float(row["distance"])
+        similarity = 1.0 / (1.0 + dist)
         meta = row["metadata"]
         results.append({
             "id": row["chunk_id"],

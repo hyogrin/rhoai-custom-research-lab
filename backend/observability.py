@@ -13,6 +13,23 @@ logger = logging.getLogger(__name__)
 _mlflow_enabled = False
 
 
+def _patch_tracer_on_interrupt():
+    """Add a no-op on_interrupt to MlflowLangchainTracer if missing.
+
+    LangGraph's interrupt() fires the on_interrupt callback, but MLflow's
+    tracer doesn't implement it yet (as of 3.x). Without this patch the
+    callback manager logs a noisy AttributeError warning on every interrupt.
+    """
+    try:
+        from mlflow.langchain.langchain_tracer import MlflowLangchainTracer
+
+        if not hasattr(MlflowLangchainTracer, "on_interrupt"):
+            MlflowLangchainTracer.on_interrupt = lambda self, *args, **kwargs: None
+            logger.debug("Patched MlflowLangchainTracer.on_interrupt (no-op)")
+    except Exception:
+        pass
+
+
 def init_mlflow():
     """Initialize MLflow tracing if MLFLOW_TRACKING_URI is configured."""
     global _mlflow_enabled
@@ -43,6 +60,9 @@ def init_mlflow():
         )
         mlflow.langchain.autolog(run_tracer_inline=True)
         mlflow.openai.autolog()
+
+        _patch_tracer_on_interrupt()
+
         _mlflow_enabled = True
         logger.info("MLflow LangChain/LangGraph + OpenAI tracing enabled: %s", tracking_uri)
     except Exception as e:

@@ -17,7 +17,7 @@ from typing import Annotated
 from fastapi import BackgroundTasks, FastAPI, Header, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from prometheus_fastapi_instrumentator import Instrumentator
 
@@ -26,7 +26,7 @@ load_dotenv(override=True)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from harness.session import SessionManager, ResearchSession
-from agents.orchestrator.graph import orchestrator_graph
+import agents.orchestrator.graph as _graph_module
 from backend.metrics import (
     active_research_sessions,
     research_sessions_total,
@@ -52,6 +52,8 @@ def _port_in_use(port: int) -> bool:
     import socket
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(("127.0.0.1", port)) == 0
+
+
 
 
 def _start_mcp_servers():
@@ -84,7 +86,7 @@ def _start_mcp_servers():
 
 
 def _stop_mcp_servers():
-    """Gracefully stop all MCP subprocesses."""
+    """Gracefully stop tracked MCP subprocesses (ones this process started)."""
     for proc in _mcp_processes:
         if proc.poll() is None:
             proc.terminate()
@@ -94,8 +96,33 @@ def _stop_mcp_servers():
         except subprocess.TimeoutExpired:
             proc.kill()
     if _mcp_processes:
-        logger.info("Stopped %d MCP server subprocesses", len(_mcp_processes))
+        logger.info("Stopped %d tracked MCP subprocesses", len(_mcp_processes))
     _mcp_processes.clear()
+
+
+def _stop_mcp_servers_full():
+    """Stop tracked subprocesses + port-based cleanup for orphans.
+
+    Only called during lifespan shutdown (the real backend exit),
+    not from atexit or signal handlers, to avoid killing MCP servers
+    owned by another process during casual imports.
+    """
+    _stop_mcp_servers()
+
+    for name, _, port in MCP_SERVERS:
+        if _port_in_use(port):
+            try:
+                import signal as _sig
+                result = subprocess.run(
+                    ["lsof", "-ti", f":{port}"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                for pid_str in result.stdout.strip().splitlines():
+                    pid = int(pid_str)
+                    os.kill(pid, _sig.SIGTERM)
+                    logger.info("Killed orphan process pid=%d on port %d (%s)", pid, port, name)
+            except Exception as e:
+                logger.warning("Port-based cleanup failed for %s (port %d): %s", name, port, e)
 
 
 import atexit
@@ -113,8 +140,35 @@ signal.signal(signal.SIGINT, _signal_handler)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _start_mcp_servers()
+
+    # Initialize PostgreSQL checkpointer if configured
+    pg_url = os.getenv("POSTGRES_URL", "")
+    if pg_url:
+        try:
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+            checkpointer_ctx = AsyncPostgresSaver.from_conn_string(pg_url)
+            checkpointer = await checkpointer_ctx.__aenter__()
+            await checkpointer.setup()
+
+            compiled = _graph_module.build_graph(checkpointer=checkpointer)
+            _graph_module.orchestrator_graph = compiled
+
+            app.state.pg_checkpointer = checkpointer
+            app.state.pg_checkpointer_ctx = checkpointer_ctx
+            logger.info("PostgreSQL checkpointer initialized: %s", pg_url[:40] + "...")
+        except Exception as e:
+            logger.warning("PostgreSQL checkpointer setup failed (falling back to in-memory): %s", e)
+            app.state.pg_checkpointer = None
+    else:
+        app.state.pg_checkpointer = None
+        logger.info("POSTGRES_URL not set — using in-memory checkpointer")
+
     yield
-    _stop_mcp_servers()
+
+    if getattr(app.state, "pg_checkpointer_ctx", None):
+        await app.state.pg_checkpointer_ctx.__aexit__(None, None, None)
+    _stop_mcp_servers_full()
 
 
 app = FastAPI(title="RHOAI Deep Research API", version="0.1.0", lifespan=lifespan)
@@ -131,6 +185,463 @@ app.add_middleware(
 )
 
 session_mgr = SessionManager()
+
+
+# --- AG-UI Protocol Endpoint ---
+
+
+class AgUiRunInput(BaseModel):
+    """Matches the RunAgentInput schema sent by @ag-ui/client HttpAgent."""
+    model_config = {"populate_by_name": True}
+
+    run_id: str = Field(default="", alias="runId")
+    thread_id: str = Field(default="", alias="threadId")
+    messages: list = []
+    state: dict | None = None
+    tools: list = []
+    context: list = []
+    forwarded_props: dict = Field(default_factory=dict, alias="forwardedProps")
+
+
+def _agui_event(payload: dict) -> str:
+    """Format a dict as an AG-UI SSE data line."""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _stream_agui(run_id: str, thread_id: str, query: str, settings: dict, resume_direction: str = "") -> AsyncGenerator[str, None]:
+    """Run the orchestrator graph and yield AG-UI protocol SSE events."""
+    has_document = _check_documents_exist()
+    msg_id = str(uuid.uuid4())
+
+    yield _agui_event({"type": "RUN_STARTED", "runId": run_id, "threadId": thread_id})
+
+    if not has_document and not query and not resume_direction:
+        yield _agui_event({"type": "TEXT_MESSAGE_START", "messageId": msg_id})
+        yield _agui_event({
+            "type": "TEXT_MESSAGE_CONTENT",
+            "messageId": msg_id,
+            "delta": "Please upload a document first, then ask your research question.",
+        })
+        yield _agui_event({"type": "TEXT_MESSAGE_END", "messageId": msg_id})
+        yield _agui_event({
+            "type": "MESSAGES_SNAPSHOT",
+            "messages": [{"id": msg_id, "role": "assistant", "content": "Please upload a document first, then ask your research question."}],
+        })
+        yield _agui_event({"type": "RUN_FINISHED", "runId": run_id, "threadId": thread_id})
+        return
+
+    language = settings.get("language", "en-US")
+    lang_instruction = (
+        "You MUST respond entirely in Korean (한국어로 답변하세요)."
+        if language == "ko-KR"
+        else "You MUST respond entirely in English."
+    )
+
+    config = {"configurable": {"thread_id": thread_id}}
+
+    if resume_direction:
+        from langgraph.types import Command
+        graph_input = Command(resume={"action": "continue", "direction": resume_direction})
+    else:
+        graph_input = {
+            "session_id": thread_id[:12] if thread_id else str(uuid.uuid4())[:12],
+            "query": query,
+            "file_path": "",
+            "has_document": has_document,
+            "iteration": 0,
+            "max_iterations": settings.get("maxIterations", 2),
+            "quality_threshold": settings.get("qualityThreshold", 7.0),
+            "language_instruction": lang_instruction,
+            "research_plan": [],
+            "accumulated_context": [],
+            "current_draft": "",
+            "verification_result": {},
+            "verification_history": [],
+            "quality_score": 0.0,
+            "total_tokens": 0,
+            "total_cost": 0.0,
+            "failure_hints": "",
+            "human_direction": "",
+            "enable_web_search": settings.get("enableWebSearch", True),
+            "enable_planning": settings.get("enablePlanning", True),
+            "enable_fact_check": settings.get("enableFactCheck", True),
+            "enable_parallel": settings.get("enableParallel", True),
+            "enable_sectioned": settings.get("enableSectioned", True),
+            "report_sections": [],
+            "section_order": [],
+            "failing_sections": [],
+            "intent": "",
+            "status": "normalizing",
+            "final_output": "",
+            "error": "",
+        }
+
+    session_id = thread_id[:12] if thread_id else str(uuid.uuid4())[:12]
+    session = ResearchSession(
+        session_id=session_id,
+        query=query,
+        max_iterations=settings.get("maxIterations", 2),
+        quality_threshold=settings.get("qualityThreshold", 7.0),
+    )
+
+    event_queue: asyncio.Queue = asyncio.Queue()
+    text_started = False
+    accumulated_steps: list[dict] = []
+    accumulated_verbose: list[dict] = []
+    state_update: dict = {}
+
+    async def _run_graph():
+        try:
+            async for mode, chunk in _graph_module.orchestrator_graph.astream(
+                graph_input,
+                config=config,
+                stream_mode=["updates", "custom"],
+            ):
+                await event_queue.put((mode, chunk))
+        except Exception as exc:
+            logger.error("Graph error: %s", exc, exc_info=True)
+            await event_queue.put(("error", {"__error__": str(exc)}))
+        finally:
+            await event_queue.put(None)
+
+    graph_task = asyncio.create_task(_run_graph())
+
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(event_queue.get(), timeout=15)
+            except asyncio.TimeoutError:
+                yield ": heartbeat\n\n"
+                continue
+
+            if item is None:
+                logger.info("[agui] Graph stream completed normally")
+                break
+
+            mode, chunk = item
+            logger.debug("[agui] mode=%s chunk_keys=%s", mode, list(chunk.keys()) if isinstance(chunk, dict) else type(chunk))
+
+            if mode == "error" or (isinstance(chunk, dict) and "__error__" in chunk):
+                error_msg = chunk.get("__error__", "Unknown error") if isinstance(chunk, dict) else str(chunk)
+                logger.error("[agui] Emitting RUN_ERROR: %s", error_msg)
+                yield _agui_event({"type": "RUN_ERROR", "message": error_msg})
+                return
+
+            if mode == "custom":
+                progress = chunk.get("progress", "")
+                if progress == "draft_chunk":
+                    text = chunk.get("text", "")
+                    if text:
+                        if not text_started:
+                            text_started = True
+                            yield _agui_event({"type": "TEXT_MESSAGE_START", "messageId": msg_id})
+                        yield _agui_event({"type": "TEXT_MESSAGE_CONTENT", "messageId": msg_id, "delta": text})
+
+                step_evt = _custom_progress_to_step(chunk, session)
+                if step_evt:
+                    accumulated_steps.append(step_evt)
+                    yield _agui_event({"type": "CUSTOM", "name": "step", "value": step_evt})
+
+                verbose_evt = {
+                    "id": str(uuid.uuid4())[:8],
+                    "type": progress or "custom",
+                    "timestamp": int(__import__("time").time() * 1000),
+                    "data": {k: v for k, v in chunk.items() if k != "progress"},
+                }
+                accumulated_verbose.append(verbose_evt)
+                yield _agui_event({"type": "CUSTOM", "name": "verbose", "value": verbose_evt})
+                yield _agui_event({"type": "STATE_SNAPSHOT", "snapshot": {"steps": accumulated_steps, "verbose": accumulated_verbose}})
+                continue
+
+            if not isinstance(chunk, dict) or not chunk:
+                logger.debug("[agui] Skipping non-dict chunk: %s", type(chunk))
+                continue
+            node_name = next(iter(chunk))
+            state_update = chunk[node_name]
+            if not isinstance(state_update, dict):
+                logger.debug("[agui] Skipping non-dict state from node %s: %s", node_name, type(state_update))
+                continue
+            iteration = state_update.get("iteration", session.iteration)
+            quality_score = state_update.get("quality_score", session.quality_score)
+            status = state_update.get("status", session.status)
+
+            session.iteration = iteration
+            session.quality_score = quality_score
+            session.status = status
+            if "current_draft" in state_update:
+                session.current_draft = state_update["current_draft"]
+            if "accumulated_context" in state_update:
+                session.accumulated_context = state_update["accumulated_context"]
+            if "total_tokens" in state_update:
+                session.total_tokens = state_update["total_tokens"]
+            if "report_sections" in state_update:
+                session.report_sections = state_update["report_sections"]
+            if "section_order" in state_update:
+                session.section_order = state_update["section_order"]
+            if "failing_sections" in state_update:
+                session.failing_sections = state_update["failing_sections"]
+
+            sub_events = _emit_sub_events(node_name, state_update, session)
+            for evt in sub_events:
+                evt["iteration"] = session.iteration
+                evt["max_iterations"] = session.max_iterations
+                evt["quality_score"] = session.quality_score
+
+                step_entry = {
+                    "id": str(uuid.uuid4())[:8],
+                    "phase": evt.get("phase", node_name),
+                    "icon": evt.get("icon", ""),
+                    "title": evt.get("title", ""),
+                    "detail": evt.get("detail", ""),
+                    "timestamp": int(__import__("time").time() * 1000),
+                }
+                accumulated_steps.append(step_entry)
+                yield _agui_event({"type": "CUSTOM", "name": "step", "value": step_entry})
+
+                verbose_entry = {
+                    "id": str(uuid.uuid4())[:8],
+                    "type": f"node:{node_name}",
+                    "timestamp": int(__import__("time").time() * 1000),
+                    "data": evt,
+                }
+                accumulated_verbose.append(verbose_entry)
+                yield _agui_event({"type": "CUSTOM", "name": "verbose", "value": verbose_entry})
+
+            yield _agui_event({"type": "STATE_SNAPSHOT", "snapshot": {"steps": accumulated_steps, "verbose": accumulated_verbose}})
+
+        # Check if graph was interrupted (human-in-the-loop review)
+        graph_state = await _graph_module.orchestrator_graph.aget_state(config)
+        pending_interrupts = getattr(graph_state, "tasks", [])
+        logger.info("[agui] Checking interrupts: %d tasks, next=%s", len(pending_interrupts), getattr(graph_state, "next", None))
+        interrupt_data = None
+        for task in pending_interrupts:
+            logger.info("[agui] Task: %s, has interrupts: %s", getattr(task, "name", "?"), bool(hasattr(task, "interrupts") and task.interrupts))
+            if hasattr(task, "interrupts") and task.interrupts:
+                interrupt_data = task.interrupts[0].value
+                break
+
+        if interrupt_data:
+            logger.info("[agui] Graph interrupted for review: %s", interrupt_data)
+            if text_started:
+                yield _agui_event({"type": "TEXT_MESSAGE_END", "messageId": msg_id})
+
+            yield _agui_event({"type": "CUSTOM", "name": "iteration_review", "value": interrupt_data})
+            yield _agui_event({"type": "STATE_SNAPSHOT", "snapshot": {
+                "steps": accumulated_steps,
+                "verbose": accumulated_verbose,
+                "iteration_review": interrupt_data,
+            }})
+
+            review_msg = _format_review_message(interrupt_data, language)
+            yield _agui_event({
+                "type": "MESSAGES_SNAPSHOT",
+                "messages": [{"id": msg_id, "role": "assistant", "content": review_msg}],
+            })
+
+            yield _agui_event({"type": "RUN_FINISHED", "runId": run_id, "threadId": thread_id})
+        else:
+            final_output = state_update.get("final_output", session.current_draft) if state_update else ""
+            logger.info("[agui] Stream done. text_started=%s, final_output_len=%d", text_started, len(final_output))
+
+            if text_started:
+                yield _agui_event({"type": "TEXT_MESSAGE_END", "messageId": msg_id})
+
+            if final_output and not text_started:
+                yield _agui_event({"type": "TEXT_MESSAGE_START", "messageId": msg_id})
+                yield _agui_event({"type": "TEXT_MESSAGE_CONTENT", "messageId": msg_id, "delta": final_output})
+                yield _agui_event({"type": "TEXT_MESSAGE_END", "messageId": msg_id})
+
+            sources_list = state_update.get("sources", []) if state_update else []
+            if not sources_list and session.accumulated_context:
+                from agents.orchestrator.graph import _dedup_sources
+                sources_list = _dedup_sources(session.accumulated_context)
+            if sources_list:
+                yield _agui_event({"type": "CUSTOM", "name": "sources", "value": {"sources": sources_list}})
+                yield _agui_event({"type": "STATE_SNAPSHOT", "snapshot": {
+                    "steps": accumulated_steps,
+                    "verbose": accumulated_verbose,
+                    "sources": {"sources": sources_list},
+                }})
+
+            yield _agui_event({
+                "type": "MESSAGES_SNAPSHOT",
+                "messages": [{"id": msg_id, "role": "assistant", "content": final_output}],
+            })
+
+            yield _agui_event({"type": "RUN_FINISHED", "runId": run_id, "threadId": thread_id})
+
+    except Exception as exc:
+        logger.exception("Error in AG-UI stream")
+        yield _agui_event({"type": "RUN_ERROR", "message": str(exc)})
+        return
+    finally:
+        if not graph_task.done():
+            graph_task.cancel()
+            try:
+                await graph_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+def _format_review_message(review_data: dict, language: str = "en-US") -> str:
+    """Format the iteration review data as a readable message for the user."""
+    score = review_data.get("quality_score", 0)
+    threshold = review_data.get("quality_threshold", 7.0)
+    iteration = review_data.get("iteration", 0)
+    max_iter = review_data.get("max_iterations", 5)
+    improvements = review_data.get("improvements", [])
+    can_iterate = review_data.get("can_iterate", True)
+
+    if language == "ko-KR":
+        lines = [
+            f"## Iteration Review",
+            f"",
+            f"**Quality Score**: {score:.1f} / {threshold:.1f} (Iteration {iteration}/{max_iter})",
+            f"",
+        ]
+        if improvements:
+            lines.append("**Improvement Suggestions**:")
+            for imp in improvements:
+                lines.append(f"- {imp}")
+            lines.append("")
+        if can_iterate:
+            lines.append("추가 개선 방향을 입력하시면 다음 iteration을 진행합니다. 현재 결과를 그대로 사용하시려면 **'accept'** 를 입력하세요.")
+        else:
+            lines.append(f"최대 iteration ({max_iter})에 도달했습니다. 추가 방향을 입력하시면 한 번 더 시도합니다. **'accept'** 를 입력하면 현재 결과를 확정합니다.")
+    else:
+        lines = [
+            f"## Iteration Review",
+            f"",
+            f"**Quality Score**: {score:.1f} / {threshold:.1f} (Iteration {iteration}/{max_iter})",
+            f"",
+        ]
+        if improvements:
+            lines.append("**Improvement Suggestions**:")
+            for imp in improvements:
+                lines.append(f"- {imp}")
+            lines.append("")
+        if can_iterate:
+            lines.append("Enter additional direction to proceed with the next iteration, or type **'accept'** to use the current result as-is.")
+        else:
+            lines.append(f"Maximum iterations ({max_iter}) reached. Enter direction for one more attempt, or type **'accept'** to finalize.")
+
+    return "\n".join(lines)
+
+
+def _custom_progress_to_step(chunk: dict, session: ResearchSession) -> dict | None:
+    """Convert a custom progress event to a step entry for the frontend."""
+    progress = chunk.get("progress", "")
+    title = chunk.get("section_title", "")
+    idx = chunk.get("section_index", 0)
+    total = chunk.get("total_sections", 0)
+
+    step = None
+    if progress == "section_start":
+        step = {
+            "phase": "execute",
+            "icon": "🔎",
+            "title": f"[Execute][Researcher] ({idx}/{total}) Searching: {title}",
+        }
+    elif progress == "section_done":
+        step = {
+            "phase": "execute",
+            "icon": "✅",
+            "title": f"[Execute][Writer] ({idx}/{total}) Done: {title}",
+        }
+    elif progress == "section_failed":
+        step = {
+            "phase": "execute",
+            "icon": "❌",
+            "title": f"[Execute][Researcher] ({idx}/{total}) Failed: {title}",
+        }
+    elif progress == "assembling_report":
+        step = {
+            "phase": "execute",
+            "icon": "📋",
+            "title": f"[Execute][Writer] Assembling final report ({total} sections)",
+        }
+    elif progress == "search_done":
+        sem = chunk.get("semantic_count", 0)
+        web = chunk.get("web_count", 0)
+        parts = []
+        if sem:
+            parts.append(f"{sem} chunks")
+        if web:
+            parts.append(f"{web} web results")
+        step = {
+            "phase": "execute",
+            "icon": "🔍",
+            "title": f"[Tool-Search][Researcher] {', '.join(parts)}",
+        }
+    elif progress == "drafting":
+        step = {
+            "phase": "execute",
+            "icon": "✍️",
+            "title": f"[Execute][Writer] ({idx}/{total}) Drafting: {title}",
+        }
+    elif progress == "verifying":
+        step = {
+            "phase": "verify",
+            "icon": "📊",
+            "title": "[Reviewing][Reviewer] Quality scoring...",
+        }
+
+    if step:
+        step["id"] = str(uuid.uuid4())[:8]
+        step["detail"] = ""
+        step["timestamp"] = int(__import__("time").time() * 1000)
+    return step
+
+
+@app.post("/agent")
+async def agui_endpoint(req: AgUiRunInput):
+    """AG-UI protocol endpoint — streams research as AG-UI SSE events."""
+    messages = req.messages or []
+    query = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                query = " ".join(
+                    p.get("text", "") if isinstance(p, dict) else str(p)
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            elif isinstance(content, str):
+                query = content
+            break
+
+    run_id = req.run_id or str(uuid.uuid4())
+    thread_id = req.thread_id or str(uuid.uuid4())
+    settings = req.forwarded_props.get("settings", {})
+
+    # Detect resume: check if the graph has a pending interrupt for this thread
+    resume_direction = ""
+    try:
+        config = {"configurable": {"thread_id": thread_id}}
+        graph_state = await _graph_module.orchestrator_graph.aget_state(config)
+        pending_tasks = getattr(graph_state, "tasks", [])
+        has_interrupt = any(
+            hasattr(t, "interrupts") and t.interrupts for t in pending_tasks
+        )
+        if has_interrupt and query.strip():
+            if query.strip().lower() == "accept":
+                resume_direction = "__accept__"
+            else:
+                resume_direction = query.strip()
+            query = ""
+    except Exception:
+        pass
+
+    return StreamingResponse(
+        _stream_agui(run_id, thread_id, query.strip(), settings, resume_direction=resume_direction),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 class ResearchRequest(BaseModel):
@@ -284,7 +795,7 @@ def _emit_sub_events(node_name: str, state_update: dict, session: ResearchSessio
                     "event": "step",
                     "phase": "execute",
                     "icon": "🔍",
-                    "title": f"[Tool-Search][Researcher] {len(search_results)} chunks retrieved",
+                    "title": f"[Vector-Search][Researcher] {len(search_results)} chunks retrieved",
                     "agent": "Researcher",
                     "detail": f"Sources: {', '.join(list(sources)[:5])}",
                 })
@@ -339,7 +850,7 @@ def _emit_sub_events(node_name: str, state_update: dict, session: ResearchSessio
                     "event": "step",
                     "phase": "execute",
                     "icon": "🔍",
-                    "title": f"[Tool-Search][Researcher] {len(search_results)} chunks retrieved",
+                    "title": f"[Vector-Search][Researcher] {len(search_results)} chunks retrieved",
                     "agent": "Researcher",
                     "detail": f"Sources: {', '.join(list(sources)[:5])}",
                 })
@@ -498,17 +1009,43 @@ def _collect_sources(accumulated_context: list[dict]) -> list[dict]:
 _SSE_HEARTBEAT_INTERVAL = 15  # seconds between keepalive comments
 
 
+def _check_documents_exist() -> bool:
+    """Check if any documents have been ingested into the database."""
+    try:
+        from lib.document_processing import get_db_connection
+        conn = get_db_connection()
+        row = conn.execute("SELECT COUNT(*) FROM documents").fetchone()
+        conn.close()
+        return row[0] > 0 if row else False
+    except Exception:
+        return False
+
+
 async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None]:
     """Run the orchestrator graph and yield rich SSE events for each phase.
 
     Sends SSE comment heartbeats every 15s to prevent connection timeouts
     while graph nodes are processing.
     """
+    has_document = _check_documents_exist()
+
+    if not has_document:
+        yield _sse({
+            "event": "content",
+            "text": (
+                "📄 **No documents found.** Please upload a document first using the "
+                "attachment button (📎) at the bottom of the chat, then ask your research question.\n\n"
+                "Supported formats: **PDF, TXT, MD, DOCX**"
+            ),
+        })
+        yield "data: [DONE]\n\n"
+        return
+
     initial_state = {
         "session_id": session.session_id,
         "query": session.query,
         "file_path": "",
-        "has_document": False,
+        "has_document": has_document,
         "iteration": 0,
         "max_iterations": session.max_iterations,
         "quality_threshold": session.quality_threshold,
@@ -544,7 +1081,7 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
     async def _run_graph():
         """Run the graph and push completed node updates into the queue."""
         try:
-            async for mode, chunk in orchestrator_graph.astream(
+            async for mode, chunk in _graph_module.orchestrator_graph.astream(
                 initial_state, stream_mode=["updates", "custom"]
             ):
                 await event_queue.put((mode, chunk))
@@ -657,7 +1194,7 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
                             "event": "step",
                             "phase": "execute",
                             "icon": "🔍",
-                            "title": f"[Tool-Search][Researcher] {sem} chunks retrieved",
+                            "title": f"[Vector-Search][Researcher] {sem} chunks retrieved",
                             "agent": "Researcher",
                             "detail": f"Sources: {', '.join(doc_sources[:5])}" if doc_sources else "",
                             **_iter_meta,
@@ -699,8 +1236,12 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
                     })
                 continue
 
+            if not isinstance(chunk, dict) or not chunk:
+                continue
             node_name = next(iter(chunk))
             state_update = chunk[node_name]
+            if not isinstance(state_update, dict):
+                continue
             iteration = state_update.get("iteration", session.iteration)
             quality_score = state_update.get("quality_score", session.quality_score)
             status = state_update.get("status", session.status)
@@ -878,13 +1419,21 @@ def _process_documents_background(upload_id: str, file_paths: list[str]):
 
     try:
         from docling.document_converter import DocumentConverter
+        from docling.datamodel.base_models import InputFormat
         from lib.document_processing import get_embeddings, get_db_connection
-        from lib.object_store import upload_document, get_document_url
         from sqlite_vec import serialize_float32
         import hashlib
         import json as _json
 
-        converter = DocumentConverter()
+        converter = DocumentConverter(
+            allowed_formats=[
+                InputFormat.PDF,
+                InputFormat.DOCX,
+                InputFormat.PPTX,
+                InputFormat.MD,
+                InputFormat.HTML,
+            ]
+        )
         total_chunks_stored = 0
 
         for file_idx, path in enumerate(file_paths):
@@ -924,14 +1473,7 @@ def _process_documents_background(upload_id: str, file_paths: list[str]):
 
             document_id = hashlib.sha256(path.encode()).hexdigest()[:16]
 
-            # Upload original file to MinIO for permanent storage + reference links
-            try:
-                object_key = upload_document(path, document_id)
-                object_store_path = get_document_url(object_key)
-                logger.info("Uploaded to MinIO: %s → %s", filename, object_store_path)
-            except Exception as e:
-                logger.warning("MinIO upload failed (using local path): %s", e)
-                object_store_path = path
+            object_store_path = path
 
             conn = get_db_connection()
             cur = conn.cursor()
@@ -1000,9 +1542,39 @@ async def get_upload_status(upload_id: str):
     return {"upload_id": upload_id, "status": "processing", "message": "Still processing..."}
 
 
+@app.get("/documents")
+async def list_documents():
+    """List all completed documents from the database."""
+    try:
+        from lib.document_processing import get_db_connection
+
+        conn = get_db_connection()
+        rows = conn.execute(
+            "SELECT id, name, file_type, chunk_count, status, created_at "
+            "FROM documents WHERE status = 'completed' ORDER BY created_at DESC"
+        ).fetchall()
+        conn.close()
+        return {
+            "documents": [
+                {
+                    "id": r["id"],
+                    "name": r["name"],
+                    "file_type": r["file_type"],
+                    "chunk_count": r["chunk_count"],
+                    "status": r["status"],
+                    "created_at": r["created_at"],
+                }
+                for r in rows
+            ]
+        }
+    except Exception as e:
+        logger.warning("Failed to list documents: %s", e)
+        return {"documents": []}
+
+
 @app.get("/documents/{document_id}/download_url")
 async def get_document_download_url(document_id: str):
-    """Generate a presigned download URL for a stored document."""
+    """Return the stored path for a document."""
     from lib.document_processing import get_db_connection
 
     conn = get_db_connection()
@@ -1014,24 +1586,118 @@ async def get_document_download_url(document_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    object_store_path = row["object_store_path"]
-    doc_name = row["name"]
-    if not object_store_path or not object_store_path.startswith("http"):
-        raise HTTPException(status_code=404, detail="Document not in object storage")
-
-    try:
-        from lib.object_store import get_presigned_url
-        object_key = f"{document_id}/{doc_name}"
-        url = get_presigned_url(object_key)
-        return {"document_id": document_id, "name": doc_name, "download_url": url}
-    except Exception as e:
-        logger.warning("Presigned URL generation failed: %s", e)
-        return {"document_id": document_id, "name": doc_name, "download_url": object_store_path}
+    return {"document_id": document_id, "name": row["name"], "path": row["object_store_path"] or ""}
 
 
 @app.get("/health")
 async def health():
     """Simple liveness probe."""
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Thread management endpoints (for Next.js frontend ThreadList adapter)
+# ---------------------------------------------------------------------------
+
+POSTGRES_URL = os.getenv("POSTGRES_URL", "")
+
+
+@app.get("/threads")
+async def list_threads():
+    """List all research threads from PostgreSQL checkpointer."""
+    if not POSTGRES_URL:
+        return {"threads": []}
+
+    try:
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+        async with AsyncPostgresSaver.from_conn_string(POSTGRES_URL) as checkpointer:
+            try:
+                seen: dict[str, dict] = {}
+                async for checkpoint in checkpointer.alist({}):
+                    thread_id = checkpoint.config.get("configurable", {}).get("thread_id", "")
+                    if not thread_id or thread_id in seen:
+                        continue
+                    state = checkpoint.checkpoint.get("channel_values", {})
+                    seen[thread_id] = {
+                        "id": thread_id,
+                        "title": (state.get("query", "")[:60] or "New conversation"),
+                        "created_at": checkpoint.checkpoint.get("ts", ""),
+                        "status": state.get("status", "unknown"),
+                    }
+                return {"threads": list(seen.values())}
+            except Exception as table_err:
+                if "does not exist" in str(table_err):
+                    await checkpointer.setup()
+                    logger.info("Auto-created checkpointer tables on first access")
+                    return {"threads": []}
+                raise
+    except Exception as e:
+        logger.warning("Failed to list threads: %s", e)
+        return {"threads": []}
+
+
+@app.get("/threads/{thread_id}/messages")
+async def get_thread_messages(thread_id: str):
+    """Return the conversation messages for a thread from its checkpoint state."""
+    if not POSTGRES_URL:
+        return {"messages": []}
+
+    try:
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+        async with AsyncPostgresSaver.from_conn_string(POSTGRES_URL) as checkpointer:
+            config = {"configurable": {"thread_id": thread_id}}
+            checkpoint = await checkpointer.aget(config)
+            if not checkpoint:
+                return {"messages": []}
+
+            state = checkpoint.get("channel_values", {})
+            query = state.get("query", "")
+            final_output = state.get("final_output", "") or state.get("current_draft", "")
+
+            messages = []
+            if query:
+                messages.append({
+                    "id": f"{thread_id}-user",
+                    "role": "user",
+                    "content": [{"type": "text", "text": query}],
+                })
+            if final_output:
+                messages.append({
+                    "id": f"{thread_id}-assistant",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": final_output}],
+                })
+            return {"messages": messages}
+    except Exception as e:
+        logger.warning("Failed to get thread messages %s: %s", thread_id, e)
+        return {"messages": []}
+
+
+@app.post("/threads")
+async def create_thread():
+    """Create a new thread (returns a new thread_id)."""
+    thread_id = str(uuid.uuid4())
+    return {"thread_id": thread_id}
+
+
+@app.delete("/threads/{thread_id}")
+async def delete_thread(thread_id: str):
+    """Delete a thread and its checkpoints."""
+    if not POSTGRES_URL:
+        raise HTTPException(status_code=501, detail="PostgreSQL not configured")
+
+    try:
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+        async with AsyncPostgresSaver.from_conn_string(POSTGRES_URL) as checkpointer:
+            config = {"configurable": {"thread_id": thread_id}}
+            # Clear the thread's checkpoints
+            await checkpointer.adelete(config)
+        return {"deleted": True, "thread_id": thread_id}
+    except Exception as e:
+        logger.warning("Failed to delete thread %s: %s", thread_id, e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
