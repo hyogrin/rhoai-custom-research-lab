@@ -40,53 +40,10 @@ from agents.orchestrator.layers.tools import (
 )
 from agents.orchestrator.layers.observability import HarnessObserver
 from harness.failure import FailureCategory
-from harness.session import SessionManager, ResearchSession
-
 logger = logging.getLogger(__name__)
 
 # Module-level observer registry (per session)
 _observers: dict[str, HarnessObserver] = {}
-
-# Session manager for periodic checkpointing
-_session_mgr: SessionManager | None = None
-
-
-def _get_session_mgr() -> SessionManager:
-    global _session_mgr
-    if _session_mgr is None:
-        _session_mgr = SessionManager()
-        try:
-            _session_mgr.ensure_table()
-        except Exception as e:
-            logger.warning(f"Could not ensure sessions table: {e}")
-    return _session_mgr
-
-
-def checkpoint_session(state: ResearchState):
-    """Persist the current graph state to SQLite for frontend resume."""
-    try:
-        mgr = _get_session_mgr()
-        session = ResearchSession(
-            session_id=state.get("session_id", ""),
-            query=state.get("query", ""),
-            iteration=state.get("iteration", 0),
-            max_iterations=state.get("max_iterations", 3),
-            quality_threshold=state.get("quality_threshold", 7.0),
-            research_plan=state.get("research_plan", []),
-            accumulated_context=state.get("accumulated_context", []),
-            current_draft=state.get("current_draft", ""),
-            verification_history=state.get("verification_history", []),
-            total_tokens=state.get("total_tokens", 0),
-            total_cost=state.get("total_cost", 0.0),
-            report_sections=state.get("report_sections", []),
-            section_order=state.get("section_order", []),
-            failing_sections=state.get("failing_sections", []),
-            status=state.get("status", "unknown"),
-            quality_score=state.get("quality_score", 0.0),
-        )
-        mgr.save(session)
-    except Exception as e:
-        logger.warning(f"Session checkpoint failed: {e}")
 
 
 def _get_observer(session_id: str) -> HarnessObserver:
@@ -113,7 +70,6 @@ def normalize_node(state: ResearchState) -> dict:
         "status": "planning",
         "failure_hints": past_memory,
     }
-    checkpoint_session({**state, **update})
     return update
 
 
@@ -134,7 +90,6 @@ def classify_intent_node(state: ResearchState) -> dict:
         "intent": intent,
         "total_tokens": state.get("total_tokens", 0) + result.get("tokens_used", 0),
     }
-    checkpoint_session({**state, **update})
     return update
 
 
@@ -164,7 +119,6 @@ def direct_response_node(state: ResearchState) -> dict:
         "status": "complete",
         "total_tokens": state.get("total_tokens", 0) + result.get("tokens_used", 0),
     }
-    checkpoint_session({**state, **update})
     return update
 
 
@@ -184,7 +138,6 @@ def plan_node(state: ResearchState) -> dict:
             "research_plan": fallback_plan,
             "status": "researching",
         }
-        checkpoint_session({**state, **update})
         return update
 
     # Generate plan via tool layer
@@ -245,7 +198,6 @@ def plan_node(state: ResearchState) -> dict:
             "status": "researching",
             "total_tokens": state.get("total_tokens", 0) + result.get("tokens_used", 0),
         }
-    checkpoint_session({**state, **update})
     return update
 
 
@@ -493,7 +445,6 @@ def _execute_sections(state: ResearchState, writer: StreamWriter) -> dict:
         "status": "verifying",
         "total_tokens": total_tokens,
     }
-    checkpoint_session({**state, **update})
     return update
 
 
@@ -654,7 +605,6 @@ def execute_node(state: ResearchState, writer: StreamWriter) -> dict:
         "status": "verifying",
         "total_tokens": total_tokens,
     }
-    checkpoint_session({**state, **update})
     return update
 
 
@@ -719,7 +669,6 @@ def verify_node(state: ResearchState, writer: StreamWriter) -> dict:
         "status": "observing",
         "total_tokens": state.get("total_tokens", 0) + verification.get("tokens_used", 0),
     }
-    checkpoint_session({**state, **update})
     return update
 
 
@@ -740,7 +689,6 @@ def observe_node(state: ResearchState) -> dict:
     update = {
         "failure_hints": failure_hints,
     }
-    checkpoint_session({**state, **update})
     return update
 
 
@@ -815,7 +763,6 @@ def iterate_node(state: ResearchState) -> dict:
         "iteration": new_iteration,
         "status": "planning",
     }
-    checkpoint_session({**state, **update})
     return update
 
 
@@ -943,7 +890,6 @@ def finalize_node(state: ResearchState) -> dict:
         "total_cost": total_cost,
         "status": "complete",
     }
-    checkpoint_session({**state, **update})
     return update
 
 

@@ -81,15 +81,6 @@ def mock_mcp_functions():
 
 
 @pytest.fixture
-def mock_session_manager():
-    """Patch SessionManager to avoid real DB calls."""
-    with patch("agents.orchestrator.graph.SessionManager") as mock_cls:
-        mock_mgr = MagicMock()
-        mock_cls.return_value = mock_mgr
-        yield mock_mgr
-
-
-@pytest.fixture
 def mock_observer():
     """Patch HarnessObserver to avoid real observability calls."""
     with patch("agents.orchestrator.graph.HarnessObserver") as mock_cls:
@@ -101,13 +92,6 @@ def mock_observer():
 
 
 @pytest.fixture
-def mock_checkpoint():
-    """Patch checkpoint_session to avoid DB writes."""
-    with patch("agents.orchestrator.graph.checkpoint_session"):
-        yield
-
-
-@pytest.fixture
 def mock_failure_memory():
     """Patch load_past_failure_memory."""
     with patch("agents.orchestrator.graph.load_past_failure_memory", return_value=""):
@@ -115,7 +99,7 @@ def mock_failure_memory():
 
 
 class TestBuildGraph:
-    def test_returns_compiled_graph(self, mock_session_manager, mock_checkpoint, mock_failure_memory):
+    def test_returns_compiled_graph(self, mock_failure_memory):
         from agents.orchestrator.graph import build_graph
 
         graph = build_graph()
@@ -124,7 +108,7 @@ class TestBuildGraph:
         assert hasattr(graph, "invoke")
         assert hasattr(graph, "astream")
 
-    def test_graph_has_expected_nodes(self, mock_session_manager, mock_checkpoint, mock_failure_memory):
+    def test_graph_has_expected_nodes(self, mock_failure_memory):
         from agents.orchestrator.graph import build_graph
 
         graph = build_graph()
@@ -179,7 +163,7 @@ class TestShouldIterate:
 class TestGraphInvocation:
     @pytest.mark.asyncio
     async def test_graph_runs_to_completion(
-        self, mock_mcp_functions, mock_observer, mock_checkpoint, mock_failure_memory
+        self, mock_mcp_functions, mock_observer, mock_failure_memory
     ):
         from agents.orchestrator.graph import build_graph
 

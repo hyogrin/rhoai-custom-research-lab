@@ -25,7 +25,7 @@ load_dotenv(override=True)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from harness.session import SessionManager, ResearchSession
+from harness.session import ResearchSession
 import agents.orchestrator.graph as _graph_module
 from backend.metrics import (
     active_research_sessions,
@@ -60,7 +60,11 @@ def _start_mcp_servers():
     """Start MCP servers as subprocesses."""
     for name, module, port in MCP_SERVERS:
         if _port_in_use(port):
-            logger.info("MCP server %s already running on port %d — skipping", name, port)
+            logger.warning(
+                "Port %d already in use — cannot start %s. "
+                "Stop the process holding the port (e.g. Jupyter kernel) or run 'make backend-stop' first.",
+                port, name,
+            )
             continue
         proc = subprocess.Popen(
             [sys.executable, "-m", module],
@@ -183,8 +187,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-session_mgr = SessionManager()
 
 
 # --- AG-UI Protocol Endpoint ---
@@ -1265,8 +1267,6 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
                 session.failing_sections = state_update["failing_sections"]
             session.updated_at = __import__("datetime").datetime.utcnow().isoformat()
 
-            session_mgr.save(session)
-
             sub_events = _emit_sub_events(node_name, state_update, session)
             for evt in sub_events:
                 evt["iteration"] = session.iteration
@@ -1276,7 +1276,6 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
 
         final_output = state_update.get("final_output", session.current_draft)
         session.status = "complete"
-        session_mgr.save(session)
 
         yield _sse({"event": "content", "text": final_output})
 
@@ -1300,7 +1299,6 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
         active_research_sessions.dec()
         research_sessions_total.labels(status="failed").inc()
         session.status = "failed"
-        session_mgr.save(session)
         yield _sse({"event": "error", "message": f"Research error: {exc}", "phase": "error"})
     finally:
         if not graph_task.done():
@@ -1327,7 +1325,6 @@ async def start_research(req: ResearchRequest):
     session._enable_fact_check = req.enable_fact_check
     session._enable_parallel = req.enable_parallel
     session._enable_sectioned = req.enable_sectioned
-    session_mgr.save(session)
     active_research_sessions.inc()
     research_sessions_total.labels(status="started").inc()
     logger.info("Starting research session %s for query: %s", session.session_id, req.query[:120])
@@ -1340,24 +1337,6 @@ async def start_research(req: ResearchRequest):
             "X-Accel-Buffering": "no",
         },
     )
-
-
-@app.get("/sessions/{session_id}/status")
-async def session_status(session_id: str):
-    """Return the current progress of a research session."""
-    progress = session_mgr.get_progress(session_id)
-    if progress is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-    return progress
-
-
-@app.get("/sessions/{session_id}/draft")
-async def session_draft(session_id: str):
-    """Return the current draft for a research session."""
-    session = session_mgr.load(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-    return {"draft": session.current_draft, "status": session.status}
 
 
 @app.post("/upload")
@@ -1445,6 +1424,15 @@ def _process_documents_background(upload_id: str, file_paths: list[str]):
             result = converter.convert(path)
             doc = result.document
 
+            doc_title = filename
+            for item, _level in doc.iterate_items():
+                if hasattr(item, "label") and item.label == "section_header" and item.text.strip():
+                    doc_title = item.text.strip()
+                    break
+            if doc_title == filename and hasattr(doc, "name") and doc.name:
+                doc_title = doc.name.replace("_", " ")
+            logger.info("Document title resolved: %s → %s", filename, doc_title)
+
             _update(f"✂️ [Docling] Smart chunking (heading hierarchy): {filename}", file_base_pct + 15)
             chunks = _semantic_chunk_document(doc)
             _update(f"✂️ [Docling] {len(chunks)} semantic chunks created: {filename}", file_base_pct + 18)
@@ -1482,11 +1470,12 @@ def _process_documents_background(upload_id: str, file_paths: list[str]):
                 """INSERT INTO documents (id, name, file_type, chunk_count, status, object_store_path)
                    VALUES (?, ?, ?, ?, 'completed', ?)
                    ON CONFLICT (id) DO UPDATE SET
+                       name = excluded.name,
                        chunk_count = excluded.chunk_count,
                        status = excluded.status,
                        object_store_path = excluded.object_store_path,
                        updated_at = datetime('now')""",
-                (document_id, filename, os.path.splitext(path)[1], len(chunks), object_store_path),
+                (document_id, doc_title, os.path.splitext(path)[1], len(chunks), object_store_path),
             )
             cur.execute("DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM document_chunks WHERE document_id = ?)", (document_id,))
             cur.execute("DELETE FROM document_chunks WHERE document_id = ?", (document_id,))
@@ -1496,7 +1485,7 @@ def _process_documents_background(upload_id: str, file_paths: list[str]):
                 cur.execute(
                     """INSERT INTO document_chunks (document_id, document_name, chunk_index, content, metadata)
                        VALUES (?, ?, ?, ?, ?)""",
-                    (document_id, filename, idx, chunk["text"],
+                    (document_id, doc_title, idx, chunk["text"],
                      _json.dumps(metadata) if metadata else "{}"),
                 )
                 chunk_id = cur.lastrowid
