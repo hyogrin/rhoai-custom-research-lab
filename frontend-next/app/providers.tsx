@@ -88,6 +88,8 @@ type ThreadContextType = {
 type DocumentContextType = {
   documents: DocumentInfo[];
   refreshDocuments: () => Promise<void>;
+  uploadStatus: string | null;
+  setUploadStatus: (s: string | null) => void;
 };
 
 export const SettingsContext = createContext<SettingsContextType>({
@@ -107,6 +109,8 @@ export const ThreadContext = createContext<ThreadContextType>({
 export const DocumentContext = createContext<DocumentContextType>({
   documents: [],
   refreshDocuments: async () => {},
+  uploadStatus: null,
+  setUploadStatus: () => {},
 });
 
 export function useSettings() {
@@ -161,6 +165,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
     getStoredThreadId(),
   );
   const [documents, setDocuments] = useState<DocumentInfo[]>([]);
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
 
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -336,8 +341,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
   );
 
   const docCtx = useMemo<DocumentContextType>(
-    () => ({ documents, refreshDocuments: fetchDocuments }),
-    [documents, fetchDocuments],
+    () => ({ documents, refreshDocuments: fetchDocuments, uploadStatus, setUploadStatus }),
+    [documents, fetchDocuments, uploadStatus],
   );
 
   return (

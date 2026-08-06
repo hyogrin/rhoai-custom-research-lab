@@ -103,8 +103,9 @@ def search_by_document(query: str, document_id: str, top_k: int = 5) -> list[dic
            JOIN document_chunks dc ON dc.id = sub.chunk_id
            LEFT JOIN documents d ON dc.document_id = d.id
            WHERE dc.document_id = ?
-           ORDER BY sub.distance""",
-        (serialize_float32(embedding), top_k * 10, document_id),
+           ORDER BY sub.distance
+           LIMIT ?""",
+        (serialize_float32(embedding), top_k * 10, document_id, top_k),
     ).fetchall()
 
     results = []

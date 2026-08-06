@@ -289,6 +289,16 @@ def semantic_search(query: str, top_k: int = 5) -> list[dict]:
     return result if isinstance(result, list) else []
 
 
+def search_by_document(query: str, document_id: str, top_k: int = 5) -> list[dict]:
+    """Search within a specific document via vector-search-mcp server."""
+    result = _call_mcp_sync("vector-search", "search_by_document", {
+        "query": query,
+        "document_id": document_id,
+        "top_k": top_k,
+    })
+    return result if isinstance(result, list) else []
+
+
 # ---------------------------------------------------------------------------
 # Web Search MCP tools
 # ---------------------------------------------------------------------------

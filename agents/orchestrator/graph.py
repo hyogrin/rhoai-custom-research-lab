@@ -26,6 +26,7 @@ from agents.orchestrator.state import ResearchState
 from agents.orchestrator.layers.context import gather_context, load_past_failure_memory
 from agents.orchestrator.layers.tools import (
     semantic_search,
+    search_by_document,
     web_search,
     synthesize_context,
     generate_plan,
@@ -55,6 +56,38 @@ def _get_observer(session_id: str) -> HarnessObserver:
 # --- Graph Nodes ---
 
 
+def _resolve_target_document(query: str) -> tuple[str, str]:
+    """Match document references in the query against the document database.
+
+    Returns (document_id, document_name) or ("", "") if no match.
+    """
+    try:
+        from db import get_connection
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT id, name FROM documents WHERE status = 'completed'"
+        ).fetchall()
+        conn.close()
+
+        if not rows:
+            return "", ""
+
+        q_lower = query.lower()
+        for row in rows:
+            doc_name = row["name"]
+            if doc_name.lower() in q_lower:
+                return row["id"], doc_name
+            name_no_ext = os.path.splitext(doc_name)[0]
+            if name_no_ext.lower() in q_lower:
+                return row["id"], doc_name
+            words = [w for w in doc_name.replace("_", " ").replace("-", " ").split() if len(w) > 3]
+            if words and sum(1 for w in words if w.lower() in q_lower) >= len(words) * 0.6:
+                return row["id"], doc_name
+    except Exception as e:
+        logger.debug("Document resolution failed: %s", e)
+    return "", ""
+
+
 def normalize_node(state: ResearchState) -> dict:
     """Normalize the input and initialize session state."""
     session_id = state.get("session_id") or str(uuid.uuid4())[:12]
@@ -64,11 +97,17 @@ def normalize_node(state: ResearchState) -> dict:
 
     past_memory = load_past_failure_memory()
 
+    doc_id, doc_name = _resolve_target_document(state["query"])
+    if doc_id:
+        logger.info("Target document resolved: %s (%s)", doc_name, doc_id)
+
     update = {
         "session_id": session_id,
         "iteration": 1,
         "status": "planning",
         "failure_hints": past_memory,
+        "target_document_id": doc_id,
+        "target_document_name": doc_name,
     }
     return update
 
@@ -206,6 +245,7 @@ _PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "4"))
 
 def _search_section(
     topic: dict, query: str, iteration: int, ws_flag: bool, parallel: bool,
+    document_id: str = "",
 ) -> dict:
     """Run search queries for a single section and return context + counts."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -221,7 +261,7 @@ def _search_section(
         futures_map: dict = {}
         with ThreadPoolExecutor(max_workers=_PARALLEL_WORKERS) as pool:
             for idx, q in enumerate(queries[:3]):
-                futures_map[pool.submit(_run_semantic, q, iteration)] = ("semantic", q)
+                futures_map[pool.submit(_run_semantic, q, iteration, document_id)] = ("semantic", q)
                 if ws_flag and idx == 0:
                     futures_map[pool.submit(_run_web, q, iteration)] = ("web", q)
 
@@ -240,7 +280,7 @@ def _search_section(
                     logger.error("Section '%s' search (%s) failed: %s", title, kind, e, exc_info=True)
     else:
         for idx, q in enumerate(queries[:3]):
-            for r in _run_semantic(q, iteration):
+            for r in _run_semantic(q, iteration, document_id):
                 r.setdefault("metadata", {})["sub_topic"] = title
                 section_context.append(r)
                 semantic_count += 1
@@ -353,8 +393,12 @@ def _execute_sections(state: ResearchState, writer: StreamWriter) -> dict:
         # --- Phase 1: Search ---
         writer({"progress": "section_start", **evt_base})
 
+        target_doc_id = state.get("target_document_id", "")
         try:
-            search_result = _search_section(topic, state["query"], iteration, ws_flag, parallel)
+            search_result = _search_section(
+                topic, state["query"], iteration, ws_flag, parallel,
+                document_id=target_doc_id,
+            )
         except Exception as e:
             logger.error("Section '%s' search failed: %s", title, e, exc_info=True)
             sections.append({"sub_topic": title, "content": "", "search_context": [], "score": 0.0, "status": "failed"})
@@ -459,11 +503,19 @@ def _format_context_entry(ctx: dict) -> str:
     return f"[{source}]\n{content}"
 
 
-def _run_semantic(query: str, iteration: int) -> list[dict]:
-    """Run a single semantic_search and return context entries. Thread-safe."""
+def _run_semantic(query: str, iteration: int, document_id: str = "") -> list[dict]:
+    """Run a single semantic_search and return context entries. Thread-safe.
+
+    If document_id is provided, search is scoped to that document only.
+    """
     seen: set = set()
     entries: list[dict] = []
-    for r in semantic_search(query, top_k=3):
+    results = (
+        search_by_document(query, document_id, top_k=5)
+        if document_id
+        else semantic_search(query, top_k=3)
+    )
+    for r in results:
         key = (r.get("document_id", ""), r.get("chunk_index", 0))
         if key not in seen:
             seen.add(key)
@@ -514,6 +566,7 @@ def execute_node(state: ResearchState, writer: StreamWriter) -> dict:
 
     ws_flag = state.get("enable_web_search", True)
     parallel = state.get("enable_parallel", True)
+    target_doc_id = state.get("target_document_id", "")
 
     search_steps = [s for s in plan[:4] if s.get("action", "search") in ("search", "web_search")]
     other_steps = [s for s in plan[:4] if s.get("action", "search") not in ("search", "web_search")]
@@ -523,7 +576,7 @@ def execute_node(state: ResearchState, writer: StreamWriter) -> dict:
         with ThreadPoolExecutor(max_workers=_PARALLEL_WORKERS) as pool:
             for step in search_steps:
                 q = step.get("query", state["query"])
-                futures_map[pool.submit(_run_semantic, q, iteration)] = ("semantic", q)
+                futures_map[pool.submit(_run_semantic, q, iteration, target_doc_id)] = ("semantic", q)
                 if ws_flag:
                     futures_map[pool.submit(_run_web, q, iteration)] = ("web", q)
 
@@ -544,7 +597,7 @@ def execute_node(state: ResearchState, writer: StreamWriter) -> dict:
     else:
         for step in search_steps:
             q = step.get("query", state["query"])
-            new_context.extend(_run_semantic(q, iteration))
+            new_context.extend(_run_semantic(q, iteration, target_doc_id))
             observer.trace_tool_call(iteration=iteration, operation="semantic_search", input_summary=q[:200], output_summary="done", tokens_used=0)
             if ws_flag:
                 new_context.extend(_run_web(q, iteration))

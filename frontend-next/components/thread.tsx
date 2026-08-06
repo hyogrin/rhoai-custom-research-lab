@@ -640,10 +640,9 @@ const ThreadSuggestions: FC = () => {
 
 const Composer: FC = () => {
   const { settings } = useSettings();
-  const { refreshDocuments } = useDocuments();
+  const { refreshDocuments, uploadStatus, setUploadStatus } = useDocuments();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
-  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;

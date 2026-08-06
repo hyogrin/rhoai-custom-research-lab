@@ -49,6 +49,10 @@ class ResearchState(TypedDict):
     section_order: list[str]      # sub_topic titles in planned order
     failing_sections: list[str]   # sub_topics to rewrite on next iteration
 
+    # Document targeting — when user references a specific document
+    target_document_id: str   # document_id to filter vector search, empty = search all
+    target_document_name: str # resolved document title for display
+
     # Intent classification
     intent: str  # "research" | "casual" — set by classify_intent node
 

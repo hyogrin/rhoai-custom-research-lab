@@ -1561,6 +1561,28 @@ async def list_documents():
         return {"documents": []}
 
 
+@app.delete("/documents/reset")
+async def reset_documents():
+    """Delete all documents, chunks, and vector embeddings from the database."""
+    try:
+        from lib.document_processing import get_db_connection
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM vec_chunks")
+        cur.execute("DELETE FROM document_chunks")
+        cur.execute("DELETE FROM documents")
+        conn.commit()
+        deleted = cur.execute("SELECT changes()").fetchone()[0]
+        cur.close()
+        conn.close()
+        logger.info("Document database reset: all documents, chunks, and vectors deleted")
+        return {"reset": True, "message": "All documents deleted"}
+    except Exception as e:
+        logger.warning("Failed to reset documents: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/documents/{document_id}/download_url")
 async def get_document_download_url(document_id: str):
     """Return the stored path for a document."""
@@ -1678,12 +1700,12 @@ async def delete_thread(thread_id: str):
         raise HTTPException(status_code=501, detail="PostgreSQL not configured")
 
     try:
-        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+        import psycopg
 
-        async with AsyncPostgresSaver.from_conn_string(POSTGRES_URL) as checkpointer:
-            config = {"configurable": {"thread_id": thread_id}}
-            # Clear the thread's checkpoints
-            await checkpointer.adelete(config)
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as conn:
+            await conn.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s", (thread_id,))
+            await conn.execute("DELETE FROM checkpoint_blobs WHERE thread_id = %s", (thread_id,))
+            await conn.execute("DELETE FROM checkpoints WHERE thread_id = %s", (thread_id,))
         return {"deleted": True, "thread_id": thread_id}
     except Exception as e:
         logger.warning("Failed to delete thread %s: %s", thread_id, e)

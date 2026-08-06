@@ -1,7 +1,10 @@
 "use client";
 
-import { X, Target, Repeat, Globe, Map, ShieldCheck, Layers, FileText } from "lucide-react";
-import { useSettings } from "@/app/providers";
+import { useState } from "react";
+import { X, Target, Repeat, Globe, Map, ShieldCheck, Layers, FileText, Trash2 } from "lucide-react";
+import { useSettings, useDocuments } from "@/app/providers";
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 type SettingsPanelProps = {
   open: boolean;
@@ -10,6 +13,9 @@ type SettingsPanelProps = {
 
 export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
   const { settings, setSettings } = useSettings();
+  const { documents, refreshDocuments } = useDocuments();
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [resetting, setResetting] = useState(false);
 
   if (!open) return null;
 
@@ -94,6 +100,68 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
             checked={settings.enableSectioned}
             onChange={(v) => setSettings({ ...settings, enableSectioned: v })}
           />
+
+          <div className="border-t border-border" />
+
+          {/* Document Database Reset */}
+          <div className="space-y-3">
+            <div className="flex items-center gap-2">
+              <Trash2 className="h-4 w-4 text-red-400" />
+              <div className="flex-1">
+                <span className="text-sm font-medium">Reset Document Database</span>
+                <p className="text-xs text-muted-foreground">
+                  Delete all uploaded documents, chunks, and embeddings
+                  {documents.length > 0 && (
+                    <span className="ml-1 text-red-400">({documents.length} document{documents.length > 1 ? "s" : ""})</span>
+                  )}
+                </p>
+              </div>
+            </div>
+
+            {!confirmReset ? (
+              <button
+                type="button"
+                onClick={() => setConfirmReset(true)}
+                disabled={documents.length === 0}
+                className="w-full rounded-md border border-red-300/30 px-3 py-1.5 text-xs font-medium text-red-400 transition-colors hover:bg-red-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Reset Documents
+              </button>
+            ) : (
+              <div className="space-y-2 rounded-md border border-red-400/30 bg-red-500/5 p-3">
+                <p className="text-xs text-red-400 font-medium">
+                  This will permanently delete all {documents.length} document{documents.length > 1 ? "s" : ""} and their embeddings. This cannot be undone.
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setConfirmReset(false)}
+                    className="flex-1 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-muted"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    disabled={resetting}
+                    onClick={async () => {
+                      setResetting(true);
+                      try {
+                        const res = await fetch(`${API_URL}/documents/reset`, { method: "DELETE" });
+                        if (res.ok) {
+                          await refreshDocuments();
+                          setConfirmReset(false);
+                        }
+                      } catch { /* ignore */ }
+                      setResetting(false);
+                    }}
+                    className="flex-1 rounded-md bg-red-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-600 disabled:opacity-50"
+                  >
+                    {resetting ? "Deleting..." : "Confirm Delete"}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </>
