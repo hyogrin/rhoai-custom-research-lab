@@ -239,6 +239,8 @@ connect_existing() {
 check_openshell() {
     section "OpenShell (pre-installed check)"
 
+    local OPENSHELL_NS="${OPENSHELL_SANDBOX_NAMESPACE:-openshell}"
+
     if [ "$MODE" = "local" ]; then
         if curl -sf "http://127.0.0.1:${OPENSHELL_GATEWAY_PORT}/healthz" >/dev/null 2>&1; then
             set_env_var "OPENSHELL_GATEWAY_URL" "http://127.0.0.1:${OPENSHELL_GATEWAY_PORT}"
@@ -246,12 +248,32 @@ check_openshell() {
             return 0
         fi
     else
-        local OPENSHELL_NS="${OPENSHELL_SANDBOX_NAMESPACE:-openshell}"
         if oc get svc openshell -n "$OPENSHELL_NS" &>/dev/null; then
+            # Verify Agent Sandbox CRDs are present
+            if ! oc get crd sandboxes.agents.x-k8s.io &>/dev/null; then
+                warn "OpenShell gateway found but Agent Sandbox CRDs are missing."
+                warn "  Run: ./scripts/install-openshell.sh  (requires cluster-admin)"
+                return 1
+            fi
+
             set_env_var "OPENSHELL_GATEWAY_URL" "http://127.0.0.1:${OPENSHELL_GATEWAY_PORT}"
-            info "OpenShell found in namespace '${OPENSHELL_NS}' — port-forwarding..."
+            info "OpenShell found in namespace '${OPENSHELL_NS}'"
+
+            # Port-forward (kill any stale forward first)
+            pkill -f "port-forward svc/openshell" 2>/dev/null || true
+            sleep 1
             oc port-forward svc/openshell "${OPENSHELL_GATEWAY_PORT}:8080" -n "$OPENSHELL_NS" &>/dev/null &
             sleep 2
+
+            # Register gateway if CLI is available and not yet registered
+            if command -v openshell &>/dev/null; then
+                if ! openshell gateway list 2>/dev/null | grep -q "cluster-forward"; then
+                    info "Registering local gateway 'cluster-forward'..."
+                    openshell gateway add "http://127.0.0.1:${OPENSHELL_GATEWAY_PORT}" \
+                        --name cluster-forward --local 2>/dev/null || true
+                fi
+            fi
+
             info "OpenShell gateway ready (port-forwarded to localhost:${OPENSHELL_GATEWAY_PORT})"
             return 0
         fi
@@ -259,7 +281,7 @@ check_openshell() {
 
     warn "OpenShell gateway not available."
     warn "  The Claim-Evidence Graph feature requires OpenShell (admin prerequisite)."
-    warn "  Ask your cluster admin: https://docs.nvidia.com/openshell/latest/installation.html"
+    warn "  Install: ./scripts/install-openshell.sh  (requires cluster-admin)"
     warn "  This does NOT affect the core research workflow."
 }
 

@@ -145,6 +145,21 @@ contradicting evidence.
 | `OPENSHELL_TIMEOUT_SECONDS` | `60` | Execution timeout |
 | `OPENSHELL_POLICY_PATH` | `config/openshell/claim-evidence-policy.yaml` | Security policy |
 | `OPENSHELL_REQUIRE_APPROVAL` | `true` | Whether to interrupt for user approval |
+| `ARTIFACT_PLAN_TIMEOUT` | `120` | Claim-evidence planning LLM timeout (seconds) |
+| `OPENSHELL_GATEWAY_URL` | `http://127.0.0.1:8080` | Gateway endpoint (must match SDK config) |
+
+### Connectivity
+
+The `openshell` CLI and Python SDK connect via gRPC to the endpoint stored in
+`~/.config/openshell/gateways/<name>/metadata.json` (written by `openshell gateway add`).
+For cluster-based gateways (ClusterIP service, no Route), a port-forward is required:
+
+```bash
+oc port-forward svc/openshell 8080:8080 -n openshell
+```
+
+`make setup` handles port-forwarding and gateway registration automatically when
+OpenShell is detected on the cluster.
 
 ### SSE Events
 
@@ -192,10 +207,35 @@ For advanced use:
 | Component | Scope | Provisioned by |
 |-----------|-------|----------------|
 | PostgreSQL + pgvector | Lab-owned | `make setup` (automatic) |
-| OpenShell gateway | Cluster-shared | Cluster admin (see [install guide](https://docs.nvidia.com/openshell/latest/installation.html)) |
+| Agent Sandbox CRDs | Cluster-shared | `./scripts/install-openshell.sh` (cluster-admin) |
+| OpenShell gateway | Cluster-shared | `./scripts/install-openshell.sh` (cluster-admin) |
 
 OpenShell is only required for the optional Claim-Evidence Graph feature.
 The core research workflow works without it.
+
+**Install (cluster-admin, one-time):**
+```bash
+./scripts/install-openshell.sh                    # Install CRDs + gateway (TP defaults)
+./scripts/install-openshell.sh -v 0.0.99          # Specific chart version
+./scripts/install-openshell.sh --status            # Verify installation
+```
+
+The script installs two components:
+1. **Agent Sandbox CRDs** (`kubernetes-sigs/agent-sandbox`) — Kubernetes-native sandbox API
+2. **OpenShell gateway** (NVIDIA Helm chart) — sandbox lifecycle manager
+
+> **TP (Technology Preview):** TLS is disabled and unauthenticated client access is
+> enabled for lab convenience. For production, configure OIDC authentication
+> (see `helm show values oci://ghcr.io/nvidia/openshell/helm-chart`, `server.oidc.*`).
+
+**Developer workstation setup (after admin install):**
+```bash
+openshell gateway add http://127.0.0.1:8080 --name cluster-forward --local
+oc port-forward svc/openshell 8080:8080 -n openshell   # required for ClusterIP gateways
+openshell sandbox list                                   # verify connectivity
+```
+
+`make setup` automatically detects and port-forwards OpenShell when available.
 
 ### Frontend-Backend Protocol
 

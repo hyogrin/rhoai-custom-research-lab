@@ -29,6 +29,7 @@ class OpenShellExecutor:
 
     def __init__(self):
         self._client = None
+        self._workspace_cache: dict[str, str] = {}
 
     def _get_client(self):
         if self._client is None:
@@ -45,18 +46,23 @@ class OpenShellExecutor:
 
     def create_sandbox(self, config: SandboxConfig) -> str:
         client = self._get_client()
-        kwargs: dict = {
-            "workspace": config.workspace,
-            "name": config.name,
-            "labels": config.labels,
-        }
-        if config.cpu:
-            kwargs["cpu"] = config.cpu
-        if config.memory:
-            kwargs["memory"] = config.memory
 
-        sandbox = client.create(**kwargs)
+        spec = None
+        if config.image:
+            from openshell._proto import openshell_pb2
+            spec = openshell_pb2.SandboxSpec(
+                template=openshell_pb2.SandboxTemplate(image=config.image),
+            )
+            logger.info("Using custom image: %s", config.image)
+
+        sandbox = client.create(
+            workspace=config.workspace,
+            name=config.name,
+            labels=config.labels,
+            spec=spec,
+        )
         logger.info("Created sandbox: %s (id=%s)", config.name, sandbox.id)
+        self._workspace_cache[config.name] = config.workspace
 
         if config.policy_path and os.path.exists(config.policy_path):
             import subprocess
@@ -66,22 +72,43 @@ class OpenShellExecutor:
                 timeout=30,
             )
 
+        try:
+            client.wait_ready(config.name, workspace=config.workspace, timeout_seconds=120.0)
+            logger.info("Sandbox %s is ready", config.name)
+        except Exception as e:
+            logger.warning("Sandbox %s wait_ready failed: %s — proceeding anyway", config.name, e)
+
         return sandbox.id
 
     def upload_inputs(self, sandbox_id: str, files: dict[str, bytes]) -> None:
         client = self._get_client()
         for path, data in files.items():
-            client.exec(
+            dirname = os.path.dirname(path)
+            logger.info("Uploading %s (%d bytes) to sandbox %s", path, len(data), sandbox_id)
+
+            mkdir_result = client.exec(
                 sandbox_id,
-                ["mkdir", "-p", os.path.dirname(path)],
+                ["mkdir", "-p", dirname],
                 timeout_seconds=10,
             )
-            client.exec(
+            if mkdir_result.exit_code != 0:
+                logger.error("mkdir -p %s failed (code %d): %s", dirname, mkdir_result.exit_code,
+                             getattr(mkdir_result, "stderr", ""))
+
+            import base64
+            b64_data = base64.b64encode(data).decode("ascii")
+            write_result = client.exec(
                 sandbox_id,
-                ["tee", path],
-                stdin=data,
+                ["sh", "-c", f"echo '{b64_data}' | base64 -d > {path}"],
                 timeout_seconds=30,
             )
+            if write_result.exit_code != 0:
+                logger.error("Write to %s failed (code %d): %s", path, write_result.exit_code,
+                             getattr(write_result, "stderr", ""))
+            else:
+                verify = client.exec(sandbox_id, ["ls", "-la", path], timeout_seconds=5)
+                logger.info("Verified upload %s: %s", path,
+                            getattr(verify, "stdout", "").strip() if verify.exit_code == 0 else "MISSING")
 
     def execute(self, sandbox_id: str, command: list[str], timeout: int) -> ExecutionResult:
         client = self._get_client()
@@ -128,7 +155,8 @@ class OpenShellExecutor:
     def delete_sandbox(self, sandbox_id: str) -> None:
         try:
             client = self._get_client()
-            client.delete(sandbox_id)
+            workspace = self._workspace_cache.pop(sandbox_id, os.environ.get("OPENSHELL_WORKSPACE", "default"))
+            client.delete(sandbox_id, workspace=workspace)
             logger.info("Deleted sandbox: %s", sandbox_id)
         except Exception as e:
             logger.warning("Failed to delete sandbox %s: %s", sandbox_id, e)

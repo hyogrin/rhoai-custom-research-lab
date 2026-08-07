@@ -14,10 +14,10 @@ from agents.orchestrator.layers.tools import _call_llm
 
 logger = logging.getLogger(__name__)
 
-MAX_CLAIMS = 12
-MAX_EVIDENCE = 24
-MAX_TOTAL_NODES = 36
-MAX_EDGES = 48
+MAX_CLAIMS = 5
+MAX_EVIDENCE = 10
+MAX_TOTAL_NODES = 15
+MAX_EDGES = 20
 MAX_LABEL_LENGTH = 300
 
 VALID_NODE_TYPES = {"claim", "evidence"}
@@ -188,6 +188,43 @@ def _sanitize_spec(spec: dict) -> dict:
     return spec
 
 
+def _extract_cited_passages(draft: str, max_chars: int = 2500) -> str:
+    """Extract only paragraphs that contain citations, with their section headings.
+
+    At this stage the draft still uses [[cite:SRC_XXX]] format (pre-finalize).
+    Falls back to head-truncation when no citations are found.
+    """
+    cite_re = re.compile(r"\[\[cite:SRC_[A-Za-z0-9]+\]\]", re.IGNORECASE)
+
+    paragraphs = draft.split("\n\n")
+    cited_parts: list[str] = []
+    last_heading = ""
+    heading_emitted = False
+    total = 0
+
+    for para in paragraphs:
+        stripped = para.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            last_heading = stripped
+            heading_emitted = False
+            continue
+        if cite_re.search(stripped):
+            if last_heading and not heading_emitted:
+                cited_parts.append(last_heading)
+                total += len(last_heading) + 2
+                heading_emitted = True
+            if total + len(stripped) > max_chars:
+                break
+            cited_parts.append(stripped)
+            total += len(stripped) + 2
+
+    if not cited_parts:
+        return draft[:max_chars]
+    return "\n\n".join(cited_parts)
+
+
 def plan_claim_evidence_graph(state: dict[str, Any]) -> dict:
     """Generate a Claim-Evidence Graph spec from the research state.
 
@@ -203,21 +240,24 @@ def plan_claim_evidence_graph(state: dict[str, Any]) -> dict:
     available_sources = _extract_source_ids(accumulated_context)
     available_source_ids = {s["id"] for s in available_sources}
 
+    # Only send citation-bearing paragraphs to minimize prompt size
+    cited_text = _extract_cited_passages(current_draft)
+
     sources_for_prompt = available_sources[:10]
     sources_text = json.dumps(sources_for_prompt, ensure_ascii=False)
     if len(sources_text) > 2000:
         sources_text = sources_text[:2000] + "..."
 
-    user_prompt = f"""Report (excerpt):
-{current_draft[:3000]}
+    user_prompt = f"""Report (cited passages only):
+{cited_text}
 
 Sources (use ONLY these IDs): {sources_text}
 
 Generate a Claim-Evidence Graph as JSON."""
 
     logger.info(
-        "Claim-evidence planner: draft=%d chars, sources=%d, prompt=%d chars",
-        len(current_draft), len(sources_for_prompt), len(user_prompt),
+        "Claim-evidence planner: draft=%d chars, cited=%d chars, sources=%d, prompt=%d chars",
+        len(current_draft), len(cited_text), len(sources_for_prompt), len(user_prompt),
     )
 
     messages = [
@@ -226,7 +266,7 @@ Generate a Claim-Evidence Graph as JSON."""
     ]
 
     try:
-        content, tokens_used = _call_llm(messages, max_tokens=2048, temperature=0.2)
+        content, tokens_used = _call_llm(messages, max_tokens=1536, temperature=0.2)
         logger.info("Claim-evidence planner LLM response: %d chars, %d tokens", len(content), tokens_used)
     except Exception as e:
         logger.error("LLM call failed for claim-evidence planning: %s", e)

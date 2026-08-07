@@ -255,8 +255,11 @@ import atexit
 atexit.register(_stop_mcp_servers)
 
 def _signal_handler(signum, frame):
-    _stop_mcp_servers()
-    sys.exit(0)
+    for proc in _mcp_processes:
+        if proc.poll() is None:
+            proc.terminate()
+    _mcp_processes.clear()
+    os._exit(0)
 
 signal.signal(signal.SIGTERM, _signal_handler)
 signal.signal(signal.SIGINT, _signal_handler)
@@ -431,6 +434,8 @@ async def _stream_agui(run_id: str, thread_id: str, query: str, settings: dict, 
     accumulated_steps: list[dict] = []
     accumulated_verbose: list[dict] = []
     state_update: dict = {}
+    _artifact_data: dict | None = None
+    _artifact_status: str = "disabled"
 
     async def _run_graph():
         try:
@@ -522,6 +527,10 @@ async def _stream_agui(run_id: str, thread_id: str, query: str, settings: dict, 
                 session.section_order = state_update["section_order"]
             if "failing_sections" in state_update:
                 session.failing_sections = state_update["failing_sections"]
+            if "claim_evidence_artifact" in state_update:
+                _artifact_data = state_update["claim_evidence_artifact"]
+            if "artifact_status" in state_update:
+                _artifact_status = state_update["artifact_status"]
 
             sub_events = _emit_sub_events(node_name, state_update, session)
             for evt in sub_events:
@@ -617,13 +626,21 @@ async def _stream_agui(run_id: str, thread_id: str, query: str, settings: dict, 
             if not sources_list and session.accumulated_context:
                 from agents.orchestrator.graph import resolve_citations
                 _, sources_list = resolve_citations("", session.accumulated_context)
+
+            final_snapshot: dict = {
+                "steps": accumulated_steps,
+                "verbose": accumulated_verbose,
+            }
             if sources_list:
                 yield _agui_event({"type": "CUSTOM", "name": "sources", "value": {"sources": sources_list}})
-                yield _agui_event({"type": "STATE_SNAPSHOT", "snapshot": {
-                    "steps": accumulated_steps,
-                    "verbose": accumulated_verbose,
-                    "sources": {"sources": sources_list},
-                }})
+                final_snapshot["sources"] = {"sources": sources_list}
+            if _artifact_data and _artifact_status == "completed":
+                final_snapshot["claim_evidence_artifact"] = _artifact_data
+                final_snapshot["artifact_status"] = _artifact_status
+            elif _artifact_status in ("failed", "denied"):
+                final_snapshot["artifact_status"] = _artifact_status
+
+            yield _agui_event({"type": "STATE_SNAPSHOT", "snapshot": final_snapshot})
 
             yield _agui_event({
                 "type": "MESSAGES_SNAPSHOT",

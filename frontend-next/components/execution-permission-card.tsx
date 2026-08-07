@@ -1,7 +1,19 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type FC } from "react";
 import { useAui } from "@assistant-ui/react";
+import {
+  CheckCircle2,
+  ShieldAlert,
+  ShieldCheck,
+  ShieldX,
+  Terminal,
+  Wifi,
+  WifiOff,
+  Cpu,
+  Timer,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
 
 export type ExecutionPermissionData = {
   type: "execution_permission";
@@ -23,7 +35,9 @@ type ExecutionPermissionCardProps = {
   data: ExecutionPermissionData;
 };
 
-export function ExecutionPermissionCard({ data }: ExecutionPermissionCardProps) {
+export const ExecutionPermissionCard: FC<ExecutionPermissionCardProps> = ({
+  data,
+}) => {
   const [resolved, setResolved] = useState<"approved" | "denied" | null>(null);
   const aui = useAui();
 
@@ -43,56 +57,96 @@ export function ExecutionPermissionCard({ data }: ExecutionPermissionCardProps) 
 
   if (resolved === "approved") {
     return (
-      <div className="execution-permission-card resolved">
-        <div className="permission-status approved">Execution approved</div>
+      <div className="review-card review-card--resolved">
+        <div className="flex items-center gap-2 text-sm">
+          <ShieldCheck className="size-4 text-emerald-500" />
+          <span className="text-muted-foreground">
+            Sandbox execution approved — generating graph...
+          </span>
+        </div>
       </div>
     );
   }
 
   if (resolved === "denied") {
     return (
-      <div className="execution-permission-card resolved">
-        <div className="permission-status denied">Execution denied — report finalized without graph</div>
+      <div className="review-card review-card--resolved">
+        <div className="flex items-center gap-2 text-sm">
+          <ShieldX className="size-4 text-red-400" />
+          <span className="text-muted-foreground">
+            Execution denied — report finalized without graph
+          </span>
+        </div>
       </div>
     );
   }
 
+  const networkDenied = data.permissions.network === "deny";
+
   return (
-    <div className="execution-permission-card">
-      <div className="permission-header">
-        <span className="permission-icon">🔒</span>
-        <span className="permission-title">Execution Permission Required</span>
-      </div>
-
-      <div className="permission-purpose">{data.purpose}</div>
-
-      <div className="permission-details">
-        <div className="detail-row">
-          <span className="detail-label">Command:</span>
-          <code className="detail-value">{data.command.join(" ")}</code>
-        </div>
-        <div className="detail-row">
-          <span className="detail-label">Network:</span>
-          <span className="detail-value detail-deny">{data.permissions.network}</span>
-        </div>
-        <div className="detail-row">
-          <span className="detail-label">CPU / Memory:</span>
-          <span className="detail-value">{data.permissions.cpu} / {data.permissions.memory}</span>
-        </div>
-        <div className="detail-row">
-          <span className="detail-label">Timeout:</span>
-          <span className="detail-value">{data.permissions.timeout_seconds}s</span>
+    <div className="review-card">
+      <div className="flex items-center gap-3">
+        <span className="review-card__icon">
+          <ShieldAlert className="size-4" />
+        </span>
+        <div className="flex flex-col">
+          <p className="text-[13.5px] font-medium">Execution Permission</p>
+          <p className="text-xs text-muted-foreground">{data.purpose}</p>
         </div>
       </div>
 
-      <div className="permission-actions">
-        <button className="btn-approve" onClick={handleApprove}>
-          Approve Once
-        </button>
-        <button className="btn-deny" onClick={handleDeny}>
+      <div className="review-card__suggestions">
+        <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground mb-2">
+          <Terminal className="size-3" />
+          Sandbox Details
+        </div>
+        <div className="space-y-2">
+          <div className="flex items-start gap-2 text-xs">
+            <Terminal className="size-3 mt-0.5 shrink-0 text-muted-foreground/60" />
+            <code className="text-[11px] leading-relaxed break-all text-muted-foreground font-mono">
+              {data.command.join(" ")}
+            </code>
+          </div>
+          <div className="flex items-center gap-4 text-xs text-muted-foreground">
+            <span className="inline-flex items-center gap-1">
+              {networkDenied ? (
+                <WifiOff className="size-3 text-emerald-500" />
+              ) : (
+                <Wifi className="size-3 text-amber-500" />
+              )}
+              <span className={cn(networkDenied && "text-emerald-600")}>
+                {networkDenied ? "Network blocked" : data.permissions.network}
+              </span>
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <Cpu className="size-3" />
+              {data.permissions.cpu} / {data.permissions.memory}
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <Timer className="size-3" />
+              {data.permissions.timeout_seconds}s
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex items-center justify-end gap-2">
+        <button
+          type="button"
+          onClick={handleDeny}
+          className="review-card__btn review-card__btn--secondary"
+        >
           Deny
+        </button>
+        <button
+          type="button"
+          onClick={handleApprove}
+          className="review-card__btn review-card__btn--primary"
+        >
+          <CheckCircle2 className="size-3.5" />
+          Approve Once
         </button>
       </div>
     </div>
   );
-}
+};

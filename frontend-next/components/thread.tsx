@@ -184,17 +184,6 @@ const ThreadWelcome: FC = () => {
 // ---------------------------------------------------------------------------
 
 function preprocessMarkdown(text: string): string {
-  // Resolve unresolved [[cite:SRC_*]] tokens to numbered citations by appearance order
-  const citeIds: string[] = [];
-  text = text.replace(/\[\[cite:(SRC_[A-Za-z0-9]+)\]\]/gi, (_match, id) => {
-    const normalized = id.toUpperCase();
-    let idx = citeIds.indexOf(normalized);
-    if (idx === -1) {
-      citeIds.push(normalized);
-      idx = citeIds.length - 1;
-    }
-    return `[${idx + 1}](#cite-${idx + 1})`;
-  });
   // Fix collapsed table rows: "| val | | val |" → "| val |\n| val |"
   text = text.replace(/ \| \| /g, " |\n| ");
   // Fix separator row collapsed inline

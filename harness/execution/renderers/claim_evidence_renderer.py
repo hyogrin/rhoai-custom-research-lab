@@ -5,7 +5,7 @@ Reads a validated JSON specification and produces an SVG visualization.
 This script runs INSIDE an OpenShell sandbox with restricted permissions.
 
 Usage:
-    python3 claim_evidence_renderer.py /sandbox/input/claim_evidence.json /sandbox/output/claim-evidence.svg
+    python3 claim_evidence_renderer.py /tmp/input/claim_evidence.json /tmp/output/claim-evidence.svg
 """
 
 import html

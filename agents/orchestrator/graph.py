@@ -11,6 +11,7 @@ import os
 import sys
 import time
 import uuid
+from pathlib import Path
 
 from langgraph.graph import StateGraph, END
 from langgraph.types import interrupt, Command, StreamWriter
@@ -440,9 +441,6 @@ def _execute_sections(state: ResearchState, writer: StreamWriter) -> dict:
 
         # --- Phase 2: Draft (with token streaming) ---
         writer({"progress": "drafting", **evt_base})
-
-        if idx > 1:
-            writer({"progress": "draft_chunk", "text": "\n\n---\n\n", **evt_base})
 
         def _on_draft_chunk(text: str) -> None:
             writer({"progress": "draft_chunk", "text": text, **evt_base})
@@ -916,7 +914,8 @@ def artifact_plan_node(state: ResearchState, writer: StreamWriter) -> dict:
     logger.info("Starting claim-evidence graph planning (execution_id=%s)", execution_id)
 
     # Timeout guard: fail gracefully if LLM is unresponsive
-    timeout_sec = int(os.environ.get("ARTIFACT_PLAN_TIMEOUT", "30"))
+    # Default 120s — structured JSON generation via MaaS is slower than plain text
+    timeout_sec = int(os.environ.get("ARTIFACT_PLAN_TIMEOUT", "120"))
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(plan_claim_evidence_graph, state)
         try:
@@ -966,10 +965,10 @@ def artifact_plan_node(state: ResearchState, writer: StreamWriter) -> dict:
         "artifact_type": "claim_evidence_graph",
         "purpose": "Render a Claim-Evidence Graph from the accepted report",
         "command": [
-            "python3",
-            "/sandbox/app/claim_evidence_renderer.py",
-            "/sandbox/input/claim_evidence.json",
-            "/sandbox/output/claim-evidence.svg",
+            "/usr/bin/python3",
+            "/tmp/app/claim_evidence_renderer.py",
+            "/tmp/input/claim_evidence.json",
+            "/tmp/output/claim-evidence.svg",
         ],
         "permissions": exec_permissions,
     }
@@ -1042,7 +1041,8 @@ def sandbox_execute_node(state: ResearchState, writer: StreamWriter) -> dict:
     session_id = state.get("session_id", "")
 
     executor = get_executor()
-    sandbox_name = f"research-artifact-{session_id}-{execution_id}"
+    short_id = execution_id[:8] if execution_id else session_id[:8]
+    sandbox_name = f"ce-{short_id}"
 
     writer({
         "progress": "sandbox_scheduled",
@@ -1070,26 +1070,40 @@ def sandbox_execute_node(state: ResearchState, writer: StreamWriter) -> dict:
             ),
         )
 
+        writer({
+            "progress": "sandbox_creating",
+            "execution_id": execution_id,
+            "message": f"Creating sandbox (image: {config.image or 'gateway default'})...",
+        })
+
         sandbox_id = executor.create_sandbox(config)
 
         writer({
             "progress": "sandbox_running",
             "execution_id": execution_id,
             "sandbox_id": sandbox_id,
+            "message": "Sandbox ready — uploading inputs and executing renderer...",
         })
 
         import json as _json
         input_data = _json.dumps(spec, ensure_ascii=False).encode("utf-8")
-        executor.upload_inputs(sandbox_id, {"/sandbox/input/claim_evidence.json": input_data})
+
+        renderer_path = Path(__file__).resolve().parent.parent.parent / "harness" / "execution" / "renderers" / "claim_evidence_renderer.py"
+        renderer_bytes = renderer_path.read_bytes()
+
+        executor.upload_inputs(sandbox_id, {
+            "/tmp/input/claim_evidence.json": input_data,
+            "/tmp/app/claim_evidence_renderer.py": renderer_bytes,
+        })
 
         timeout = int(os.environ.get("OPENSHELL_TIMEOUT_SECONDS", "60"))
         result = executor.execute(
             sandbox_id,
             command=[
-                "python3",
-                "/sandbox/app/claim_evidence_renderer.py",
-                "/sandbox/input/claim_evidence.json",
-                "/sandbox/output/claim-evidence.svg",
+                "/usr/bin/python3",
+                "/tmp/app/claim_evidence_renderer.py",
+                "/tmp/input/claim_evidence.json",
+                "/tmp/output/claim-evidence.svg",
             ],
             timeout=timeout,
         )
@@ -1111,11 +1125,11 @@ def sandbox_execute_node(state: ResearchState, writer: StreamWriter) -> dict:
 
         outputs = executor.download_outputs(
             sandbox_id,
-            ["/sandbox/output/claim-evidence.svg", "/sandbox/output/artifact-metadata.json"],
+            ["/tmp/output/claim-evidence.svg", "/tmp/output/artifact-metadata.json"],
         )
 
-        svg_data = outputs.get("/sandbox/output/claim-evidence.svg", b"")
-        metadata_raw = outputs.get("/sandbox/output/artifact-metadata.json", b"")
+        svg_data = outputs.get("/tmp/output/claim-evidence.svg", b"")
+        metadata_raw = outputs.get("/tmp/output/artifact-metadata.json", b"")
 
         artifact_metadata = {}
         if metadata_raw:
@@ -1213,7 +1227,8 @@ def artifact_verify_node(state: ResearchState, writer: StreamWriter) -> dict:
     spec_nodes = spec.get("nodes", [])
     evidence_nodes = [n for n in spec_nodes if n.get("type") == "evidence"]
     accumulated = state.get("accumulated_context", [])
-    available_ids = {str(i) for i in range(1, len(accumulated) + 1)}
+    available_ids = {ctx.get("source_id", "") for ctx in accumulated if ctx.get("source_id")}
+    available_ids |= {str(i) for i in range(1, len(accumulated) + 1)}
     source_valid = all(
         n.get("source_id", "") in available_ids or not n.get("source_id")
         for n in evidence_nodes

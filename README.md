@@ -3,58 +3,7 @@
 A hands-on lab for building **custom deep research systems** using **harness engineering** on **Red Hat OpenShift AI (RHOAI)**. Upload documents, perform iterative deep research through a quality-driven feedback loop, and receive comprehensive analytical reports.
 
 ## Architecture
-
-```mermaid
-flowchart TB
-    subgraph UI ["User Interface"]
-        Browser(("Browser"))
-        NextJS["Next.js + assistant-ui\n:3000"]
-        Backend["FastAPI Backend\n:8000\n(AG-UI + SSE)"]
-    end
-
-    subgraph Orchestrator ["LangGraph Orchestrator"]
-        Graph["StateGraph\n(harness controller)"]
-        MCPClient["MCP Client"]
-        Context["Context Gatherer"]
-        Observability["Observability"]
-    end
-
-    subgraph Harness ["Iterative Harness — LangGraph Inner Loop"]
-        direction LR
-        Plan["1. Plan\ngenerate plan\nrewrite queries"]
-        Execute["2. Execute\nMCP tools\n(search, draft)"]
-        Verify["3. Verify\nLLM-as-Judge\ncitation check"]
-        Reflect["4. Reflect\nfailure hints\nweb-search expand"]
-        Plan --> Execute --> Verify --> Reflect
-        Reflect -- "score < threshold" --> Plan
-    end
-
-    subgraph MCP ["MCP Tool Layer · FastMCP · Streamable HTTP"]
-        VectorMCP["vector-search-mcp\n:9002\nsemantic search"]
-        WebMCP["web-search-mcp\n:9003\nweb search (DuckDuckGo)"]
-        VerifMCP["verification-mcp\n:9004\nscore, cite, fact-check"]
-    end
-
-    subgraph Infra ["Infrastructure"]
-        PG[("PostgreSQL\n+ pgvector\n(checkpointer + vectors)")]
-        MaaS["MaaS Gateway\n(RHOAI Model Serving)"]
-    end
-
-    Browser -- "HTTP" --> NextJS
-    NextJS -- "AG-UI over SSE" --> Backend
-    Backend -- "auto-start\nsubprocess" --> MCP
-    Backend -- "invoke graph" --> Graph
-    Backend -- "Docling direct" --> PG
-    Graph -.-> Harness
-    Graph -- "checkpointer" --> PG
-    Graph -- "LLM calls\n(OpenAI API)" --> MaaS
-    MCPClient -- "MCP\nstreamable-http" --> MCP
-    VectorMCP --> PG
-    VectorMCP -- "embedding" --> MaaS
-    VerifMCP -- "LLM scoring" --> MaaS
-```
-
-
+![architecture](./images/architecture.png)
 
 
 
