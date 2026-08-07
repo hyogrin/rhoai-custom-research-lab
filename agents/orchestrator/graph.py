@@ -245,7 +245,7 @@ _PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "4"))
 
 def _search_section(
     topic: dict, query: str, iteration: int, ws_flag: bool, parallel: bool,
-    document_id: str = "",
+    document_id: str = "", ws_limit: int = 2,
 ) -> dict:
     """Run search queries for a single section and return context + counts."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -263,7 +263,7 @@ def _search_section(
             for idx, q in enumerate(queries[:3]):
                 futures_map[pool.submit(_run_semantic, q, iteration, document_id)] = ("semantic", q)
                 if ws_flag and idx == 0:
-                    futures_map[pool.submit(_run_web, q, iteration)] = ("web", q)
+                    futures_map[pool.submit(_run_web, q, iteration, ws_limit)] = ("web", q)
 
             for future in as_completed(futures_map):
                 kind, q = futures_map[future]
@@ -285,11 +285,12 @@ def _search_section(
                 section_context.append(r)
                 semantic_count += 1
             if ws_flag and idx == 0:
-                for r in _run_web(q, iteration):
+                for r in _run_web(q, iteration, ws_limit):
                     r.setdefault("metadata", {})["sub_topic"] = title
                     section_context.append(r)
                     web_count += 1
 
+    logger.info("Section '%s' search: %d semantic, %d web results", title, semantic_count, web_count)
     return {
         "context": section_context,
         "semantic_count": semantic_count,
@@ -301,6 +302,7 @@ def _draft_and_build_section(
     topic: dict, query: str, search_result: dict,
     previous_content: str, failure_hints: str, language_instruction: str,
     stream_callback: Callable[[str], None] | None = None,
+    source_offset: int = 0,
 ) -> dict:
     """Draft a section from search results and return the section data."""
     title = topic.get("title", "Untitled")
@@ -312,6 +314,7 @@ def _draft_and_build_section(
         improvement_hints=failure_hints,
         language_instruction=language_instruction,
         stream_callback=stream_callback,
+        source_offset=source_offset,
     )
 
     section_data = {
@@ -398,6 +401,7 @@ def _execute_sections(state: ResearchState, writer: StreamWriter) -> dict:
             search_result = _search_section(
                 topic, state["query"], iteration, ws_flag, parallel,
                 document_id=target_doc_id,
+                ws_limit=state.get("web_search_limit", 2),
             )
         except Exception as e:
             logger.error("Section '%s' search failed: %s", title, e, exc_info=True)
@@ -437,6 +441,9 @@ def _execute_sections(state: ResearchState, writer: StreamWriter) -> dict:
         # --- Phase 2: Draft (with token streaming) ---
         writer({"progress": "drafting", **evt_base})
 
+        if idx > 1:
+            writer({"progress": "draft_chunk", "text": "\n\n---\n\n", **evt_base})
+
         def _on_draft_chunk(text: str) -> None:
             writer({"progress": "draft_chunk", "text": text, **evt_base})
 
@@ -453,6 +460,7 @@ def _execute_sections(state: ResearchState, writer: StreamWriter) -> dict:
                     state.get("failure_hints", ""),
                     state.get("language_instruction", ""),
                     stream_callback=_on_draft_chunk,
+                    source_offset=len(new_context),
                 )
 
                 if span:
@@ -492,22 +500,27 @@ def _execute_sections(state: ResearchState, writer: StreamWriter) -> dict:
     return update
 
 
-def _format_context_entry(ctx: dict) -> str:
-    """Format a context entry for LLM prompt, including source URL when available."""
+def _format_context_entry(ctx: dict, idx: int | None = None) -> str:
+    """Format a context entry for LLM prompt using stable source_id for citations."""
     metadata = ctx.get("metadata") or {}
     source = ctx.get("source", "unknown")
-    url = metadata.get("source_url", "")
+    src_id = ctx.get("source_id", "SRC_UNKNOWN")
+    doc_name = ctx.get("document_name", source)
+    url = metadata.get("source_url", "") or metadata.get("url", "")
     content = ctx.get("content", "")[:500]
+    header = f"[{src_id}: {doc_name}]"
     if url and url.startswith("http"):
-        return f"[{source}]({url})\n{content}"
-    return f"[{source}]\n{content}"
+        header = f"[{src_id}: {doc_name}]({url})"
+    return f"{header}\n{content}"
 
 
 def _run_semantic(query: str, iteration: int, document_id: str = "") -> list[dict]:
     """Run a single semantic_search and return context entries. Thread-safe.
 
     If document_id is provided, search is scoped to that document only.
+    Each entry gets a stable source_id based on the document name (not position).
     """
+    import hashlib
     seen: set = set()
     entries: list[dict] = []
     results = (
@@ -519,29 +532,43 @@ def _run_semantic(query: str, iteration: int, document_id: str = "") -> list[dic
         key = (r.get("document_id", ""), r.get("chunk_index", 0))
         if key not in seen:
             seen.add(key)
+            doc_name = r.get("document_name", "unknown")
+            source_url = r.get("source_url", "")
+            # Stable source_id: hash of document name (deduplicates chunks from same doc)
+            id_basis = source_url if (source_url and source_url.startswith("http")) else doc_name
+            src_id = "SRC_" + hashlib.sha256(id_basis.encode()).hexdigest()[:6].upper()
             entries.append({
                 "iteration": iteration,
-                "source": f"{r.get('document_name', 'unknown')}[{r.get('chunk_index', 0)}]",
+                "source": f"{doc_name}[{r.get('chunk_index', 0)}]",
+                "source_id": src_id,
+                "document_name": doc_name,
                 "content": r.get("content", ""),
                 "metadata": {
                     "similarity": r.get("similarity", 0),
-                    "source_url": r.get("source_url", ""),
-                    "document_name": r.get("document_name", ""),
+                    "source_url": source_url,
+                    "document_name": doc_name,
                     "chunk_index": r.get("chunk_index", 0),
                 },
             })
     return entries
 
 
-def _run_web(query: str, iteration: int) -> list[dict]:
+def _run_web(query: str, iteration: int, num_results: int = 2) -> list[dict]:
     """Run a single web_search and return context entries. Thread-safe."""
+    import hashlib
     entries: list[dict] = []
-    for wr in web_search(query, num_results=2):
+    results = web_search(query, num_results=num_results)
+    logger.info("web_search('%s', num_results=%d) → %d results", query[:80], num_results, len(results))
+    for wr in results:
+        url = wr.get("url", "")
+        src_id = "SRC_" + hashlib.sha256(url.encode()).hexdigest()[:6].upper()
         entries.append({
             "iteration": iteration,
-            "source": f"web:{wr.get('url', '')}",
+            "source": f"web:{url}",
+            "source_id": src_id,
+            "document_name": wr.get("title", url),
             "content": f"{wr.get('title', '')}\n{wr.get('content', '')}",
-            "metadata": {"type": "web_search", "url": wr.get("url", "")},
+            "metadata": {"type": "web_search", "url": url},
         })
     return entries
 
@@ -567,6 +594,7 @@ def execute_node(state: ResearchState, writer: StreamWriter) -> dict:
     ws_flag = state.get("enable_web_search", True)
     parallel = state.get("enable_parallel", True)
     target_doc_id = state.get("target_document_id", "")
+    ws_limit = state.get("web_search_limit", 2)
 
     search_steps = [s for s in plan[:4] if s.get("action", "search") in ("search", "web_search")]
     other_steps = [s for s in plan[:4] if s.get("action", "search") not in ("search", "web_search")]
@@ -578,7 +606,7 @@ def execute_node(state: ResearchState, writer: StreamWriter) -> dict:
                 q = step.get("query", state["query"])
                 futures_map[pool.submit(_run_semantic, q, iteration, target_doc_id)] = ("semantic", q)
                 if ws_flag:
-                    futures_map[pool.submit(_run_web, q, iteration)] = ("web", q)
+                    futures_map[pool.submit(_run_web, q, iteration, ws_limit)] = ("web", q)
 
             for future in as_completed(futures_map):
                 kind, q = futures_map[future]
@@ -600,7 +628,7 @@ def execute_node(state: ResearchState, writer: StreamWriter) -> dict:
             new_context.extend(_run_semantic(q, iteration, target_doc_id))
             observer.trace_tool_call(iteration=iteration, operation="semantic_search", input_summary=q[:200], output_summary="done", tokens_used=0)
             if ws_flag:
-                new_context.extend(_run_web(q, iteration))
+                new_context.extend(_run_web(q, iteration, ws_limit))
                 observer.trace_tool_call(iteration=iteration, operation="web_search", input_summary=q[:200], output_summary="done", tokens_used=0)
 
     for step in other_steps:
@@ -626,7 +654,10 @@ def execute_node(state: ResearchState, writer: StreamWriter) -> dict:
             )
 
     # Draft or improve the report (include source URLs for citation linking)
-    context_text = "\n\n".join(_format_context_entry(c) for c in new_context[-10:])
+    # Use source_id-based context formatting for the LLM
+    context_text = "\n\n".join(
+        _format_context_entry(c) for c in new_context[-10:]
+    )
     plan_text = json.dumps(plan)
 
     logger.info(
@@ -739,9 +770,28 @@ def observe_node(state: ResearchState) -> dict:
     if improvements:
         failure_hints += "\n" + "\n".join(f"- {imp}" for imp in improvements)
 
-    update = {
+    update: dict = {
         "failure_hints": failure_hints,
     }
+
+    # Dynamically increase web_search_limit when sources appear insufficient
+    if not passed:
+        current_limit = state.get("web_search_limit", 2)
+        max_limit = state.get("web_search_max_limit", 5)
+        if current_limit < max_limit:
+            details = state.get("verification_result", {}).get("quality_details", {})
+            needs_more_sources = (
+                details.get("completeness", 10) < 6
+                or details.get("source_quality", 10) < 6
+                or any(
+                    kw in imp.lower()
+                    for imp in improvements
+                    for kw in ("source", "evidence", "citation", "reference", "web", "depth")
+                )
+            )
+            if needs_more_sources:
+                update["web_search_limit"] = min(current_limit + 2, max_limit)
+
     return update
 
 
@@ -794,16 +844,42 @@ def iteration_review_node(state: ResearchState) -> dict:
             direction = raw
 
     if action == "accept" or iteration >= max_iterations:
-        return {"status": "finalizing", "human_direction": direction}
+        return {"status": "finalizing", "human_direction": direction, "quality_score": quality_score}
 
     return {"status": "planning", "human_direction": direction}
 
 
-def route_after_review(state: ResearchState) -> Literal["iterate", "finalize"]:
-    """Route after human review: iterate if user wants to continue, else finalize."""
+def route_after_review(state: ResearchState) -> Literal["iterate", "artifact_router"]:
+    """Route after human review: iterate if user wants to continue, else artifact branch."""
     if state.get("status") == "finalizing":
-        return "finalize"
+        return "artifact_router"
     return "iterate"
+
+
+def route_artifact(state: ResearchState) -> Literal["artifact_plan", "finalize"]:
+    """Route after artifact_router: plan if enabled, else finalize."""
+    if state.get("enable_claim_evidence_graph"):
+        return "artifact_plan"
+    return "finalize"
+
+
+def route_after_plan(state: ResearchState) -> Literal["permission_gate", "finalize"]:
+    """Route after artifact_plan: skip to finalize if planning failed."""
+    if state.get("artifact_status") == "failed":
+        return "finalize"
+    return "permission_gate"
+
+
+def route_after_permission(state: ResearchState) -> Literal["sandbox_execute", "finalize"]:
+    """Route after permission gate: execute if approved, else finalize."""
+    if state.get("execution_permission_decision") == "approved":
+        return "sandbox_execute"
+    return "finalize"
+
+
+def route_after_artifact_verification(state: ResearchState) -> Literal["finalize"]:
+    """Always routes to finalize after verification."""
+    return "finalize"
 
 
 def iterate_node(state: ResearchState) -> dict:
@@ -819,58 +895,441 @@ def iterate_node(state: ResearchState) -> dict:
     return update
 
 
-def _dedup_sources(accumulated_context: list[dict]) -> list[dict]:
-    """Deduplicate sources from accumulated context into a list of dicts.
+# --- Artifact Branch Nodes ---
 
-    Returns a 1-indexed list: [{"index": 1, "name": ..., "snippet": ..., "url": ..., "domain": ...}, ...]
-    The index matches the [Source N] numbering used in LLM prompts.
+
+def artifact_router_node(state: ResearchState, writer: StreamWriter) -> dict:
+    """Route: check if claim-evidence graph is enabled."""
+    if state.get("enable_claim_evidence_graph"):
+        return {"artifact_status": "planning"}
+    return {"artifact_status": "disabled"}
+
+
+def artifact_plan_node(state: ResearchState, writer: StreamWriter) -> dict:
+    """Plan the claim-evidence graph using LLM to generate structured spec."""
+    import concurrent.futures
+    from agents.orchestrator.artifact_planner import plan_claim_evidence_graph
+
+    execution_id = f"exec-{uuid.uuid4().hex[:8]}"
+
+    writer({"progress": "artifact_planning", "artifact_type": "claim_evidence_graph"})
+    logger.info("Starting claim-evidence graph planning (execution_id=%s)", execution_id)
+
+    # Timeout guard: fail gracefully if LLM is unresponsive
+    timeout_sec = int(os.environ.get("ARTIFACT_PLAN_TIMEOUT", "30"))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(plan_claim_evidence_graph, state)
+        try:
+            result = future.result(timeout=timeout_sec)
+        except concurrent.futures.TimeoutError:
+            logger.error("Claim-evidence planning timed out after %ds", timeout_sec)
+            writer({"progress": "execution_failed", "execution_id": execution_id, "stage": "artifact_plan", "error": f"Timed out ({timeout_sec}s)"})
+            return {
+                "artifact_status": "failed",
+                "artifact_execution_id": execution_id,
+                "claim_evidence_spec": {},
+                "sandbox_error": f"Planning timed out after {timeout_sec}s — model may not support this prompt size",
+                "total_tokens": state.get("total_tokens", 0),
+            }
+
+    spec = result.get("spec", {})
+    errors = result.get("errors", [])
+    tokens_used = result.get("tokens_used", 0)
+
+    total_tokens = state.get("total_tokens", 0) + tokens_used
+
+    if errors:
+        logger.warning("Claim-evidence spec errors: %s", errors)
+        writer({"progress": "execution_failed", "execution_id": execution_id, "stage": "artifact_plan", "error": errors[0][:200]})
+        return {
+            "artifact_status": "failed",
+            "artifact_execution_id": execution_id,
+            "claim_evidence_spec": {},
+            "sandbox_error": f"Planning failed: {'; '.join(errors[:3])}",
+            "total_tokens": total_tokens,
+        }
+
+    logger.info("Claim-evidence spec generated: %d nodes, %d edges", len(spec.get("nodes", [])), len(spec.get("edges", [])))
+
+    exec_permissions = {
+        "network": "deny",
+        "read_only": ["/sandbox/app", "/sandbox/input"],
+        "read_write": ["/sandbox/output", "/tmp"],
+        "cpu": os.environ.get("OPENSHELL_CPU", "500m"),
+        "memory": os.environ.get("OPENSHELL_MEMORY", "512Mi"),
+        "timeout_seconds": int(os.environ.get("OPENSHELL_TIMEOUT_SECONDS", "60")),
+    }
+
+    permission_request = {
+        "type": "execution_permission",
+        "execution_id": execution_id,
+        "artifact_type": "claim_evidence_graph",
+        "purpose": "Render a Claim-Evidence Graph from the accepted report",
+        "command": [
+            "python3",
+            "/sandbox/app/claim_evidence_renderer.py",
+            "/sandbox/input/claim_evidence.json",
+            "/sandbox/output/claim-evidence.svg",
+        ],
+        "permissions": exec_permissions,
+    }
+
+    writer({
+        "progress": "execution_proposed",
+        "execution_id": execution_id,
+        "artifact_type": "claim_evidence_graph",
+        "permission_summary": exec_permissions,
+    })
+
+    return {
+        "artifact_status": "permission_required",
+        "artifact_execution_id": execution_id,
+        "claim_evidence_spec": spec,
+        "execution_permission_request": permission_request,
+        "total_tokens": total_tokens,
+    }
+
+
+def permission_gate_node(state: ResearchState, writer: StreamWriter) -> dict:
+    """Gate: interrupt for user permission or auto-approve."""
+    permission_request = state.get("execution_permission_request", {})
+    execution_id = state.get("artifact_execution_id", "")
+    require_approval = os.environ.get("OPENSHELL_REQUIRE_APPROVAL", "true").lower() == "true"
+
+    if not require_approval:
+        writer({
+            "progress": "permission_approved",
+            "execution_id": execution_id,
+        })
+        return {"execution_permission_decision": "approved", "artifact_status": "approved"}
+
+    writer({
+        "progress": "permission_required",
+        "execution_id": execution_id,
+        "permissions": permission_request.get("permissions", {}),
+    })
+
+    user_response = interrupt(permission_request)
+
+    decision = "denied"
+    if isinstance(user_response, str):
+        raw = user_response.strip()
+        if raw == "__execution_approve__":
+            decision = "approved"
+    elif isinstance(user_response, dict):
+        action = user_response.get("action", "")
+        if action == "__execution_approve__":
+            decision = "approved"
+
+    if decision == "approved":
+        writer({"progress": "permission_approved", "execution_id": execution_id})
+        return {"execution_permission_decision": "approved", "artifact_status": "approved"}
+    else:
+        writer({
+            "progress": "execution_denied",
+            "execution_id": execution_id,
+            "reason": "User denied execution",
+        })
+        return {"execution_permission_decision": "denied", "artifact_status": "denied"}
+
+
+def sandbox_execute_node(state: ResearchState, writer: StreamWriter) -> dict:
+    """Execute the trusted renderer inside an OpenShell sandbox."""
+    from harness.execution.openshell_executor import get_executor
+
+    execution_id = state.get("artifact_execution_id", "")
+    spec = state.get("claim_evidence_spec", {})
+    session_id = state.get("session_id", "")
+
+    executor = get_executor()
+    sandbox_name = f"research-artifact-{session_id}-{execution_id}"
+
+    writer({
+        "progress": "sandbox_scheduled",
+        "execution_id": execution_id,
+        "sandbox_id": sandbox_name,
+    })
+
+    try:
+        from harness.execution.models import SandboxConfig
+        config = SandboxConfig(
+            name=sandbox_name,
+            image=os.environ.get("OPENSHELL_RENDERER_IMAGE", ""),
+            workspace=os.environ.get("OPENSHELL_WORKSPACE", "default"),
+            cpu=os.environ.get("OPENSHELL_CPU", "500m"),
+            memory=os.environ.get("OPENSHELL_MEMORY", "512Mi"),
+            labels={
+                "app": "rhoai-custom-research",
+                "artifact": "claim-evidence",
+                "session": session_id,
+                "execution": execution_id,
+            },
+            policy_path=os.environ.get(
+                "OPENSHELL_POLICY_PATH",
+                "config/openshell/claim-evidence-policy.yaml",
+            ),
+        )
+
+        sandbox_id = executor.create_sandbox(config)
+
+        writer({
+            "progress": "sandbox_running",
+            "execution_id": execution_id,
+            "sandbox_id": sandbox_id,
+        })
+
+        import json as _json
+        input_data = _json.dumps(spec, ensure_ascii=False).encode("utf-8")
+        executor.upload_inputs(sandbox_id, {"/sandbox/input/claim_evidence.json": input_data})
+
+        timeout = int(os.environ.get("OPENSHELL_TIMEOUT_SECONDS", "60"))
+        result = executor.execute(
+            sandbox_id,
+            command=[
+                "python3",
+                "/sandbox/app/claim_evidence_renderer.py",
+                "/sandbox/input/claim_evidence.json",
+                "/sandbox/output/claim-evidence.svg",
+            ],
+            timeout=timeout,
+        )
+
+        if result.exit_code != 0:
+            logger.error("Renderer exited with code %d: %s", result.exit_code, result.stderr[:500])
+            writer({
+                "progress": "execution_failed",
+                "execution_id": execution_id,
+                "stage": "sandbox_execute",
+                "error": f"Renderer exited with code {result.exit_code}",
+            })
+            return {
+                "sandbox_id": sandbox_id,
+                "sandbox_status": "failed",
+                "sandbox_error": f"Renderer exit code {result.exit_code}: {result.stderr[:200]}",
+                "artifact_status": "failed",
+            }
+
+        outputs = executor.download_outputs(
+            sandbox_id,
+            ["/sandbox/output/claim-evidence.svg", "/sandbox/output/artifact-metadata.json"],
+        )
+
+        svg_data = outputs.get("/sandbox/output/claim-evidence.svg", b"")
+        metadata_raw = outputs.get("/sandbox/output/artifact-metadata.json", b"")
+
+        artifact_metadata = {}
+        if metadata_raw:
+            try:
+                artifact_metadata = _json.loads(metadata_raw)
+            except _json.JSONDecodeError:
+                pass
+
+        artifact_id = f"artifact-{uuid.uuid4().hex[:8]}"
+
+        writer({
+            "progress": "artifact_created",
+            "execution_id": execution_id,
+            "artifact_id": artifact_id,
+            "format": "svg",
+        })
+
+        return {
+            "sandbox_id": sandbox_id,
+            "sandbox_status": "completed",
+            "artifact_status": "created",
+            "claim_evidence_artifact": {
+                "artifact_id": artifact_id,
+                "type": "claim_evidence_graph",
+                "format": "svg",
+                "svg_data": svg_data.decode("utf-8", errors="replace") if svg_data else "",
+                "metadata": artifact_metadata,
+                "execution_id": execution_id,
+                "title": spec.get("title", "Claim-Evidence Graph"),
+            },
+        }
+
+    except Exception as e:
+        logger.error("Sandbox execution failed: %s", e)
+        writer({
+            "progress": "execution_failed",
+            "execution_id": execution_id,
+            "stage": "sandbox_execute",
+            "error": str(e)[:200],
+        })
+        return {
+            "sandbox_id": sandbox_name,
+            "sandbox_status": "failed",
+            "sandbox_error": str(e)[:500],
+            "artifact_status": "failed",
+        }
+    finally:
+        try:
+            executor.delete_sandbox(sandbox_name)
+        except Exception as cleanup_err:
+            logger.warning("Sandbox cleanup failed: %s", cleanup_err)
+
+
+def artifact_verify_node(state: ResearchState, writer: StreamWriter) -> dict:
+    """Verify the generated SVG artifact for safety and completeness."""
+    import xml.etree.ElementTree as ET
+
+    execution_id = state.get("artifact_execution_id", "")
+    artifact = state.get("claim_evidence_artifact", {})
+    spec = state.get("claim_evidence_spec", {})
+
+    writer({"progress": "artifact_verifying", "execution_id": execution_id})
+
+    checks: dict[str, bool] = {}
+    svg_data = artifact.get("svg_data", "")
+
+    # Check 1: SVG exists
+    checks["file_exists"] = bool(svg_data)
+
+    # Check 2: Not empty and reasonable size
+    checks["size_valid"] = 0 < len(svg_data) < 2_000_000
+
+    # Check 3: Valid XML
+    valid_xml = False
+    if svg_data:
+        try:
+            ET.fromstring(svg_data)
+            valid_xml = True
+        except ET.ParseError:
+            pass
+    checks["valid_svg"] = valid_xml
+
+    # Check 4: No script tags
+    checks["no_scripts"] = "<script" not in svg_data.lower()
+
+    # Check 5: No external resources
+    has_external = False
+    for pattern in ["xlink:href=\"http", "href=\"http", "url(http"]:
+        if pattern in svg_data.lower():
+            has_external = True
+            break
+    checks["no_external_resources"] = not has_external
+
+    # Check 6: Source links valid — every evidence node references known source
+    spec_nodes = spec.get("nodes", [])
+    evidence_nodes = [n for n in spec_nodes if n.get("type") == "evidence"]
+    accumulated = state.get("accumulated_context", [])
+    available_ids = {str(i) for i in range(1, len(accumulated) + 1)}
+    source_valid = all(
+        n.get("source_id", "") in available_ids or not n.get("source_id")
+        for n in evidence_nodes
+    )
+    checks["source_links_valid"] = source_valid
+
+    # Check 7: Renderer exit code (already checked in sandbox_execute, infer from status)
+    checks["renderer_success"] = state.get("sandbox_status") == "completed"
+
+    passed = all(checks.values())
+
+    verification = {"passed": passed, "checks": checks}
+
+    if passed:
+        writer({"progress": "execution_completed", "execution_id": execution_id, "artifact": artifact})
+    else:
+        failed_checks = [k for k, v in checks.items() if not v]
+        logger.warning("Artifact verification failed: %s", failed_checks)
+        writer({
+            "progress": "execution_failed",
+            "execution_id": execution_id,
+            "stage": "artifact_verify",
+            "error": f"Verification failed: {', '.join(failed_checks)}",
+        })
+
+    return {
+        "artifact_verification": verification,
+        "artifact_status": "completed" if passed else "failed",
+    }
+
+
+def _build_source_registry(accumulated_context: list[dict]) -> dict[str, dict]:
+    """Build a source registry keyed by source_id from accumulated context.
+
+    Returns: {source_id: {name, url, snippet, domain}}
     """
     import re as _re
     from urllib.parse import urlparse
 
-    seen: dict[str, dict] = {}
+    registry: dict[str, dict] = {}
     for ctx in accumulated_context:
-        metadata = ctx.get("metadata") or {}
-        url = metadata.get("source_url", "")
-        raw_name = ctx.get("document_name", ctx.get("source", "")) or ""
-        doc_name = _re.sub(r"\[\d+\]$", "", raw_name).strip()
-        if not doc_name:
+        src_id = ctx.get("source_id", "")
+        if not src_id or src_id in registry:
             continue
-        key = url if (url and url.startswith("http")) else doc_name
-        if key not in seen:
-            snippet = (ctx.get("content", "") or "")[:150].strip()
-            domain = ""
-            if url and url.startswith("http"):
-                try:
-                    domain = urlparse(url).netloc
-                except Exception:
-                    domain = url[:40]
-            seen[key] = {"name": doc_name, "url": url if url.startswith("http") else "", "snippet": snippet, "domain": domain}
+        metadata = ctx.get("metadata") or {}
+        url = metadata.get("source_url", "") or metadata.get("url", "")
+        raw_name = ctx.get("document_name", ctx.get("source", "")) or ""
+        doc_name = _re.sub(r"\[\d+\]$", "", raw_name).strip() or src_id
+        snippet = (ctx.get("content", "") or "")[:150].strip()
+        domain = ""
+        if url and url.startswith("http"):
+            try:
+                domain = urlparse(url).netloc
+            except Exception:
+                domain = url[:40]
+        registry[src_id] = {
+            "name": doc_name,
+            "url": url if (url and url.startswith("http")) else "",
+            "snippet": snippet,
+            "domain": domain,
+        }
+    return registry
 
-    result = []
-    for idx, entry in enumerate(seen.values(), 1):
-        result.append({"index": idx, **entry})
-    return result
 
+def resolve_citations(text: str, accumulated_context: list[dict]) -> tuple[str, list[dict]]:
+    """Citation resolver: extract [[cite:SRC_ID]], validate, assign numbers, replace.
 
-def _build_references(accumulated_context: list[dict]) -> str:
-    """Build a markdown references section from context entries.
+    1. Extract all [[cite:SOURCE_ID]] tokens from text.
+    2. Validate each against the source registry.
+    3. Assign citation numbers by first-appearance order.
+    4. Replace [[cite:SRC_ID]] with [N](#cite-N).
+    5. Return (resolved_text, sources_list for frontend).
 
-    Each entry shows the citation badge number linked to #cite-N
-    followed by the document name (with URL if available).
+    Unknown/hallucinated source IDs are silently removed.
     """
-    sources = _dedup_sources(accumulated_context)
-    if not sources:
-        return ""
+    import re as _re
 
-    lines = []
-    for s in sources:
-        badge = f"[{s['index']}](#cite-{s['index']})"
-        if s["url"]:
-            lines.append(f"{badge} [{s['name']}]({s['url']})")
-        else:
-            lines.append(f"{badge} {s['name']}")
-    return "\n\n".join(lines)
+    registry = _build_source_registry(accumulated_context)
+
+    # Find all cited source IDs in order of appearance
+    cite_pattern = _re.compile(r"\[\[cite:(SRC_[A-Z0-9]+)\]\]")
+    all_cited = cite_pattern.findall(text)
+
+    # Assign sequential numbers by first appearance (only valid IDs)
+    id_to_num: dict[str, int] = {}
+    for src_id in all_cited:
+        if src_id in registry and src_id not in id_to_num:
+            id_to_num[src_id] = len(id_to_num) + 1
+
+    # Remove any legacy numeric citations the LLM might have produced
+    text = _re.sub(r"\[Source\s+\d+\](?!\()", "", text)
+    text = _re.sub(r"\[\d+\]\(#cite-\d+\)", "", text)
+
+    # Replace [[cite:SRC_ID]] with [N](#cite-N) or remove if invalid
+    def _replace_cite(m: _re.Match) -> str:
+        src_id = m.group(1)
+        num = id_to_num.get(src_id)
+        if num is None:
+            return ""
+        return f"[{num}](#cite-{num})"
+
+    resolved = cite_pattern.sub(_replace_cite, text)
+
+    # Build sources list for frontend (only actually cited sources)
+    sources_list = []
+    for src_id, num in sorted(id_to_num.items(), key=lambda x: x[1]):
+        entry = registry[src_id]
+        sources_list.append({
+            "index": num,
+            "name": entry["name"],
+            "url": entry["url"],
+            "snippet": entry["snippet"],
+            "domain": entry["domain"],
+        })
+
+    return resolved, sources_list
 
 
 def finalize_node(state: ResearchState) -> dict:
@@ -919,11 +1378,6 @@ def finalize_node(state: ResearchState) -> dict:
     else:
         output = state.get("current_draft", "")
 
-    # Build references section from accumulated context source URLs
-    references = _build_references(state.get("accumulated_context") or [])
-    if references:
-        output += f"\n\n---\n\n## References\n\n{references}"
-
     output += (
         f"\n\n---\n"
         f"*Research completed in {iterations} iteration(s) | "
@@ -935,19 +1389,44 @@ def finalize_node(state: ResearchState) -> dict:
 
     output = _fix_markdown_output(output)
 
-    sources_list = _dedup_sources(state.get("accumulated_context") or [])
+    # Resolve [[cite:SRC_ID]] → [N](#cite-N) and build sources list
+    accumulated_context = state.get("accumulated_context") or []
+    output, sources_list = resolve_citations(output, accumulated_context)
+
+    # Append references section (only actually cited sources, deterministic order)
+    if sources_list:
+        ref_lines = []
+        for s in sources_list:
+            badge = f"[{s['index']}](#cite-{s['index']})"
+            if s["url"]:
+                ref_lines.append(f"{badge} [{s['name']}]({s['url']})")
+            else:
+                ref_lines.append(f"{badge} {s['name']}")
+        references = "\n\n".join(ref_lines)
+        footer_marker = "\n\n---\n*Research completed"
+        if footer_marker in output:
+            output = output.replace(footer_marker, f"\n\n---\n\n## References\n\n{references}{footer_marker}")
+        else:
+            output += f"\n\n---\n\n## References\n\n{references}"
 
     update = {
         "final_output": output,
         "sources": sources_list,
         "total_cost": total_cost,
         "status": "complete",
+        "quality_score": score,
     }
+
+    # Preserve artifact metadata if present (never modify report text)
+    artifact = state.get("claim_evidence_artifact")
+    if artifact and state.get("artifact_status") == "completed":
+        update["claim_evidence_artifact"] = artifact
+
     return update
 
 
 def _fix_markdown_output(text: str) -> str:
-    """Ensure blank lines before headings, fix table formatting, convert citations to links."""
+    """Ensure blank lines before headings and fix table formatting."""
     import re
     text = re.sub(r"(\])\.(#{1,6}\s)", r"\1.\n\n\2", text)
     text = re.sub(r"(\|)\s*(#{1,6}\s)", r"\1\n\n\2", text)
@@ -956,13 +1435,6 @@ def _fix_markdown_output(text: str) -> str:
     text = re.sub(r" \| \| ", " |\n| ", text)
     text = re.sub(r"(\| :?-+:? (?:\| :?-+:? )*\|) (\|)", r"\1\n\2", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    # Convert [Source N] and [Source 1, Source 2] into citation badge links.
-    # Negative lookahead avoids transforming [Source N](url) which is already a link.
-    def _expand_cite(m: re.Match) -> str:
-        nums = re.findall(r"\d+", m.group(1))
-        return "".join(f"[{n}](#cite-{n})" for n in nums)
-
-    text = re.sub(r"\[Source (\d+(?:,\s*(?:Source\s*)?\d+)*)\](?!\()", _expand_cite, text)
     return text
 
 
@@ -981,6 +1453,11 @@ def build_graph(checkpointer=None):
     graph.add_node("observe", observe_node)
     graph.add_node("iteration_review", iteration_review_node)
     graph.add_node("iterate", iterate_node)
+    graph.add_node("artifact_router", artifact_router_node)
+    graph.add_node("artifact_plan", artifact_plan_node)
+    graph.add_node("permission_gate", permission_gate_node)
+    graph.add_node("sandbox_execute", sandbox_execute_node)
+    graph.add_node("artifact_verify", artifact_verify_node)
     graph.add_node("finalize", finalize_node)
 
     graph.set_entry_point("normalize")
@@ -999,9 +1476,23 @@ def build_graph(checkpointer=None):
     )
     graph.add_conditional_edges(
         "iteration_review", route_after_review,
-        {"iterate": "iterate", "finalize": "finalize"},
+        {"iterate": "iterate", "artifact_router": "artifact_router"},
     )
     graph.add_edge("iterate", "plan")
+    graph.add_conditional_edges(
+        "artifact_router", route_artifact,
+        {"artifact_plan": "artifact_plan", "finalize": "finalize"},
+    )
+    graph.add_conditional_edges(
+        "artifact_plan", route_after_plan,
+        {"permission_gate": "permission_gate", "finalize": "finalize"},
+    )
+    graph.add_conditional_edges(
+        "permission_gate", route_after_permission,
+        {"sandbox_execute": "sandbox_execute", "finalize": "finalize"},
+    )
+    graph.add_edge("sandbox_execute", "artifact_verify")
+    graph.add_edge("artifact_verify", "finalize")
     graph.add_edge("finalize", END)
 
     return graph.compile(checkpointer=checkpointer)

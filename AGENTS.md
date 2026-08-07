@@ -4,6 +4,10 @@ A research system that performs custom deep research on uploaded documents using
 harness engineering — an iterative plan-execute-verify-reflect loop that evolves
 research quality through multiple passes.
 
+This file (`AGENTS.md`) is the **LangGraph inner loop definition** — it specifies
+the orchestrator's behavior, MCP tool contracts, quality thresholds, and iteration
+semantics. The actual harness implementation lives in `agents/orchestrator/graph.py`.
+
 ## Architecture
 
 ```
@@ -11,17 +15,44 @@ User Query + Documents
         │
         ▼
 ┌─────────────────────────────────────────────────────────┐
-│             AGENTS.md  Harness  (inner loop)            │
+│        LangGraph Orchestrator — Iterative Harness       │
+│     (inner loop defined in AGENTS.md specification)     │
 │                                                         │
 │   1. Plan        ─→  2. Execute   ─→  3. Verify        │
-│   generate plan      use MCP tools     quality scoring  │
-│   rewrite queries    (vector-search,   citation check   │
-│   load context        web-search)      fact check       │
+│   generate plan      MCP tools:       LLM-as-Judge     │
+│   rewrite queries    · vector-search  quality scoring   │
+│   section planning   · web-search     citation check    │
 │        ↑                                   │            │
 │        └──── 4. Reflect (fix failures) ────┘            │
-│              trace collection                           │
-│              failure memory                             │
-│              cost tracking                              │
+│              dynamic web-search expansion               │
+│              failure hints for next iteration            │
+│              quality threshold check                    │
+└─────────────────────────────────────────────────────────┘
+        │ (accept or max_iterations)
+        ▼
+┌─────────────────────────────────────────────────────────┐
+│              Finalize + Citation Resolution              │
+│                                                         │
+│   [[cite:SRC_ID]] → [N](#cite-N) (deterministic)       │
+│   Source registry → numbered References section         │
+└─────────────────────────────────────────────────────────┘
+        │ (optional, if enabled)
+        ▼
+┌─────────────────────────────────────────────────────────┐
+│     Optional Claim-Evidence Graph (artifact branch)     │
+│                                                         │
+│   artifact_router → artifact_plan → permission_gate     │
+│                                          │              │
+│                         ┌────────────────┤              │
+│                         ▼ (approved)     ▼ (denied)     │
+│                   sandbox_execute      finalize          │
+│                         │                               │
+│                         ▼                               │
+│                   artifact_verify → finalize             │
+│                                                         │
+│   Execution: NVIDIA OpenShell (policy-controlled)       │
+│   Renderer: trusted Python script (networkx SVG)        │
+│   Network: deny-all (Landlock enforced)                 │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -49,15 +80,16 @@ User Query + Documents
 
 ## MCP Tools Available
 
-All capabilities are exposed as FastMCP servers with **streamable-http** transport
-for standardized, network-accessible, horizontally scalable access:
+Active MCP servers (FastMCP, **streamable-http** transport):
 
 | MCP Server | Port | Tools | Harness Phase |
 |------------|------|-------|---------------|
 | `vector-search-mcp` | 9002 | `semantic_search`, `search_by_document`, `get_chunk_context` | Execute |
-| `web-search-mcp` | 9003 | `web_search` | Execute |
+| `web-search-mcp` | 9003 | `web_search` (SearXNG + DuckDuckGo fallback) | Execute |
 | `verification-mcp` | 9004 | `quality_score`, `validate_citations`, `fact_check`, `llm_as_judge`, `run_verification` | Verify |
-| `observability-mcp` | 9005 | `record_trace`, `record_failure`, `get_metrics`, `get_failure_hints`, `get_past_failure_patterns` | Reflect |
+
+The `observability-mcp` (port 9005) server is started but currently unused — observability
+is handled in-process by `HarnessObserver` (`agents/orchestrator/layers/observability.py`).
 
 Document ingestion (Docling → embedding → pgvector) is handled directly by the backend API — no MCP indirection needed.
 Query rewriting, context synthesis, research planning, and report drafting are performed as direct LLM calls within the orchestrator (no MCP overhead for pure prompt operations).
@@ -73,11 +105,62 @@ Query rewriting, context synthesis, research planning, and report drafting are p
 ```
 0_setup/                  — Environment and model setup
 1_document_processing/    — Docling + pgvector (data foundation)
-2_tool_layer/             — MCP tool servers (vector-search, web-search, verification, observability)
-3_harness_engineering/    — AGENTS.md concept + iterative inner loop + long transaction
+2_tool_layer/             — MCP tool servers (vector-search, web-search, verification)
+3_harness_engineering/    — Iterative inner loop concept + long transaction pattern
 4_agent_orchestration/    — LangGraph orchestrator + system integration
 5_deployment/             — OpenShift deployment with Helm
 6_evaluation/             — Quality and performance evaluation
+```
+
+## Claim-Evidence Graph (Optional Artifact)
+
+After the user accepts a research report, the system can optionally generate a
+Claim-Evidence Graph — a visual SVG showing key claims and their supporting or
+contradicting evidence.
+
+### How It Works
+
+1. **Toggle**: Enabled via `enableClaimEvidenceGraph` in Research Settings (default: off)
+2. **Planning**: LLM extracts claims and evidence from the report as structured JSON
+3. **Permission Gate**: User must approve sandbox execution (HITL interrupt)
+4. **Sandbox Execution**: Trusted renderer runs inside an NVIDIA OpenShell sandbox
+5. **Verification**: SVG is validated (no scripts, no external URLs, valid XML)
+6. **Display**: Graph is shown below the research report in the UI
+
+### Security Model
+
+- Sandbox runs with **deny-all network** policy (Landlock enforced)
+- Only a trusted, repository-controlled renderer executes
+- LLM generates structured JSON only — never executable code
+- Execution permissions are managed separately from research settings
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENSHELL_RENDERER_IMAGE` | (required) | Container image with Python + networkx + matplotlib |
+| `OPENSHELL_WORKSPACE` | `default` | OpenShell workspace |
+| `OPENSHELL_CPU` | `500m` | CPU limit |
+| `OPENSHELL_MEMORY` | `512Mi` | Memory limit |
+| `OPENSHELL_TIMEOUT_SECONDS` | `60` | Execution timeout |
+| `OPENSHELL_POLICY_PATH` | `config/openshell/claim-evidence-policy.yaml` | Security policy |
+| `OPENSHELL_REQUIRE_APPROVAL` | `true` | Whether to interrupt for user approval |
+
+### SSE Events
+
+The artifact branch emits these progress events visible in step history:
+
+```
+artifact_planning → execution_proposed → permission_required →
+permission_approved → sandbox_scheduled → sandbox_running →
+artifact_created → artifact_verifying → execution_completed
+```
+
+### Testing
+
+```bash
+uv run pytest tests/test_artifact_graph.py -v   # Unit tests (mocked OpenShell)
+RUN_OPENSHELL_INTEGRATION_TESTS=true uv run pytest tests/test_openshell_integration.py  # Integration (requires gateway)
 ```
 
 ## Running the System
@@ -85,13 +168,34 @@ Query rewriting, context synthesis, research planning, and report drafting are p
 ### Local Development
 
 ```bash
-cp sample.env .env        # Configure model endpoints + infra URLs
-uv sync                   # Install Python dependencies
-docker compose up -d      # Start PostgreSQL + pgvector
+cp sample.env .env        # Configure model endpoints
+make setup                # Install Python deps + provision PostgreSQL (auto-detects cluster vs local)
 cd frontend-next && npm install && cd ..  # Install frontend dependencies
 make backend-start        # Start backend + auto-start all 4 MCP servers
 make frontend-start       # Start Next.js UI (separate terminal)
 ```
+
+`make setup` runs `uv sync` + `scripts/setup.sh` which:
+- Auto-detects if you're on a cluster (`oc whoami`) or local Docker
+- Provisions PostgreSQL + pgvector with DDL initialization
+- Updates `.env` with `POSTGRES_URL`
+- Checks for OpenShell availability (admin prerequisite, not installed here)
+
+For advanced use:
+```bash
+./scripts/setup-postgres.sh     # PostgreSQL only (standalone)
+./scripts/setup.sh --connect-only    # Port-forward to existing cluster PostgreSQL
+```
+
+### Prerequisites (Admin)
+
+| Component | Scope | Provisioned by |
+|-----------|-------|----------------|
+| PostgreSQL + pgvector | Lab-owned | `make setup` (automatic) |
+| OpenShell gateway | Cluster-shared | Cluster admin (see [install guide](https://docs.nvidia.com/openshell/latest/installation.html)) |
+
+OpenShell is only required for the optional Claim-Evidence Graph feature.
+The core research workflow works without it.
 
 ### Frontend-Backend Protocol
 

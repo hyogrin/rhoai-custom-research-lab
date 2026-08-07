@@ -44,6 +44,10 @@ class ResearchState(TypedDict):
     enable_parallel: bool
     enable_sectioned: bool
 
+    # Web search limits (dynamic — Reflect can increase up to max)
+    web_search_limit: int       # current effective limit per query (default: 2)
+    web_search_max_limit: int   # cap (default: 5)
+
     # Sectioned report (used when SECTIONED_REPORT=true)
     report_sections: list[dict]   # [{sub_topic, content, search_context, score, status}]
     section_order: list[str]      # sub_topic titles in planned order
@@ -61,6 +65,19 @@ class ResearchState(TypedDict):
 
     # Structured sources for frontend citation badges
     sources: list[dict]
+
+    # Claim-Evidence Graph artifact
+    enable_claim_evidence_graph: bool
+    artifact_status: str  # disabled|planning|permission_required|approved|denied|scheduled|running|created|verifying|completed|failed
+    artifact_execution_id: str
+    claim_evidence_spec: dict
+    execution_permission_request: dict
+    execution_permission_decision: str
+    sandbox_id: str
+    sandbox_status: str
+    sandbox_error: str
+    claim_evidence_artifact: dict
+    artifact_verification: dict
 
     # Control flow
     status: str  # normalizing|planning|researching|writing|verifying|observing|complete|failed

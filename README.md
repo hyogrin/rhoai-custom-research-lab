@@ -19,21 +19,20 @@ flowchart TB
         Observability["Observability Layer"]
     end
 
-    subgraph Harness ["AGENTS.md Harness — Iterative Inner Loop"]
+    subgraph Harness ["Iterative Harness — LangGraph Inner Loop"]
         direction LR
         Plan["1. Plan\ngenerate plan\nrewrite queries"]
-        Execute["2. Execute\nuse MCP tools\n(search, draft)"]
-        Verify["3. Verify\nquality scoring\ncitation + fact check"]
-        Reflect["4. Reflect\nfailure memory\ncost tracking"]
+        Execute["2. Execute\nMCP tools\n(search, draft)"]
+        Verify["3. Verify\nLLM-as-Judge\ncitation check"]
+        Reflect["4. Reflect\nfailure hints\nweb-search expand"]
         Plan --> Execute --> Verify --> Reflect
         Reflect -- "score < threshold" --> Plan
     end
 
     subgraph MCP ["MCP Tool Layer · FastMCP · Streamable HTTP"]
         VectorMCP["vector-search-mcp\n:9002\nsemantic search"]
-        WebMCP["web-search-mcp\n:9003\nweb search (SearXNG)"]
+        WebMCP["web-search-mcp\n:9003\nweb search (DuckDuckGo)"]
         VerifMCP["verification-mcp\n:9004\nscore, cite, fact-check"]
-        ObsMCP["observability-mcp\n:9005\ntrace, failure, metrics"]
     end
 
     subgraph Infra ["Infrastructure"]
@@ -56,49 +55,65 @@ flowchart TB
     VectorMCP --> vLLM
 ```
 
+
+
+
+
 ### Harness Inner Loop Detail
 
 ```
     ┌──────────┐     ┌──────────┐     ┌──────────┐
     │  1.Plan  │────▶│2.Execute │────▶│ 3.Verify │
-    │ generate │     │ MCP tool │     │ quality  │
-    │  plan    │     │ calls    │     │ scoring  │
+    │ generate │     │ MCP tool │     │LLM-as-   │
+    │  plan    │     │ calls    │     │  Judge   │
     └──────────┘     └──────────┘     └─────┬────┘
          ▲                                  │
          │           ┌──────────┐           │
          └───────────│4.Reflect │◀──────────┘
         score <      │ failure  │
-        threshold    │ memory   │  ──▶ Human Review
+        threshold    │ hints    │  ──▶ Human Review
                      └──────────┘      (interrupt when max iterations reached)
     Iterations stop when score >= QUALITY_THRESHOLD or MAX_ITERATIONS reached.
     At max iterations, a human-in-the-loop review is triggered.
+
+    AGENTS.md = LangGraph inner loop definition (specification, not the harness itself)
 ```
+
+
 
 ## Key Technologies
 
-| Component | Technology | Purpose |
-|-----------|-----------|---------|
-| Harness Engineering | AGENTS.md | Project-specific agent instructions, inner loop definition |
-| Orchestration | LangGraph | Stateful graph-based harness controller |
-| Protocol (Frontend-Backend) | AG-UI over SSE | Real-time agent-user interaction protocol |
-| Tool Protocol | MCP (Model Context Protocol) | Standardized tool exposure via FastMCP + streamable-http |
-| Document Intelligence | Docling | PDF/DOCX/PPTX parsing, table extraction, OCR |
-| Persistence | PostgreSQL + pgvector | Checkpointing, chat history, and semantic search |
-| Object Storage | MinIO | Document file storage |
-| Model Serving | RHOAI vLLM | LLM and embedding inference |
-| Web UI | Next.js + assistant-ui | Interactive research with AG-UI streaming |
+
+| Component                   | Technology                   | Purpose                                                    |
+| --------------------------- | ---------------------------- | ---------------------------------------------------------- |
+| Harness Engineering         | AGENTS.md                    | LangGraph inner loop definition (specification)            |
+| Orchestration               | LangGraph                    | Stateful graph-based harness controller                    |
+| Protocol (Frontend-Backend) | AG-UI over SSE               | Real-time agent-user interaction protocol                  |
+| Tool Protocol               | MCP (Model Context Protocol) | Standardized tool exposure via FastMCP + streamable-http   |
+| Document Intelligence       | Docling                      | PDF/DOCX/PPTX parsing, table extraction, OCR               |
+| Persistence                 | PostgreSQL + pgvector        | Checkpointing, chat history, and semantic search           |
+| Object Storage              | MinIO                        | Document file storage                                      |
+| Model Serving               | RHOAI vLLM                   | LLM and embedding inference                                |
+| Web UI                      | Next.js + assistant-ui       | Interactive research with AG-UI streaming                  |
+
+
+
 
 ## Lab Flow
 
-| Phase | Folder | Focus | Key Outcome |
-|-------|--------|-------|-------------|
-| **0** | `0_setup/` | Environment & model setup | Cluster ready, model endpoints verified |
-| **1** | `1_document_processing/` | Docling + pgvector | Documents parsed, chunked, embedded |
-| **2** | `2_tool_layer/` | MCP tool servers | All MCP tools built and tested (vector-search, web-search, verification, observability) |
-| **3** | `3_harness_engineering/` | AGENTS.md + inner loop | Iterative harness with quality-driven research |
-| **4** | `4_agent_orchestration/` | LangGraph system integration | Full pipeline wired and tested end-to-end |
-| **5** | `5_deployment/` | OpenShift deployment | System running on cluster via Helm |
-| **6** | `6_evaluation/` | Quality & performance | Research quality metrics validated |
+
+| Phase | Folder                   | Focus                        | Key Outcome                                                                             |
+| ----- | ------------------------ | ---------------------------- | --------------------------------------------------------------------------------------- |
+| **0** | `0_setup/`               | Environment & model setup    | Cluster ready, model endpoints verified                                                 |
+| **1** | `1_document_processing/` | Docling + pgvector           | Documents parsed, chunked, embedded                                                     |
+| **2** | `2_tool_layer/`          | MCP tool servers             | All MCP tools built and tested (vector-search, web-search, verification)            |
+| **3** | `3_harness_engineering/` | Iterative inner loop         | Quality-driven research with plan-execute-verify-reflect                            |
+| **4** | `4_agent_orchestration/` | LangGraph system integration | Full pipeline wired and tested end-to-end                                               |
+| **5** | `5_deployment/`          | OpenShift deployment         | System running on cluster via Helm                                                      |
+| **6** | `6_evaluation/`          | Quality & performance        | Research quality metrics validated                                                      |
+
+
+
 
 ## Quick Start
 
@@ -109,7 +124,7 @@ git clone https://github.com/hyogrin/rhoai-custom-research-lab.git
 cd rhoai-custom-research-lab
 ```
 
-2. Configure environment:
+1. Configure environment:
 
 ```bash
 cp sample.env .env
@@ -117,26 +132,21 @@ cp sample.env .env
 # Models must be pre-deployed on RHOAI or any OpenAI-compatible endpoint
 ```
 
-3. Install Python dependencies:
+1. Setup (Python deps + PostgreSQL — auto-detects cluster vs local):
 
 ```bash
-uv sync
+make setup
 ```
 
-4. Install frontend dependencies:
+1. Install frontend dependencies:
 
 ```bash
 cd frontend-next && npm install && cd ..
 ```
 
-5. Start local services:
+1. Follow phases 0–6 in order.
 
-```bash
-docker compose up -d   # PostgreSQL+pgvector
-make dev-up            # MinIO, SearXNG (if not using docker-compose)
-```
 
-6. Follow phases 0–6 in order.
 
 ## Running the UI
 
@@ -144,32 +154,36 @@ The project includes a web UI (Next.js frontend + FastAPI backend) for interacti
 
 ```mermaid
 flowchart LR
-    A["docker compose up -d"] --> B["make backend-start"]
+    A["make setup"] --> B["make backend-start"]
     B --> C["make frontend-start"]
-    B -. "auto-starts\n4 MCP servers\nas subprocesses" .-> D["MCP :9002-9005"]
+    A -. "uv sync +\nPostgreSQL provisioning\n+ .env update" .-> E["Ready"]
+    B -. "auto-starts\n3 MCP servers\nas subprocesses" .-> D["MCP :9002-9004"]
 ```
 
-1. Start infrastructure (only once):
+
+
+1. Setup (first time only — Python deps + PostgreSQL):
 
 ```bash
-docker compose up -d   # PostgreSQL + pgvector
+make setup             # uv sync + auto-detect env + provision PostgreSQL + update .env
 ```
 
-2. Start the backend API (auto-starts all 4 MCP servers):
+1. Start the backend API (auto-starts MCP servers):
 
 ```bash
-make backend-start     # FastAPI :8000 + MCP :9002-9005
+make backend-start     # FastAPI :8000 + MCP :9002-9004
 ```
 
-3. Start the frontend (in a separate terminal):
+1. Start the frontend (in a separate terminal):
 
 ```bash
 make frontend-start    # Next.js on port 3000
 ```
 
-4. Open http://localhost:3000 in your browser.
+1. Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 The UI supports:
+
 - **Document upload** — PDF and text files via drag-and-drop
 - **Real-time AG-UI streaming** — Harness phases (Plan, Execute, Verify, Reflect) shown as interactive step cards with thinking/reasoning visibility
 - **Human-in-the-loop** — Review component with quality score gauge and accept/continue actions when max iterations reached
@@ -186,28 +200,37 @@ make ui-stop           # Stops backend + frontend + MCP servers
 docker compose down    # Stops PostgreSQL
 ```
 
+
+
 ## System Ports
 
-| Service | Port | Protocol | Description |
-|---------|------|----------|-------------|
-| Next.js Frontend | 3000 | HTTP | Web UI (assistant-ui + AG-UI runtime) |
-| FastAPI Backend | 8000 | HTTP + AG-UI SSE | API server (AG-UI endpoint, auto-starts MCP subprocesses) |
-| vector-search-mcp | 9002 | MCP (streamable-http) | Semantic search over pgvector |
-| web-search-mcp | 9003 | MCP (streamable-http) | Web search via SearXNG |
-| verification-mcp | 9004 | MCP (streamable-http) | Quality score, citation/fact check |
-| observability-mcp | 9005 | MCP (streamable-http) | Traces, failures, metrics |
-| PostgreSQL | 5432 | TCP | Checkpointing, chat history, pgvector |
+
+| Service                     | Port | Protocol              | Description                                               |
+| --------------------------- | ---- | --------------------- | --------------------------------------------------------- |
+| Next.js Frontend            | 3000 | HTTP                  | Web UI (assistant-ui + AG-UI runtime)                     |
+| FastAPI Backend             | 8000 | HTTP + AG-UI SSE      | API server (AG-UI endpoint, auto-starts MCP subprocesses) |
+| vector-search-mcp           | 9002 | MCP (streamable-http) | Semantic search over pgvector                             |
+| web-search-mcp              | 9003 | MCP (streamable-http) | Web search via DuckDuckGo (SearXNG optional)              |
+| verification-mcp            | 9004 | MCP (streamable-http) | Quality score, citation/fact check                        |
+| PostgreSQL                  | 5432 | TCP                   | Checkpointing, chat history, pgvector                     |
+
+
+
 
 ## Prerequisites
 
-| Component | Version | Purpose |
-|-----------|---------|---------|
-| Red Hat OpenShift | 4.17+ | Container platform |
-| OpenShift AI (RHOAI) | 3.4+ | Model serving (vLLM) |
-| Python | 3.11+ | Lab notebooks and agent code |
-| Node.js | 22+ | Frontend (Next.js) |
-| uv | 0.4+ | Python package manager |
-| Docker/Podman | Latest | PostgreSQL container |
+
+| Component            | Version | Purpose                      |
+| -------------------- | ------- | ---------------------------- |
+| Red Hat OpenShift    | 4.17+   | Container platform           |
+| OpenShift AI (RHOAI) | 3.4+    | Model serving (vLLM)         |
+| Python               | 3.11+   | Lab notebooks and agent code |
+| Node.js              | 22+     | Frontend (Next.js)           |
+| uv                   | 0.4+    | Python package manager       |
+| Docker/Podman        | Latest  | PostgreSQL container         |
+
+
+
 
 ## References
 
@@ -218,3 +241,4 @@ docker compose down    # Stops PostgreSQL
 - [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) — Tool protocol standard
 - [Docling](https://github.com/docling-project/docling) — Document intelligence
 - [FastMCP](https://github.com/jlowin/fastmcp) — Python MCP server framework
+

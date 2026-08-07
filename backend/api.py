@@ -89,6 +89,93 @@ def _start_mcp_servers():
         logger.info("All %d MCP servers ready (%ds)", len(MCP_SERVERS), waited)
 
 
+def _ensure_openshell_gateway():
+    """Ensure the OpenShell gateway is available when claim-evidence graph is enabled.
+
+    The gateway runs as a Docker container via docker-compose (profile: openshell).
+    This is platform-agnostic — works on macOS, Linux, Windows with Docker Desktop.
+    """
+    import shutil
+
+    if not os.environ.get("OPENSHELL_RENDERER_IMAGE"):
+        logger.info("OPENSHELL_RENDERER_IMAGE not set — skipping OpenShell gateway setup")
+        return
+
+    # Check if gateway is already reachable
+    gateway_url = os.environ.get("OPENSHELL_GATEWAY_URL", "http://127.0.0.1:8080")
+    try:
+        import urllib.request
+        req = urllib.request.Request(f"{gateway_url.rstrip('/')}/healthz", method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            if resp.status == 200:
+                logger.info("OpenShell gateway already running at %s", gateway_url)
+                return
+    except Exception:
+        pass
+
+    # Start gateway via docker compose (openshell profile)
+    logger.info("Starting OpenShell gateway via docker compose...")
+    compose_file = os.path.join(os.path.dirname(__file__), "..", "docker-compose.yml")
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "-f", compose_file, "--profile", "openshell", "up", "-d", "openshell-gateway"],
+            capture_output=True, text=True, timeout=60,
+            cwd=os.path.join(os.path.dirname(__file__), ".."),
+        )
+        if result.returncode == 0:
+            logger.info("OpenShell gateway container started")
+        else:
+            logger.warning("Failed to start OpenShell gateway: %s", result.stderr[:300])
+            return
+    except FileNotFoundError:
+        logger.warning("docker not found — cannot start OpenShell gateway. Install Docker Desktop.")
+        return
+    except subprocess.TimeoutExpired:
+        logger.warning("OpenShell gateway startup timed out")
+        return
+
+    # Wait for gateway to be healthy
+    max_wait, interval = 15, 2
+    waited = 0
+    while waited < max_wait:
+        time.sleep(interval)
+        waited += interval
+        try:
+            req = urllib.request.Request(f"{gateway_url.rstrip('/')}/healthz", method="GET")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                if resp.status == 200:
+                    logger.info("OpenShell gateway healthy (%ds)", waited)
+                    break
+        except Exception:
+            continue
+    else:
+        logger.warning("OpenShell gateway not healthy after %ds — sandbox execution may fail", max_wait)
+
+    # Register gateway with CLI if available
+    openshell_bin = shutil.which("openshell")
+    if openshell_bin:
+        subprocess.run(
+            [openshell_bin, "gateway", "add", gateway_url, "--local", "--name", "docker-local"],
+            capture_output=True, timeout=10,
+        )
+
+    # Install Python SDK if not available
+    try:
+        import openshell  # noqa: F401
+    except ImportError:
+        logger.info("Installing openshell Python SDK...")
+        try:
+            subprocess.run(
+                ["uv", "pip", "install", "openshell", "-q"],
+                capture_output=True, timeout=60,
+            )
+        except FileNotFoundError:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "openshell", "-q"],
+                capture_output=True, timeout=60,
+            )
+
+
 def _stop_mcp_servers():
     """Gracefully stop tracked MCP subprocesses (ones this process started)."""
     for proc in _mcp_processes:
@@ -144,6 +231,7 @@ signal.signal(signal.SIGINT, _signal_handler)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _start_mcp_servers()
+    _ensure_openshell_gateway()
 
     # Initialize PostgreSQL checkpointer if configured
     pg_url = os.getenv("POSTGRES_URL", "")
@@ -243,7 +331,12 @@ async def _stream_agui(run_id: str, thread_id: str, query: str, settings: dict, 
 
     if resume_direction:
         from langgraph.types import Command
-        graph_input = Command(resume={"action": "continue", "direction": resume_direction})
+        if resume_direction == "__accept__":
+            graph_input = Command(resume={"action": "accept", "direction": ""})
+        elif resume_direction in ("__execution_approve__", "__execution_deny__"):
+            graph_input = Command(resume=resume_direction)
+        else:
+            graph_input = Command(resume={"action": "continue", "direction": resume_direction})
     else:
         graph_input = {
             "session_id": thread_id[:12] if thread_id else str(uuid.uuid4())[:12],
@@ -269,6 +362,19 @@ async def _stream_agui(run_id: str, thread_id: str, query: str, settings: dict, 
             "enable_fact_check": settings.get("enableFactCheck", True),
             "enable_parallel": settings.get("enableParallel", True),
             "enable_sectioned": settings.get("enableSectioned", True),
+            "enable_claim_evidence_graph": settings.get("enableClaimEvidenceGraph", False),
+            "web_search_limit": settings.get("webSearchLimit", 2),
+            "web_search_max_limit": settings.get("webSearchMaxLimit", 5),
+            "artifact_status": "disabled",
+            "artifact_execution_id": "",
+            "claim_evidence_spec": {},
+            "execution_permission_request": {},
+            "execution_permission_decision": "",
+            "sandbox_id": "",
+            "sandbox_status": "",
+            "sandbox_error": "",
+            "claim_evidence_artifact": {},
+            "artifact_verification": {},
             "report_sections": [],
             "section_order": [],
             "failing_sections": [],
@@ -423,24 +529,44 @@ async def _stream_agui(run_id: str, thread_id: str, query: str, settings: dict, 
                 break
 
         if interrupt_data:
-            logger.info("[agui] Graph interrupted for review: %s", interrupt_data)
-            if text_started:
-                yield _agui_event({"type": "TEXT_MESSAGE_END", "messageId": msg_id})
+            # Determine interrupt type
+            is_execution_permission = (
+                isinstance(interrupt_data, dict)
+                and interrupt_data.get("type") == "execution_permission"
+            )
 
-            yield _agui_event({"type": "CUSTOM", "name": "iteration_review", "value": interrupt_data})
-            yield _agui_event({"type": "STATE_SNAPSHOT", "snapshot": {
-                "steps": accumulated_steps,
-                "verbose": accumulated_verbose,
-                "iteration_review": interrupt_data,
-            }})
+            if is_execution_permission:
+                logger.info("[agui] Graph interrupted for execution permission: %s", interrupt_data.get("execution_id"))
+                if text_started:
+                    yield _agui_event({"type": "TEXT_MESSAGE_END", "messageId": msg_id})
 
-            review_msg = _format_review_message(interrupt_data, language)
-            yield _agui_event({
-                "type": "MESSAGES_SNAPSHOT",
-                "messages": [{"id": msg_id, "role": "assistant", "content": review_msg}],
-            })
+                yield _agui_event({"type": "CUSTOM", "name": "execution_permission", "value": interrupt_data})
+                yield _agui_event({"type": "STATE_SNAPSHOT", "snapshot": {
+                    "steps": accumulated_steps,
+                    "verbose": accumulated_verbose,
+                    "execution_permission": interrupt_data,
+                }})
 
-            yield _agui_event({"type": "RUN_FINISHED", "runId": run_id, "threadId": thread_id})
+                yield _agui_event({"type": "RUN_FINISHED", "runId": run_id, "threadId": thread_id})
+            else:
+                logger.info("[agui] Graph interrupted for review: %s", interrupt_data)
+                if text_started:
+                    yield _agui_event({"type": "TEXT_MESSAGE_END", "messageId": msg_id})
+
+                yield _agui_event({"type": "CUSTOM", "name": "iteration_review", "value": interrupt_data})
+                yield _agui_event({"type": "STATE_SNAPSHOT", "snapshot": {
+                    "steps": accumulated_steps,
+                    "verbose": accumulated_verbose,
+                    "iteration_review": interrupt_data,
+                }})
+
+                review_msg = _format_review_message(interrupt_data, language)
+                yield _agui_event({
+                    "type": "MESSAGES_SNAPSHOT",
+                    "messages": [{"id": msg_id, "role": "assistant", "content": review_msg}],
+                })
+
+                yield _agui_event({"type": "RUN_FINISHED", "runId": run_id, "threadId": thread_id})
         else:
             final_output = state_update.get("final_output", session.current_draft) if state_update else ""
             logger.info("[agui] Stream done. text_started=%s, final_output_len=%d", text_started, len(final_output))
@@ -455,8 +581,8 @@ async def _stream_agui(run_id: str, thread_id: str, query: str, settings: dict, 
 
             sources_list = state_update.get("sources", []) if state_update else []
             if not sources_list and session.accumulated_context:
-                from agents.orchestrator.graph import _dedup_sources
-                sources_list = _dedup_sources(session.accumulated_context)
+                from agents.orchestrator.graph import resolve_citations
+                _, sources_list = resolve_citations("", session.accumulated_context)
             if sources_list:
                 yield _agui_event({"type": "CUSTOM", "name": "sources", "value": {"sources": sources_list}})
                 yield _agui_event({"type": "STATE_SNAPSHOT", "snapshot": {
@@ -587,6 +713,72 @@ def _custom_progress_to_step(chunk: dict, session: ResearchSession) -> dict | No
             "icon": "📊",
             "title": "[Reviewing][Reviewer] Quality scoring...",
         }
+    elif progress == "artifact_planning":
+        step = {
+            "phase": "artifact",
+            "icon": "🕸️",
+            "title": "[Artifact] Planning Claim-Evidence Graph",
+        }
+    elif progress == "execution_proposed":
+        step = {
+            "phase": "artifact",
+            "icon": "🕸️",
+            "title": "[Artifact] Execution proposed",
+        }
+    elif progress == "permission_required":
+        step = {
+            "phase": "permission",
+            "icon": "🔒",
+            "title": "[Permission] Approval required",
+        }
+    elif progress == "permission_approved":
+        step = {
+            "phase": "permission",
+            "icon": "🔓",
+            "title": "[Permission] Approved",
+        }
+    elif progress == "sandbox_scheduled":
+        step = {
+            "phase": "sandbox",
+            "icon": "📦",
+            "title": f"[Sandbox] Creating: {chunk.get('sandbox_id', '')}",
+        }
+    elif progress == "sandbox_running":
+        step = {
+            "phase": "sandbox",
+            "icon": "▶️",
+            "title": "[Sandbox] Rendering graph...",
+        }
+    elif progress == "artifact_created":
+        step = {
+            "phase": "artifact",
+            "icon": "✅",
+            "title": "[Artifact] SVG generated",
+        }
+    elif progress == "artifact_verifying":
+        step = {
+            "phase": "artifact",
+            "icon": "🔍",
+            "title": "[Artifact] Verifying...",
+        }
+    elif progress == "execution_completed":
+        step = {
+            "phase": "artifact",
+            "icon": "🎉",
+            "title": "[Artifact] Complete",
+        }
+    elif progress == "execution_denied":
+        step = {
+            "phase": "permission",
+            "icon": "🚫",
+            "title": "[Permission] Denied by user",
+        }
+    elif progress == "execution_failed":
+        step = {
+            "phase": "sandbox",
+            "icon": "❌",
+            "title": f"[Sandbox] Failed: {chunk.get('error', '')[:80]}",
+        }
 
     if step:
         step["id"] = str(uuid.uuid4())[:8]
@@ -619,6 +811,7 @@ async def agui_endpoint(req: AgUiRunInput):
 
     # Detect resume: check if the graph has a pending interrupt for this thread
     resume_direction = ""
+    interrupt_type = ""
     try:
         config = {"configurable": {"thread_id": thread_id}}
         graph_state = await _graph_module.orchestrator_graph.aget_state(config)
@@ -627,10 +820,27 @@ async def agui_endpoint(req: AgUiRunInput):
             hasattr(t, "interrupts") and t.interrupts for t in pending_tasks
         )
         if has_interrupt and query.strip():
-            if query.strip().lower() == "accept":
-                resume_direction = "__accept__"
+            # Determine interrupt type from the interrupt payload
+            for t in pending_tasks:
+                if hasattr(t, "interrupts") and t.interrupts:
+                    for intr in t.interrupts:
+                        payload = intr.value if hasattr(intr, "value") else intr
+                        if isinstance(payload, dict) and payload.get("type") == "execution_permission":
+                            interrupt_type = "execution_permission"
+                            break
+                    break
+
+            if interrupt_type == "execution_permission":
+                raw = query.strip().lower()
+                if raw in ("approve", "approve once", "__execution_approve__"):
+                    resume_direction = "__execution_approve__"
+                else:
+                    resume_direction = "__execution_deny__"
             else:
-                resume_direction = query.strip()
+                if query.strip().lower() == "accept":
+                    resume_direction = "__accept__"
+                else:
+                    resume_direction = query.strip()
             query = ""
     except Exception:
         pass
@@ -1066,6 +1276,8 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
         "enable_fact_check": getattr(session, "_enable_fact_check", True),
         "enable_parallel": getattr(session, "_enable_parallel", True),
         "enable_sectioned": getattr(session, "_enable_sectioned", True),
+        "web_search_limit": getattr(session, "_web_search_limit", 2),
+        "web_search_max_limit": getattr(session, "_web_search_max_limit", 5),
         "report_sections": [],
         "section_order": [],
         "failing_sections": [],
@@ -1607,8 +1819,30 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# Thread management endpoints (for Next.js frontend ThreadList adapter)
+# Artifact endpoint
 # ---------------------------------------------------------------------------
+
+_artifact_store = None
+
+
+def _get_artifact_store():
+    global _artifact_store
+    if _artifact_store is None:
+        from backend.artifact_store import ArtifactStore
+        _artifact_store = ArtifactStore()
+    return _artifact_store
+
+
+@app.get("/artifacts/{artifact_id}")
+async def get_artifact(artifact_id: str):
+    """Serve a stored artifact (SVG, etc.)."""
+    from fastapi.responses import Response
+    store = _get_artifact_store()
+    data = store.get(artifact_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    content_type = "image/svg+xml" if artifact_id.endswith(".svg") or b"<svg" in data[:200] else "application/octet-stream"
+    return Response(content=data, media_type=content_type)
 
 POSTGRES_URL = os.getenv("POSTGRES_URL", "")
 

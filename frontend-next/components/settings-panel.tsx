@@ -72,6 +72,30 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
             checked={settings.enableWebSearch}
             onChange={(v) => setSettings({ ...settings, enableWebSearch: v })}
           />
+          {settings.enableWebSearch && (
+            <>
+              <SliderSetting
+                icon={<Globe className="h-4 w-4 text-blue-300" />}
+                label="Web Results per Query"
+                description="Number of web results fetched per search query"
+                value={settings.webSearchLimit}
+                min={1}
+                max={5}
+                step={1}
+                onChange={(v) => setSettings({ ...settings, webSearchLimit: v })}
+              />
+              <SliderSetting
+                icon={<Globe className="h-4 w-4 text-blue-200" />}
+                label="Max Web Results (auto-expand)"
+                description="Maximum results when Reflect requests more sources"
+                value={settings.webSearchMaxLimit}
+                min={settings.webSearchLimit}
+                max={10}
+                step={1}
+                onChange={(v) => setSettings({ ...settings, webSearchMaxLimit: v })}
+              />
+            </>
+          )}
           <ToggleSetting
             icon={<Map className="h-4 w-4 text-green-400" />}
             label="Research Planning"
@@ -99,6 +123,13 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
             description="Decompose into sub-topics with independent sections"
             checked={settings.enableSectioned}
             onChange={(v) => setSettings({ ...settings, enableSectioned: v })}
+          />
+          <ToggleSetting
+            icon={<Layers className="h-4 w-4 text-rose-400" />}
+            label="Generate Claim-Evidence Graph"
+            description="Visualize claims and evidence relationships after report"
+            checked={settings.enableClaimEvidenceGraph}
+            onChange={(v) => setSettings({ ...settings, enableClaimEvidenceGraph: v })}
           />
 
           <div className="border-t border-border" />

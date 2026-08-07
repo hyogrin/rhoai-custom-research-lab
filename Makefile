@@ -14,8 +14,9 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-setup: ## Install all Python dependencies
+setup: ## Install Python deps + provision PostgreSQL (auto-detects cluster vs local)
 	uv sync
+	@./scripts/setup.sh
 
 mcp-start: ## Start all MCP servers locally
 	@echo "Starting vector-search-mcp on port 9002..."
@@ -64,8 +65,8 @@ start: ## Show how to start all services
 	@echo " Start services in separate terminals:"
 	@echo "========================================="
 	@echo ""
-	@echo "  Terminal 0 — PostgreSQL (if not running):"
-	@echo "    docker compose up -d"
+	@echo "  First time setup (Python deps + PostgreSQL):"
+	@echo "    make setup"
 	@echo ""
 	@echo "  Terminal 1 — Backend + MCP servers:"
 	@echo "    make backend-start"

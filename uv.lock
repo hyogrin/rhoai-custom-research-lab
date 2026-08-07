@@ -3443,6 +3443,22 @@ wheels = [
 ]
 
 [[package]]
+name = "openshell"
+version = "0.0.99"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cloudpickle" },
+    { name = "grpcio" },
+    { name = "httpx" },
+    { name = "protobuf" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c3/d5/8f6c394c1129ae01637fb1c9f56b8f5a10a988d667e0e4bd5fecc5e44067/openshell-0.0.99-py3-none-macosx_13_0_arm64.whl", hash = "sha256:f7db8eb284fa0815c0ab375016def8524873ee033049940f071ffef4d0c1a61e", size = 8440178, upload-time = "2026-08-05T15:33:31.493Z" },
+    { url = "https://files.pythonhosted.org/packages/db/29/7ddde3ec2d44357d7f911484b9df5fed814758922b241acd045ebe5a54a2/openshell-0.0.99-py3-none-manylinux_2_39_aarch64.whl", hash = "sha256:b06e062563201d4f98a87e8de23e10e40733b548e12891623982ca5b120bccf2", size = 8506339, upload-time = "2026-08-05T15:33:52.563Z" },
+    { url = "https://files.pythonhosted.org/packages/76/cb/8520cd87729942de875ce6af08953e9d1e19296a5db0a1da92d76a77a682/openshell-0.0.99-py3-none-manylinux_2_39_x86_64.whl", hash = "sha256:72f8f14c304f5da233755ae285ee8c4c19aaf7fb7b40b14f6c6b17ef9752141f", size = 8988885, upload-time = "2026-08-05T15:34:12.529Z" },
+]
+
+[[package]]
 name = "opentelemetry-api"
 version = "1.43.0"
 source = { registry = "https://pypi.org/simple" }
@@ -5444,6 +5460,9 @@ dev = [
 mcp = [
     { name = "mcp" },
 ]
+openshell = [
+    { name = "openshell" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -5467,6 +5486,7 @@ requires-dist = [
     { name = "mlflow", specifier = ">=2.15.0" },
     { name = "onnxruntime", specifier = ">=1.20.0" },
     { name = "openai", specifier = ">=1.0.0" },
+    { name = "openshell", marker = "extra == 'openshell'", specifier = ">=0.0.90" },
     { name = "prometheus-client", specifier = ">=0.20.0" },
     { name = "prometheus-fastapi-instrumentator", specifier = ">=7.0.0" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.1.0" },
@@ -5481,7 +5501,7 @@ requires-dist = [
     { name = "sqlite-vec", specifier = ">=0.1.6" },
     { name = "uvicorn", specifier = ">=0.34.0" },
 ]
-provides-extras = ["mcp", "dev"]
+provides-extras = ["mcp", "openshell", "dev"]
 
 [[package]]
 name = "rich"

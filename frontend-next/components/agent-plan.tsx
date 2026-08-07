@@ -71,7 +71,7 @@ export function AgentPlan({ steps, visible }: AgentPlanProps) {
             <Brain className="size-3 text-primary" />
           </div>
           <span className="text-xs font-semibold text-foreground tracking-wide">
-            Agent Plan
+            Agent Harness
           </span>
           <span className="ml-auto rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground tabular-nums">
             {steps.length} steps

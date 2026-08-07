@@ -38,9 +38,22 @@ export type ResearchSettings = {
   enableFactCheck: boolean;
   enableParallel: boolean;
   enableSectioned: boolean;
+  enableClaimEvidenceGraph: boolean;
+  webSearchLimit: number;
+  webSearchMaxLimit: number;
   verbose: boolean;
   logSse: boolean;
   language: "en-US" | "ko-KR";
+};
+
+export type ExecutionPermissionSettings = {
+  requireApproval: boolean;
+  networkAccess: "deny";
+  readOnlyPaths: string[];
+  readWritePaths: string[];
+  cpu: string;
+  memory: string;
+  timeoutSeconds: number;
 };
 
 const defaultSettings: ResearchSettings = {
@@ -51,9 +64,22 @@ const defaultSettings: ResearchSettings = {
   enableFactCheck: true,
   enableParallel: true,
   enableSectioned: true,
+  enableClaimEvidenceGraph: false,
+  webSearchLimit: 2,
+  webSearchMaxLimit: 5,
   verbose: false,
   logSse: false,
   language: "en-US",
+};
+
+const defaultExecutionPermissions: ExecutionPermissionSettings = {
+  requireApproval: true,
+  networkAccess: "deny",
+  readOnlyPaths: ["/sandbox/app", "/sandbox/input"],
+  readWritePaths: ["/sandbox/output", "/tmp"],
+  cpu: "500m",
+  memory: "512Mi",
+  timeoutSeconds: 60,
 };
 
 export type ThreadInfo = {
@@ -74,6 +100,11 @@ export type DocumentInfo = {
 type SettingsContextType = {
   settings: ResearchSettings;
   setSettings: (s: ResearchSettings) => void;
+};
+
+type ExecutionPermissionContextType = {
+  executionPermissions: ExecutionPermissionSettings;
+  setExecutionPermissions: (s: ExecutionPermissionSettings) => void;
 };
 
 type ThreadContextType = {
@@ -97,6 +128,12 @@ export const SettingsContext = createContext<SettingsContextType>({
   setSettings: () => {},
 });
 
+export const ExecutionPermissionContext =
+  createContext<ExecutionPermissionContextType>({
+    executionPermissions: defaultExecutionPermissions,
+    setExecutionPermissions: () => {},
+  });
+
 export const ThreadContext = createContext<ThreadContextType>({
   threads: [],
   activeThreadId: null,
@@ -115,6 +152,10 @@ export const DocumentContext = createContext<DocumentContextType>({
 
 export function useSettings() {
   return useContext(SettingsContext);
+}
+
+export function useExecutionPermissions() {
+  return useContext(ExecutionPermissionContext);
 }
 
 export function useThreads() {
@@ -160,6 +201,8 @@ function storeThreadId(id: string | null) {
 
 export function Providers({ children }: { children: React.ReactNode }) {
   const [settings, setSettings] = useState<ResearchSettings>(defaultSettings);
+  const [executionPermissions, setExecutionPermissions] =
+    useState<ExecutionPermissionSettings>(defaultExecutionPermissions);
   const [threads, setThreads] = useState<ThreadInfo[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(() =>
     getStoredThreadId(),
@@ -169,6 +212,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+
+  const executionPermissionsRef = useRef(executionPermissions);
+  executionPermissionsRef.current = executionPermissions;
 
   const activeThreadIdRef = useRef(activeThreadId);
   activeThreadIdRef.current = activeThreadId;
@@ -291,6 +337,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
           body.forwardedProps = {
             ...body.forwardedProps,
             settings: settingsRef.current,
+            executionPermissions: executionPermissionsRef.current,
           };
           init = { ...init, body: JSON.stringify(body) };
         } catch {
@@ -347,15 +394,19 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
   return (
     <SettingsContext.Provider value={{ settings, setSettings }}>
-      <DocumentContext.Provider value={docCtx}>
-        <ThreadContext.Provider value={threadCtx}>
-          <AssistantRuntimeProvider runtime={runtime}>
-            <CitationProvider>
-              {children}
-            </CitationProvider>
-          </AssistantRuntimeProvider>
-        </ThreadContext.Provider>
-      </DocumentContext.Provider>
+      <ExecutionPermissionContext.Provider
+        value={{ executionPermissions, setExecutionPermissions }}
+      >
+        <DocumentContext.Provider value={docCtx}>
+          <ThreadContext.Provider value={threadCtx}>
+            <AssistantRuntimeProvider runtime={runtime}>
+              <CitationProvider>
+                {children}
+              </CitationProvider>
+            </AssistantRuntimeProvider>
+          </ThreadContext.Provider>
+        </DocumentContext.Provider>
+      </ExecutionPermissionContext.Provider>
     </SettingsContext.Provider>
   );
 }

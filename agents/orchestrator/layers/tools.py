@@ -607,10 +607,12 @@ def draft_report(
         "You are a research report writer. Write a comprehensive, well-structured research report "
         "based on the provided context and research plan.\n\n"
         "Citation rules (STRICT):\n"
-        "- Cite sources as [N](#cite-N) where N is the source number. Example: [1](#cite-1)\n"
-        "- For multiple sources: [1](#cite-1)[2](#cite-2) — each in its own bracket.\n"
+        "- Cite sources using their ID: [[cite:SRC_XXXX]] where SRC_XXXX is the source ID shown in the context.\n"
+        "- Example: This is a finding [[cite:SRC_A81F]].\n"
+        "- For multiple sources: statement [[cite:SRC_A81F]][[cite:SRC_B27C]]\n"
+        "- ONLY use source IDs that appear in the provided context. NEVER invent IDs.\n"
+        "- NEVER use numeric citations like [1], [2], [Source 1], etc.\n"
         "- Place citations at the END of the relevant sentence, before the period.\n"
-        "- NEVER use the format [Source N] — always use [N](#cite-N).\n"
         "- NEVER place a citation immediately before a heading or on the same line as a heading.\n\n"
         "Markdown formatting rules (STRICT):\n"
         "- ALWAYS insert a blank line before ANY heading (##, ###, etc.).\n"
@@ -642,15 +644,32 @@ def draft_report(
 
 
 def _format_source_entry(idx: int, ctx: dict) -> str:
-    """Format a single context entry for LLM prompt, including source URL if available."""
+    """Format a single context entry for LLM prompt using stable source_id."""
     raw_name = ctx.get("document_name", ctx.get("source", "unknown"))
     name = re.sub(r"\[\d+\]$", "", raw_name).strip()
+    src_id = ctx.get("source_id", f"SRC_{idx:04X}")
     metadata = ctx.get("metadata") or {}
-    url = metadata.get("source_url", "")
-    header = f"[Source {idx+1}: {name}]"
+    url = metadata.get("source_url", "") or metadata.get("url", "")
+    header = f"[{src_id}: {name}]"
     if url and url.startswith("http"):
-        header = f"[Source {idx+1}: {name}]({url})"
+        header = f"[{src_id}: {name}]({url})"
     return f"{header}\n{ctx.get('content', '')[:400]}"
+
+
+def _interleave_context(context: list[dict], max_items: int = 6) -> list[dict]:
+    """Interleave semantic and web results to ensure both types are represented."""
+    semantic = [c for c in context if (c.get("metadata") or {}).get("type") != "web_search"]
+    web = [c for c in context if (c.get("metadata") or {}).get("type") == "web_search"]
+    result: list[dict] = []
+    si, wi = 0, 0
+    while len(result) < max_items and (si < len(semantic) or wi < len(web)):
+        if si < len(semantic):
+            result.append(semantic[si])
+            si += 1
+        if len(result) < max_items and wi < len(web):
+            result.append(web[wi])
+            wi += 1
+    return result
 
 
 def draft_section(
@@ -661,6 +680,7 @@ def draft_section(
     improvement_hints: str = "",
     language_instruction: str = "",
     stream_callback: Callable[[str], None] | None = None,
+    source_offset: int = 0,
 ) -> dict:
     """Draft a single report section via direct LLM call.
 
@@ -681,10 +701,12 @@ def draft_section(
         "- Use clear structure with sub-headings (###) if needed\n"
         "- Complete every sentence — NEVER truncate mid-sentence or mid-word\n\n"
         "Citation rules (STRICT):\n"
-        "- Cite sources as [N](#cite-N) where N is the source number. Example: [1](#cite-1)\n"
-        "- For multiple sources: [1](#cite-1)[2](#cite-2) — each in its own bracket.\n"
+        "- Cite sources using their ID: [[cite:SRC_XXXX]] where SRC_XXXX is the source ID shown in the context.\n"
+        "- Example: This is a finding [[cite:SRC_A81F]].\n"
+        "- For multiple sources: statement [[cite:SRC_A81F]][[cite:SRC_B27C]]\n"
+        "- ONLY use source IDs that appear in the provided context. NEVER invent IDs.\n"
+        "- NEVER use numeric citations like [1], [2], [Source 1], etc.\n"
         "- Place citations at the END of the relevant sentence, before the period.\n"
-        "- NEVER use the format [Source N] — always use [N](#cite-N).\n"
         "- NEVER place a citation immediately before a heading or on the same line as a heading.\n\n"
         "Markdown formatting rules (STRICT):\n"
         "- ALWAYS insert a blank line before ANY heading (##, ###, etc.).\n"
@@ -700,7 +722,8 @@ def draft_section(
         system_prompt += f"\n\n{language_instruction}"
 
     context_text = "\n\n".join(
-        _format_source_entry(i, c) for i, c in enumerate(search_context[:4])
+        _format_source_entry(source_offset + i, c)
+        for i, c in enumerate(_interleave_context(search_context, max_items=6))
     )
 
     user_content = f"Research Question: {query}\n\nSection: {sub_topic_title}\n\nContext:\n{context_text}"

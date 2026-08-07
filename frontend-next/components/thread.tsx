@@ -22,6 +22,8 @@ import { AgentPlan } from "@/components/agent-plan";
 import { VerboseOutput } from "@/components/verbose-output";
 import { CitationBadge } from "@/components/elements/citation-badge";
 import { IterationReviewCard } from "@/components/elements/iteration-review-card";
+import { ExecutionPermissionCard } from "@/components/execution-permission-card";
+import { ClaimEvidenceGraph } from "@/components/claim-evidence-graph";
 import { cn } from "@/lib/utils";
 import {
   ArrowDownIcon,
@@ -65,7 +67,7 @@ const isNewChatView = (s: AssistantState) => s.thread.messages.length === 0;
 export const Thread: FC = () => {
   const isEmpty = useAuiState(isNewChatView);
   const { settings } = useSettings();
-  const { steps, verbose, iterationReview, clearReview } = useResearchEvents();
+  const { steps, verbose, iterationReview, clearReview, executionPermission, clearExecutionPermission, claimEvidenceArtifact, artifactStatus } = useResearchEvents();
   const isKorean = settings.language === "ko-KR";
 
   return (
@@ -101,6 +103,29 @@ export const Thread: FC = () => {
                 isKorean={isKorean}
                 onDismiss={clearReview}
               />
+            </div>
+          )}
+          {executionPermission && (
+            <div className="mx-auto w-full max-w-[var(--thread-max-width)] px-2 animate-in fade-in slide-in-from-bottom-2 duration-300">
+              <ExecutionPermissionCard data={executionPermission} />
+            </div>
+          )}
+          {claimEvidenceArtifact && artifactStatus === "completed" && (
+            <div className="mx-auto w-full max-w-[var(--thread-max-width)] px-2 animate-in fade-in slide-in-from-bottom-2 duration-300">
+              <ClaimEvidenceGraph
+                artifact={claimEvidenceArtifact}
+                status={artifactStatus}
+              />
+            </div>
+          )}
+          {artifactStatus === "denied" && (
+            <div className="mx-auto w-full max-w-[var(--thread-max-width)] px-2">
+              <ClaimEvidenceGraph artifact={null} status="denied" />
+            </div>
+          )}
+          {artifactStatus === "failed" && (
+            <div className="mx-auto w-full max-w-[var(--thread-max-width)] px-2">
+              <ClaimEvidenceGraph artifact={null} status="failed" />
             </div>
           )}
           <AgentPlan steps={steps} visible={settings.logSse} />
@@ -169,15 +194,6 @@ function preprocessMarkdown(text: string): string {
   text = text.replace(/([^\n])\n(#{1,6}\s)/g, "$1\n\n$2");
   // Catch heading glued directly to preceding text without any newline
   text = text.replace(/([^\n#])(#{1,6}\s)/g, "$1\n\n$2");
-  // Convert [Source N] and [Source 1, Source 2] to citation badge links
-  text = text.replace(
-    /\[Source (\d+(?:,\s*(?:Source\s*)?\d+)*)\](?!\()/g,
-    (_match, inner: string) => {
-      const nums = inner.match(/\d+/g);
-      if (!nums) return _match;
-      return nums.map((n) => `[${n}](#cite-${n})`).join("");
-    },
-  );
   return text;
 }
 
@@ -206,7 +222,7 @@ const remarkPlugins = [remarkGfm];
 const TextPart: FC = () => (
   <div className="aui-md-content">
     <MarkdownTextPrimitive
-      smooth={{ drainMs: 300 }}
+      smooth={{ drainMs: 50 }}
       preprocess={preprocessMarkdown}
       components={markdownComponents}
       remarkPlugins={remarkPlugins}
