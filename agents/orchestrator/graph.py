@@ -1293,9 +1293,9 @@ def resolve_citations(text: str, accumulated_context: list[dict]) -> tuple[str, 
 
     registry = _build_source_registry(accumulated_context)
 
-    # Find all cited source IDs in order of appearance
-    cite_pattern = _re.compile(r"\[\[cite:(SRC_[A-Z0-9]+)\]\]")
-    all_cited = cite_pattern.findall(text)
+    # Find all cited source IDs in order of appearance (case-insensitive)
+    cite_pattern = _re.compile(r"\[\[cite:(SRC_[A-Za-z0-9]+)\]\]", _re.IGNORECASE)
+    all_cited = [s.upper() for s in cite_pattern.findall(text)]
 
     # Assign sequential numbers by first appearance (only valid IDs)
     id_to_num: dict[str, int] = {}
@@ -1309,7 +1309,7 @@ def resolve_citations(text: str, accumulated_context: list[dict]) -> tuple[str, 
 
     # Replace [[cite:SRC_ID]] with [N](#cite-N) or remove if invalid
     def _replace_cite(m: _re.Match) -> str:
-        src_id = m.group(1)
+        src_id = m.group(1).upper()
         num = id_to_num.get(src_id)
         if num is None:
             return ""
@@ -1391,7 +1391,13 @@ def finalize_node(state: ResearchState) -> dict:
 
     # Resolve [[cite:SRC_ID]] → [N](#cite-N) and build sources list
     accumulated_context = state.get("accumulated_context") or []
+    logger.info(
+        "[finalize] Resolving citations: %d context entries, %d have source_id",
+        len(accumulated_context),
+        sum(1 for c in accumulated_context if c.get("source_id")),
+    )
     output, sources_list = resolve_citations(output, accumulated_context)
+    logger.info("[finalize] Citation resolution: %d sources cited", len(sources_list))
 
     # Append references section (only actually cited sources, deterministic order)
     if sources_list:

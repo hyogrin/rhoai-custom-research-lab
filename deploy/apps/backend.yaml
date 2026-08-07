@@ -84,8 +84,6 @@ spec:
               value: "5432"
             - name: PGVECTOR_DB
               value: doc_research
-            - name: MINIO_ENDPOINT
-              value: minio:9000
             - name: VECTOR_SEARCH_MCP_URL
               value: http://vector-search-mcp:9002
             - name: WEB_SEARCH_MCP_URL

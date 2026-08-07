@@ -138,8 +138,8 @@ deploy-infra: ## Deploy namespace + secrets
 	oc create configmap init-db-sql --from-file=scripts/init-db.sql \
 		-n $(NAMESPACE) --dry-run=client -o yaml | oc apply -f -
 	oc apply -f deploy/infra/ -n $(NAMESPACE)
-	@echo "Waiting for MinIO to be ready..."
-	oc wait --for=condition=ready pod -l app=minio -n $(NAMESPACE) --timeout=120s
+	@echo "Waiting for PostgreSQL to be ready..."
+	oc wait --for=condition=ready pod -l app=postgresql -n $(NAMESPACE) --timeout=120s
 
 deploy-apps: ## Deploy backend, frontend, MCP servers
 	@echo "=== Deploying applications ==="

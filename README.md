@@ -14,9 +14,9 @@ flowchart TB
 
     subgraph Orchestrator ["LangGraph Orchestrator"]
         Graph["StateGraph\n(harness controller)"]
-        MCPClient["MCP Client Layer"]
-        Context["Context Layer"]
-        Observability["Observability Layer"]
+        MCPClient["MCP Client"]
+        Context["Context Gatherer"]
+        Observability["Observability"]
     end
 
     subgraph Harness ["Iterative Harness — LangGraph Inner Loop"]
@@ -37,8 +37,7 @@ flowchart TB
 
     subgraph Infra ["Infrastructure"]
         PG[("PostgreSQL\n+ pgvector\n(checkpointer + vectors)")]
-        MinIO[("MinIO\nObject Storage")]
-        vLLM["RHOAI vLLM\nModel Serving"]
+        MaaS["MaaS Gateway\n(RHOAI Model Serving)"]
     end
 
     Browser -- "HTTP" --> NextJS
@@ -46,13 +45,13 @@ flowchart TB
     Backend -- "auto-start\nsubprocess" --> MCP
     Backend -- "invoke graph" --> Graph
     Backend -- "Docling direct" --> PG
-    Backend -- "file store" --> MinIO
     Graph -.-> Harness
     Graph -- "checkpointer" --> PG
+    Graph -- "LLM calls\n(OpenAI API)" --> MaaS
     MCPClient -- "MCP\nstreamable-http" --> MCP
     VectorMCP --> PG
-    WebMCP & VerifMCP --> vLLM
-    VectorMCP --> vLLM
+    VectorMCP -- "embedding" --> MaaS
+    VerifMCP -- "LLM scoring" --> MaaS
 ```
 
 
@@ -92,8 +91,7 @@ flowchart TB
 | Tool Protocol               | MCP (Model Context Protocol) | Standardized tool exposure via FastMCP + streamable-http   |
 | Document Intelligence       | Docling                      | PDF/DOCX/PPTX parsing, table extraction, OCR               |
 | Persistence                 | PostgreSQL + pgvector        | Checkpointing, chat history, and semantic search           |
-| Object Storage              | MinIO                        | Document file storage                                      |
-| Model Serving               | RHOAI vLLM                   | LLM and embedding inference                                |
+| Model Serving               | MaaS (RHOAI Model Serving)   | LLM and embedding inference via OpenAI-compatible API      |
 | Web UI                      | Next.js + assistant-ui       | Interactive research with AG-UI streaming                  |
 
 

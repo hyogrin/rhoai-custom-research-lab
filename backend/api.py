@@ -54,6 +54,26 @@ def _port_in_use(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _kill_port(port: int):
+    """Kill any process listening on the given port."""
+    import signal
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f":{port}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = result.stdout.strip().split()
+        for pid in pids:
+            if pid.isdigit():
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                    logger.info("Killed stale process %s on port %d", pid, port)
+                except ProcessLookupError:
+                    pass
+    except Exception as e:
+        logger.warning("Failed to kill process on port %d: %s", port, e)
+
+
 
 
 def _start_mcp_servers():
@@ -61,11 +81,25 @@ def _start_mcp_servers():
     for name, module, port in MCP_SERVERS:
         if _port_in_use(port):
             logger.warning(
-                "Port %d already in use — cannot start %s. "
-                "Stop the process holding the port (e.g. Jupyter kernel) or run 'make backend-stop' first.",
-                port, name,
+                "Port %d already in use — killing stale process for %s...", port, name,
             )
-            continue
+            try:
+                confirm = input(f"  Kill process on port {port} for {name}? [Y/n]: ").strip().lower()
+                if confirm in ("", "y", "yes"):
+                    _kill_port(port)
+                    time.sleep(0.5)
+                else:
+                    logger.warning("Skipping %s — port %d still occupied", name, port)
+                    continue
+            except (EOFError, KeyboardInterrupt):
+                _kill_port(port)
+                time.sleep(0.5)
+            if _port_in_use(port):
+                logger.warning(
+                    "Port %d still in use after kill — cannot start %s.",
+                    port, name,
+                )
+                continue
         proc = subprocess.Popen(
             [sys.executable, "-m", module],
             stdout=subprocess.DEVNULL,

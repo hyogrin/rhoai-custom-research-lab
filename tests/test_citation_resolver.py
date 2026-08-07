@@ -176,3 +176,19 @@ class TestResolveCitations:
         resolved, sources = resolve_citations(text, ctx)
         assert resolved == "No citations here."
         assert sources == []
+
+    def test_case_insensitive_source_ids(self):
+        """LLM might lowercase the source IDs — resolution should still work."""
+        ctx = _make_context([
+            {"id": "SRC_AB12CD", "name": "Doc A"},
+            {"id": "SRC_EF34GH", "name": "Doc B"},
+        ])
+        text = "Lower [[cite:SRC_ab12cd]]. Mixed [[cite:SRC_Ef34Gh]]."
+        resolved, sources = resolve_citations(text, ctx)
+
+        assert "[1](#cite-1)" in resolved
+        assert "[2](#cite-2)" in resolved
+        assert "[[cite:" not in resolved
+        assert len(sources) == 2
+        assert sources[0]["name"] == "Doc A"
+        assert sources[1]["name"] == "Doc B"

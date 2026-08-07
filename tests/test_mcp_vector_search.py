@@ -117,10 +117,10 @@ def test_db():
 
     _insert_chunk(conn, "doc-001", "research.pdf", 3, "Machine learning overview",
                   [0.1] * 384, '{"section": "intro"}',
-                  "http://minio:9000/documents/doc-001/research.pdf")
+                  "http://localhost:8000/documents/doc-001/research.pdf")
     _insert_chunk(conn, "doc-001", "research.pdf", 4, "Deep learning methods",
                   [0.12] * 384, '{"section": "methods"}',
-                  "http://minio:9000/documents/doc-001/research.pdf")
+                  "http://localhost:8000/documents/doc-001/research.pdf")
 
     with patch("mcp_servers.vector_search_mcp.server.get_connection", return_value=conn):
         yield conn
@@ -152,7 +152,7 @@ class TestSemanticSearch:
 
         results = semantic_search("test", min_similarity=0.0)
 
-        assert results[0]["source_url"].startswith("http://minio")
+        assert results[0]["source_url"].startswith("http://localhost")
 
     def test_filters_results_below_min_similarity(self, mock_embedding):
         conn = _make_test_db()
@@ -208,7 +208,7 @@ class TestSearchByDocument:
         conn = _make_test_db()
         _insert_chunk(conn, "doc-abc", "paper.pdf", 2, "Specific doc content",
                       [0.1] * 384, '{"page": 3}',
-                      "http://minio:9000/documents/doc-abc/paper.pdf")
+                      "http://localhost:8000/documents/doc-abc/paper.pdf")
         _insert_chunk(conn, "doc-xyz", "other.pdf", 0, "Other doc", [0.15] * 384)
 
         with patch("mcp_servers.vector_search_mcp.server.get_connection", return_value=conn):
@@ -218,7 +218,7 @@ class TestSearchByDocument:
 
             assert len(results) == 1
             assert results[0]["document_id"] == "doc-abc"
-            assert results[0]["source_url"] == "http://minio:9000/documents/doc-abc/paper.pdf"
+            assert results[0]["source_url"] == "http://localhost:8000/documents/doc-abc/paper.pdf"
         conn.close()
 
 

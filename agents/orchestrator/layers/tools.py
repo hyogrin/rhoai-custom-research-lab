@@ -59,7 +59,7 @@ SERVER_URLS = {
 # ---------------------------------------------------------------------------
 
 
-_MCP_TIMEOUT = int(os.getenv("MCP_TIMEOUT", "90"))
+_MCP_TIMEOUT = int(os.getenv("MCP_TIMEOUT", "30"))
 _MCP_MAX_RETRIES = int(os.getenv("MCP_MAX_RETRIES", "2"))
 
 

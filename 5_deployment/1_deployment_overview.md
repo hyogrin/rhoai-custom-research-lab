@@ -13,20 +13,18 @@ OpenShift Cluster — Namespace: doc-research-lab
 │
 ├── Application Layer
 │   ├── backend       (FastAPI — port 8000)
-│   ├── frontend      (Chainlit — port 7860)
+│   ├── frontend      (Next.js — port 3000)
 │   └── MCP Servers
 │       ├── vector-search-mcp   (port 9002)
 │       ├── web-search-mcp      (port 9003)
-│       ├── verification-mcp    (port 9004)
-│       └── observability-mcp   (port 9005)
+│       └── verification-mcp    (port 9004)
 │
 ├── Infrastructure (managed separately)
-│   ├── PostgreSQL + pgvector  (StatefulSet — port 5432)
-│   └── MinIO                  (Deployment — port 9000)
+│   └── PostgreSQL + pgvector  (StatefulSet — port 5432)
 │
 └── Model Serving (RHOAI — external to this namespace)
-    ├── granite-3.3-8b-instruct  (LLM)
-    └── granite-embedding-278m   (embeddings)
+    ├── gemma-4-12b-it          (LLM)
+    └── granite-embedding-278m  (embeddings)
 ```
 
 ## Two Deployment Methods
@@ -37,7 +35,7 @@ Individual YAML manifests applied with `oc apply`. Best for iterative
 development and when you need fine-grained control over each resource.
 
 ```bash
-make deploy-infra   # namespace, secret, PostgreSQL, MinIO
+make deploy-infra   # namespace, secret, PostgreSQL
 make deploy-apps    # backend, frontend, MCP servers
 ```
 
@@ -53,12 +51,12 @@ helm upgrade --install doc-research deploy/helm/doc-research/ \
 
 ## Separation of Concerns
 
-Infrastructure (PostgreSQL, MinIO) is deployed **before** application pods
-because the apps depend on database and object storage being available:
+Infrastructure (PostgreSQL) is deployed **before** application pods
+because the apps depend on the database being available:
 
 1. `make deploy-infra` — creates namespace, secret, PostgreSQL StatefulSet,
-   MinIO Deployment, and waits for readiness.
-2. `make deploy-apps` — deploys backend, frontend, and all 4 MCP servers
+   and waits for readiness.
+2. `make deploy-apps` — deploys backend, frontend, and MCP servers
    (env-substituted from `.env`).
 
 ## Container Image Build
@@ -66,7 +64,7 @@ because the apps depend on database and object storage being available:
 All images are built with Podman using Dockerfiles in each component directory:
 
 ```bash
-make build-all   # Build all 6 images (4 MCP + backend + frontend)
+make build-all   # Build all images (3 MCP + backend + frontend)
 make push-all    # Tag and push to REGISTRY
 ```
 

@@ -25,13 +25,13 @@ The system uses **LangGraph** for orchestration, **MCP (Model Context Protocol)*
 | Python | 3.11–3.13 | `brew install python@3.13` (Homebrew required — python.org builds lack SQLite extension support) |
 | uv | 0.4+ | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | oc CLI | 4.14+ | [Download](https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/) |
-| Podman | 4+ | `brew install podman` or system package (optional — for MinIO/SearXNG) |
+| Podman | 4+ | `brew install podman` or system package (optional — for PostgreSQL) |
 | Git | 2.x | System package |
 
 ## Optional (for local development without cluster)
 
 For running the full system locally without an OpenShift cluster:
-- Podman Compose (for MinIO + SearXNG containers)
+- Docker or Podman Compose (for PostgreSQL container)
 - A local LLM server (e.g., LM Studio, Ollama) with OpenAI-compatible API
 
 > **macOS note:** The python.org installer builds Python without SQLite extension loading support.
