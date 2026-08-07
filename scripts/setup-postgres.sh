@@ -94,6 +94,9 @@ spec:
         image: pgvector/pgvector:pg16
         ports:
         - containerPort: 5432
+        env:
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
         envFrom:
         - secretRef:
             name: postgres-credentials
