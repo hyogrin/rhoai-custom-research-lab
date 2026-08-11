@@ -13,19 +13,35 @@ logger = logging.getLogger(__name__)
 _mlflow_enabled = False
 
 
-def _patch_tracer_on_interrupt():
-    """Add a no-op on_interrupt to MlflowLangchainTracer if missing.
+def _patch_tracer_for_langgraph():
+    """Patch MlflowLangchainTracer for LangGraph compatibility.
 
-    LangGraph's interrupt() fires the on_interrupt callback, but MLflow's
-    tracer doesn't implement it yet (as of 3.x). Without this patch the
-    callback manager logs a noisy AttributeError warning on every interrupt.
+    Fixes two issues:
+    1. Missing ``on_interrupt`` / ``on_resume`` callbacks — LangGraph fires
+       these but MLflow's tracer doesn't implement them, causing noisy
+       ``AttributeError`` warnings in the callback manager.
+    2. ``GraphInterrupt`` logged as error — ``interrupt()`` raises
+       ``GraphInterrupt`` as normal HITL control flow, but MLflow's
+       ``on_chain_error`` records it as a failed span with a full traceback.
     """
     try:
         from mlflow.langchain.langchain_tracer import MlflowLangchainTracer
 
-        if not hasattr(MlflowLangchainTracer, "on_interrupt"):
-            MlflowLangchainTracer.on_interrupt = lambda self, *args, **kwargs: None
-            logger.debug("Patched MlflowLangchainTracer.on_interrupt (no-op)")
+        for attr in ("on_interrupt", "on_resume"):
+            if not hasattr(MlflowLangchainTracer, attr):
+                setattr(MlflowLangchainTracer, attr, lambda self, *a, **kw: None)
+                logger.debug("Patched MlflowLangchainTracer.%s (no-op)", attr)
+
+        _original_on_chain_error = getattr(MlflowLangchainTracer, "on_chain_error", None)
+        if _original_on_chain_error:
+            def _filtered_on_chain_error(self, error, *args, **kwargs):
+                from langgraph.errors import GraphInterrupt
+                if isinstance(error, GraphInterrupt):
+                    return
+                return _original_on_chain_error(self, error, *args, **kwargs)
+
+            MlflowLangchainTracer.on_chain_error = _filtered_on_chain_error
+            logger.debug("Patched MlflowLangchainTracer.on_chain_error (filters GraphInterrupt)")
     except Exception:
         pass
 
@@ -61,7 +77,7 @@ def init_mlflow():
         mlflow.langchain.autolog(run_tracer_inline=True)
         mlflow.openai.autolog()
 
-        _patch_tracer_on_interrupt()
+        _patch_tracer_for_langgraph()
 
         _mlflow_enabled = True
         logger.info("MLflow LangChain/LangGraph + OpenAI tracing enabled: %s", tracking_uri)

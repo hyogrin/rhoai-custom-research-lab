@@ -24,6 +24,7 @@ import { CitationBadge } from "@/components/elements/citation-badge";
 import { IterationReviewCard } from "@/components/elements/iteration-review-card";
 import { ExecutionPermissionCard } from "@/components/execution-permission-card";
 import { ClaimEvidenceGraph } from "@/components/claim-evidence-graph";
+import { IntroPanel } from "@/components/intro-panel";
 import { cn } from "@/lib/utils";
 import {
   ArrowDownIcon,
@@ -69,6 +70,7 @@ export const Thread: FC = () => {
   const { settings } = useSettings();
   const { steps, verbose, iterationReview, clearReview, executionPermission, clearExecutionPermission, claimEvidenceArtifact, artifactStatus } = useResearchEvents();
   const isKorean = settings.language === "ko-KR";
+  const [showIntro, setShowIntro] = useState(false);
 
   return (
     <ThreadPrimitive.Root
@@ -84,10 +86,16 @@ export const Thread: FC = () => {
       <ThreadPrimitive.Viewport
         className={cn(
           "relative flex flex-1 flex-col overflow-x-hidden overflow-y-scroll scroll-smooth px-4 pt-4",
-          isEmpty && "justify-center",
+          isEmpty && !showIntro && "justify-center",
         )}
       >
-        {isEmpty && <ThreadWelcome />}
+        {isEmpty && !showIntro && <ThreadWelcome />}
+        {isEmpty && showIntro && (
+          <IntroPanel
+            language={settings.language}
+            onClose={() => setShowIntro(false)}
+          />
+        )}
 
         <div className="mb-14 flex flex-col gap-y-4 empty:hidden">
           <ThreadPrimitive.Messages
@@ -141,7 +149,9 @@ export const Thread: FC = () => {
         >
           <ThreadScrollToBottom />
           <Composer />
-          {isEmpty && <ThreadSuggestions />}
+          {isEmpty && !showIntro && (
+            <ThreadSuggestions onShowIntro={() => setShowIntro(true)} />
+          )}
         </ThreadPrimitive.ViewportFooter>
       </ThreadPrimitive.Viewport>
     </ThreadPrimitive.Root>
@@ -536,6 +546,7 @@ const NO_DOCS_STARTERS = [
     label: "Upload a document",
     labelKo: "문서 업로드하기",
     icon: <Upload className="size-4" />,
+    action: "prompt" as const,
     prompt:
       "I'd like to upload a document for research. Please guide me on what file types are supported and how to get started.",
     promptKo:
@@ -545,15 +556,15 @@ const NO_DOCS_STARTERS = [
     label: "What can this tool do?",
     labelKo: "이 도구로 무엇을 할 수 있나요?",
     icon: <Info className="size-4" />,
-    prompt:
-      "Explain the features and capabilities of this deep research tool, including document analysis, citation, web search, and quality verification.",
-    promptKo:
-      "이 딥 리서치 도구의 기능과 역량을 설명해주세요. 문서 분석, 인용, 웹 검색, 품질 검증 등을 포함해서요.",
+    action: "intro" as const,
+    prompt: "",
+    promptKo: "",
   },
   {
     label: "Just chat",
     labelKo: "자유 대화",
     icon: <MessageCircle className="size-4" />,
+    action: "prompt" as const,
     prompt: "Hello! What topics are you interested in today?",
     promptKo: "안녕하세요! 오늘 어떤 주제에 관심이 있으신가요?",
   },
@@ -562,7 +573,9 @@ const NO_DOCS_STARTERS = [
 const chipClass =
   "text-foreground hover:bg-muted border-border/60 h-auto gap-1.5 rounded-full border px-3.5 py-1.5 text-sm font-normal whitespace-nowrap transition-colors cursor-pointer inline-flex items-center";
 
-const ThreadSuggestions: FC = () => {
+const ThreadSuggestions: FC<{ onShowIntro: () => void }> = ({
+  onShowIntro,
+}) => {
   const { settings } = useSettings();
   const { documents } = useDocuments();
   const aui = useAui();
@@ -577,6 +590,14 @@ const ThreadSuggestions: FC = () => {
     });
   };
 
+  const handleStarter = (starter: (typeof NO_DOCS_STARTERS)[number]) => {
+    if (starter.action === "intro") {
+      onShowIntro();
+    } else {
+      sendPrompt(isKorean ? starter.promptKo : starter.prompt);
+    }
+  };
+
   if (!hasDocuments) {
     return (
       <div className="flex w-full flex-col gap-2 px-4 min-h-[4.5rem]">
@@ -586,9 +607,7 @@ const ThreadSuggestions: FC = () => {
               <button
                 key={starter.label}
                 className={chipClass}
-                onClick={() =>
-                  sendPrompt(isKorean ? starter.promptKo : starter.prompt)
-                }
+                onClick={() => handleStarter(starter)}
               >
                 {starter.icon}
                 {isKorean ? starter.labelKo : starter.label}

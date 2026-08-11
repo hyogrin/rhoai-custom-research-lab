@@ -123,32 +123,49 @@ def _start_mcp_servers():
         logger.info("All %d MCP servers ready (%ds)", len(MCP_SERVERS), waited)
 
 
+_openshell_pf_proc: subprocess.Popen | None = None
+
+
+def _gw_tcp_check(host: str = "127.0.0.1", port: int = 8080, timeout: float = 3) -> bool:
+    """Return True if the OpenShell gateway gRPC port is reachable."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
 def _ensure_openshell_gateway():
     """Ensure the OpenShell gateway is available when claim-evidence graph is enabled.
 
-    The gateway runs as a Docker container via docker-compose (profile: openshell).
-    This is platform-agnostic — works on macOS, Linux, Windows with Docker Desktop.
+    Tries three strategies in order:
+    1. Gateway already reachable (existing port-forward or docker)
+    2. Start via docker compose
+    3. oc port-forward to cluster service (managed as backend subprocess)
     """
+    global _openshell_pf_proc
     import shutil
+    import urllib.parse
 
     if not os.environ.get("OPENSHELL_RENDERER_IMAGE"):
         logger.info("OPENSHELL_RENDERER_IMAGE not set — skipping OpenShell gateway setup")
         return
 
-    # Check if gateway is already reachable
     gateway_url = os.environ.get("OPENSHELL_GATEWAY_URL", "http://127.0.0.1:8080")
-    try:
-        import urllib.request
-        req = urllib.request.Request(f"{gateway_url.rstrip('/')}/healthz", method="GET")
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            if resp.status == 200:
-                logger.info("OpenShell gateway already running at %s", gateway_url)
-                return
-    except Exception:
-        pass
+    _parsed = urllib.parse.urlparse(gateway_url)
+    gw_host = _parsed.hostname or "127.0.0.1"
+    gw_port = _parsed.port or 8080
 
-    # Start gateway via docker compose (openshell profile)
-    logger.info("Starting OpenShell gateway via docker compose...")
+    # --- Strategy 1: Already reachable ---
+    if _gw_tcp_check(gw_host, gw_port):
+        logger.info("[OpenShell] ✅ Gateway already reachable at %s:%d", gw_host, gw_port)
+        return
+
+    # --- Strategy 2: Docker compose ---
     compose_file = os.path.join(os.path.dirname(__file__), "..", "docker-compose.yml")
     try:
         result = subprocess.run(
@@ -157,57 +174,83 @@ def _ensure_openshell_gateway():
             cwd=os.path.join(os.path.dirname(__file__), ".."),
         )
         if result.returncode == 0:
-            logger.info("OpenShell gateway container started")
-        else:
-            logger.warning("Failed to start OpenShell gateway: %s", result.stderr[:300])
-            return
+            logger.info("[OpenShell] Docker compose started — waiting for gateway...")
+            for _ in range(8):
+                time.sleep(2)
+                if _gw_tcp_check(gw_host, gw_port):
+                    logger.info("[OpenShell] ✅ Gateway reachable via docker compose")
+                    return
+            logger.warning("[OpenShell] Docker gateway started but TCP check failed")
     except FileNotFoundError:
-        logger.warning("docker not found — cannot start OpenShell gateway. Install Docker Desktop.")
-        return
+        pass
     except subprocess.TimeoutExpired:
-        logger.warning("OpenShell gateway startup timed out")
+        logger.warning("[OpenShell] Docker compose timed out")
+
+    # --- Strategy 3: oc port-forward (cluster) ---
+    oc_bin = shutil.which("oc")
+    if not oc_bin:
+        logger.warning("[OpenShell] ⚠️  Neither docker nor oc available — sandbox execution disabled")
         return
 
-    # Wait for gateway to be healthy
-    max_wait, interval = 15, 2
-    waited = 0
-    while waited < max_wait:
-        time.sleep(interval)
-        waited += interval
-        try:
-            req = urllib.request.Request(f"{gateway_url.rstrip('/')}/healthz", method="GET")
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                if resp.status == 200:
-                    logger.info("OpenShell gateway healthy (%ds)", waited)
-                    break
-        except Exception:
-            continue
-    else:
-        logger.warning("OpenShell gateway not healthy after %ds — sandbox execution may fail", max_wait)
-
-    # Register gateway with CLI if available
-    openshell_bin = shutil.which("openshell")
-    if openshell_bin:
-        subprocess.run(
-            [openshell_bin, "gateway", "add", gateway_url, "--local", "--name", "docker-local"],
-            capture_output=True, timeout=10,
-        )
-
-    # Install Python SDK if not available
     try:
-        import openshell  # noqa: F401
-    except ImportError:
-        logger.info("Installing openshell Python SDK...")
+        whoami = subprocess.run([oc_bin, "whoami"], capture_output=True, text=True, timeout=10)
+        if whoami.returncode != 0:
+            logger.warning("[OpenShell] ⚠️  Cluster login expired — run: oc login <cluster-url> --token=<token>")
+            return
+    except Exception as e:
+        logger.warning("[OpenShell] ⚠️  oc whoami failed: %s", e)
+        return
+
+    try:
+        svc_check = subprocess.run(
+            [oc_bin, "get", "svc", "openshell", "-n", "openshell"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if svc_check.returncode != 0:
+            logger.warning("[OpenShell] ⚠️  Service 'openshell' not found — run: ./scripts/install-openshell.sh")
+            return
+    except Exception:
+        return
+
+    # Kill stale port-forwards
+    try:
+        subprocess.run(["pkill", "-f", "port-forward svc/openshell"], capture_output=True, timeout=5)
+        time.sleep(1)
+    except Exception:
+        pass
+
+    logger.info("[OpenShell] Starting oc port-forward svc/openshell 8080:8080 -n openshell...")
+    _openshell_pf_proc = subprocess.Popen(
+        [oc_bin, "port-forward", "svc/openshell", f"{gw_port}:{gw_port}", "-n", "openshell"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+    for i in range(6):
+        time.sleep(2)
+        if _gw_tcp_check(gw_host, gw_port):
+            logger.info("[OpenShell] ✅ Port-forward started (pid=%d, %s:%d)", _openshell_pf_proc.pid, gw_host, gw_port)
+            return
+        if _openshell_pf_proc.poll() is not None:
+            stderr = _openshell_pf_proc.stderr.read().decode()[:200] if _openshell_pf_proc.stderr else ""
+            logger.warning("[OpenShell] ⚠️  Port-forward exited (code=%d): %s", _openshell_pf_proc.returncode, stderr)
+            _openshell_pf_proc = None
+            return
+
+    logger.warning("[OpenShell] ⚠️  Port-forward started (pid=%d) but TCP check failed after 12s", _openshell_pf_proc.pid)
+
+
+def _stop_openshell_gateway():
+    """Stop the managed port-forward subprocess if running."""
+    global _openshell_pf_proc
+    if _openshell_pf_proc and _openshell_pf_proc.poll() is None:
+        _openshell_pf_proc.terminate()
         try:
-            subprocess.run(
-                ["uv", "pip", "install", "openshell", "-q"],
-                capture_output=True, timeout=60,
-            )
-        except FileNotFoundError:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "openshell", "-q"],
-                capture_output=True, timeout=60,
-            )
+            _openshell_pf_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _openshell_pf_proc.kill()
+        logger.info("[OpenShell] Port-forward stopped (pid=%d)", _openshell_pf_proc.pid)
+    _openshell_pf_proc = None
 
 
 def _stop_mcp_servers():
@@ -297,6 +340,7 @@ async def lifespan(app: FastAPI):
 
     if getattr(app.state, "pg_checkpointer_ctx", None):
         await app.state.pg_checkpointer_ctx.__aexit__(None, None, None)
+    _stop_openshell_gateway()
     _stop_mcp_servers_full()
 
 

@@ -51,16 +51,8 @@ clean: ## Remove build artifacts
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -type f -name "*.pyc" -delete 2>/dev/null || true
 
-backend-start: _openshell-forward ## Start backend (auto-starts MCP servers as subprocesses)
+backend-start: ## Start backend (auto-starts MCP servers + OpenShell port-forward)
 	uv run uvicorn backend.api:app --host 0.0.0.0 --port $${BACKEND_PORT:-8000} --reload
-
-_openshell-forward: ## (internal) Port-forward OpenShell if available on cluster
-	@if oc get svc openshell -n openshell &>/dev/null 2>&1; then \
-		pkill -f "port-forward svc/openshell" 2>/dev/null || true; \
-		sleep 1; \
-		oc port-forward svc/openshell 8080:8080 -n openshell &>/dev/null & \
-		echo "[INFO] OpenShell port-forward started (localhost:8080)"; \
-	fi
 
 frontend-start: ## Start the Next.js frontend UI
 	cd frontend-next && npm run dev

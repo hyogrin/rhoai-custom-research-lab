@@ -59,19 +59,28 @@ SERVER_URLS = {
 # ---------------------------------------------------------------------------
 
 
-_MCP_TIMEOUT = int(os.getenv("MCP_TIMEOUT", "30"))
+_MCP_TIMEOUT = int(os.getenv("MCP_TIMEOUT", "60"))
 _MCP_MAX_RETRIES = int(os.getenv("MCP_MAX_RETRIES", "2"))
 
 
 async def _call_mcp_tool(server: str, tool_name: str, arguments: dict) -> Any:
     """Call a tool on a remote MCP server via streamable-http transport."""
     url = SERVER_URLS[server]
+    t0 = time.monotonic()
     async with streamable_http_client(url) as (read_stream, write_stream, _):
+        t_connect = time.monotonic()
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
+            t_init = time.monotonic()
             result = await session.call_tool(tool_name, arguments)
+            t_call = time.monotonic()
 
-            # Prefer structuredContent (FastMCP returns this for typed results)
+            logger.debug(
+                "MCP %s/%s timing: connect=%.1fs init=%.1fs call=%.1fs total=%.1fs",
+                server, tool_name,
+                t_connect - t0, t_init - t_connect, t_call - t_init, t_call - t0,
+            )
+
             if hasattr(result, "structuredContent") and result.structuredContent is not None:
                 return result.structuredContent.get("result", result.structuredContent)
 
@@ -95,7 +104,7 @@ def _call_mcp_sync(server: str, tool_name: str, arguments: dict) -> Any:
         except Exception as e:
             last_err = e
             err_str = str(e)
-            is_transient = any(k in err_str for k in ("TaskGroup", "ConnectionRefused", "timeout", "ConnectError"))
+            is_transient = any(k in err_str for k in ("TaskGroup", "ConnectionRefused", "timeout", "ConnectError", "TimeoutError"))
             if is_transient and attempt < _MCP_MAX_RETRIES:
                 wait = 2 ** attempt
                 logger.warning(
@@ -469,9 +478,12 @@ def generate_plan(
     web_note = ""
     if enable_web_search:
         web_note = (
-            "\n\nIMPORTANT: You have access to web search. When the user asks about "
-            "'latest trends', 'industry news', 'recent developments', or anything requiring "
-            "up-to-date information, include steps with action 'web_search' to gather current data. "
+            "\n\nIMPORTANT: You have access to web search. You MUST include steps with "
+            "action 'web_search' when the query involves ANY of:\n"
+            "- Latest trends, recent developments, industry news, current state-of-the-art\n"
+            "- Pros and cons, advantages vs disadvantages, comparisons between technologies\n"
+            "- Market analysis, adoption rates, community opinions\n"
+            "- Any topic where up-to-date information beyond uploaded documents is essential\n"
             "Use 'search' for document-based retrieval and 'web_search' for web-based retrieval."
         )
 
@@ -510,8 +522,13 @@ def generate_sectioned_plan(
     web_note = ""
     if enable_web_search:
         web_note = (
-            "- You may include web search queries prefixed with 'web:' for topics that "
-            "benefit from up-to-date web information\n"
+            "- For each sub_topic, set \"needs_web\": true if the section requires web search.\n"
+            "  MANDATORY web search cases — always set needs_web to true when:\n"
+            "  * Latest trends, recent developments, industry news, current state-of-the-art\n"
+            "  * Pros and cons, advantages vs disadvantages, comparisons between technologies\n"
+            "  * Market analysis, adoption rates, community opinions\n"
+            "  * Any topic where up-to-date information beyond uploaded documents is essential\n"
+            "  Set \"needs_web\": false only for sections that can be fully answered from uploaded documents alone.\n"
         )
     system_content = (
         "You are a research planner. Given a research question, decompose it into "
@@ -523,11 +540,13 @@ def generate_sectioned_plan(
         "IMPORTANT: Fewer sections is better. Do NOT create separate sections for 'introduction', "
         "'overview', 'background', or 'conclusion' — integrate them into the main topic sections.\n\n"
         "Return ONLY a JSON object (no other text) with this shape:\n"
-        '{"sub_topics": [{"section_number": 1, "title": "...", "queries": ["search query 1", "..."], "purpose": "..."}, '
-        '{"section_number": 2, "title": "...", "queries": [...], "purpose": "..."}], '
+        '{"sub_topics": [{"section_number": 1, "title": "...", "queries": ["search query 1", "..."], '
+        '"needs_web": true, "purpose": "..."}, '
+        '{"section_number": 2, "title": "...", "queries": [...], '
+        '"needs_web": false, "purpose": "..."}], '
         '"summary_query": "one-line summary of the full research"}\n\n'
         "Rules:\n"
-        "- Each sub_topic MUST have section_number (starting from 1), title, 1-3 search queries, and a purpose\n"
+        "- Each sub_topic MUST have section_number (starting from 1), title, 1-3 search queries, needs_web (bool), and a purpose\n"
         "- Return sub_topics in ascending section_number order\n"
         "- Use ONLY as many sections as the query genuinely requires — do NOT pad with unnecessary sections\n"
         "- Sub-topics should cover the question comprehensively without overlap\n"

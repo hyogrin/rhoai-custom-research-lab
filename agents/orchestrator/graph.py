@@ -248,22 +248,34 @@ def _search_section(
     topic: dict, query: str, iteration: int, ws_flag: bool, parallel: bool,
     document_id: str = "", ws_limit: int = 2,
 ) -> dict:
-    """Run search queries for a single section and return context + counts."""
+    """Run search queries for a single section and return context + counts.
+
+    Web search scope is determined by the plan's ``needs_web`` flag:
+    - ``True``  → web search runs for ALL queries (trends, comparisons, etc.)
+    - ``False`` → web search runs only for the first query (default)
+    When ``ws_flag`` is False globally, web search is skipped entirely.
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     title = topic.get("title", "Untitled")
     queries = topic.get("queries", [query])
+    needs_web = topic.get("needs_web", False)
 
     section_context: list[dict] = []
     semantic_count = 0
     web_count = 0
+
+    def _should_web(idx: int) -> bool:
+        if not ws_flag:
+            return False
+        return needs_web or idx == 0
 
     if parallel:
         futures_map: dict = {}
         with ThreadPoolExecutor(max_workers=_PARALLEL_WORKERS) as pool:
             for idx, q in enumerate(queries[:3]):
                 futures_map[pool.submit(_run_semantic, q, iteration, document_id)] = ("semantic", q)
-                if ws_flag and idx == 0:
+                if _should_web(idx):
                     futures_map[pool.submit(_run_web, q, iteration, ws_limit)] = ("web", q)
 
             for future in as_completed(futures_map):
@@ -285,7 +297,7 @@ def _search_section(
                 r.setdefault("metadata", {})["sub_topic"] = title
                 section_context.append(r)
                 semantic_count += 1
-            if ws_flag and idx == 0:
+            if _should_web(idx):
                 for r in _run_web(q, iteration, ws_limit):
                     r.setdefault("metadata", {})["sub_topic"] = title
                     section_context.append(r)
@@ -357,6 +369,7 @@ def _execute_sections(state: ResearchState, writer: StreamWriter) -> dict:
 
     new_context = list(state.get("accumulated_context") or [])
     total_tokens = state.get("total_tokens", 0)
+    web_empty_sections: list[str] = []
 
     topics_to_process = []
     previous_contents: dict[str, str] = {}
@@ -412,6 +425,9 @@ def _execute_sections(state: ResearchState, writer: StreamWriter) -> dict:
 
         sem = search_result["semantic_count"]
         web = search_result["web_count"]
+
+        if ws_flag and web == 0 and topic.get("needs_web", False):
+            web_empty_sections.append(title)
 
         if sem == 0 and web == 0:
             logger.warning("No search results for section '%s' — skipping (MCP servers may be unavailable)", title)
@@ -488,13 +504,20 @@ def _execute_sections(state: ResearchState, writer: StreamWriter) -> dict:
     )
     total_tokens += report_result.get("tokens_used", 0)
 
-    update = {
+    update: dict = {
         "accumulated_context": new_context,
         "report_sections": sections,
         "current_draft": report_result.get("draft", ""),
         "status": "verifying",
         "total_tokens": total_tokens,
     }
+    if web_empty_sections:
+        hint = (
+            f"[web_search_gap] Sections with 0 web results despite needing web data: "
+            f"{', '.join(web_empty_sections)}. "
+            "Consider rewriting queries or increasing web_search_limit for these sections."
+        )
+        update["failure_hints"] = (state.get("failure_hints", "") + "\n" + hint).strip()
     return update
 
 
@@ -772,14 +795,24 @@ def observe_node(state: ResearchState) -> dict:
         "failure_hints": failure_hints,
     }
 
+    # Preserve web_search_gap hints from execute phase
+    exec_hints = state.get("failure_hints", "")
+    if "[web_search_gap]" in exec_hints and "[web_search_gap]" not in failure_hints:
+        failure_hints += "\n" + "\n".join(
+            line for line in exec_hints.split("\n") if "[web_search_gap]" in line
+        )
+        update["failure_hints"] = failure_hints
+
     # Dynamically increase web_search_limit when sources appear insufficient
     if not passed:
         current_limit = state.get("web_search_limit", 2)
         max_limit = state.get("web_search_max_limit", 5)
         if current_limit < max_limit:
             details = state.get("verification_result", {}).get("quality_details", {})
+            has_web_gap = "[web_search_gap]" in state.get("failure_hints", "")
             needs_more_sources = (
-                details.get("completeness", 10) < 6
+                has_web_gap
+                or details.get("completeness", 10) < 6
                 or details.get("source_quality", 10) < 6
                 or any(
                     kw in imp.lower()
@@ -1041,6 +1074,22 @@ def sandbox_execute_node(state: ResearchState, writer: StreamWriter) -> dict:
     session_id = state.get("session_id", "")
 
     executor = get_executor()
+
+    gw_ok, gw_err = executor.check_connectivity()
+    if not gw_ok:
+        logger.warning("OpenShell gateway unavailable — skipping sandbox execution: %s", gw_err)
+        writer({
+            "progress": "execution_failed",
+            "execution_id": execution_id,
+            "stage": "sandbox_execute",
+            "error": f"OpenShell gateway unavailable: {gw_err}",
+        })
+        return {
+            "sandbox_id": "",
+            "sandbox_status": "failed",
+            "sandbox_error": f"Gateway unavailable: {gw_err}",
+            "artifact_status": "failed",
+        }
     short_id = execution_id[:8] if execution_id else session_id[:8]
     sandbox_name = f"ce-{short_id}"
 
@@ -1294,48 +1343,121 @@ def _build_source_registry(accumulated_context: list[dict]) -> dict[str, dict]:
 
 
 def resolve_citations(text: str, accumulated_context: list[dict]) -> tuple[str, list[dict]]:
-    """Citation resolver: extract [[cite:SRC_ID]], validate, assign numbers, replace.
+    """Citation resolver: extract source ID citations, validate, assign numbers, replace.
 
-    1. Extract all [[cite:SOURCE_ID]] tokens from text.
-    2. Validate each against the source registry.
-    3. Assign citation numbers by first-appearance order.
-    4. Replace [[cite:SRC_ID]] with [N](#cite-N).
-    5. Return (resolved_text, sources_list for frontend).
+    Handles multiple citation formats the LLM may produce:
+      - ``[[cite:SRC_ID]]``  (standard double-bracket)
+      - ``[cite:SRC_ID]``    (single-bracket variant)
+      - ``[[SRC_ID]]`` / ``[SRC_ID]`` (bare ID in brackets, no ``cite:`` prefix)
+    Prefix matching recovers truncated IDs (e.g. ``SRC_A81F`` → ``SRC_A81F3E``).
 
-    Unknown/hallucinated source IDs are silently removed.
+    Returns ``(resolved_text, sources_list)`` for the frontend.
     """
     import re as _re
 
     registry = _build_source_registry(accumulated_context)
 
-    # Find all cited source IDs in order of appearance (case-insensitive)
-    cite_pattern = _re.compile(r"\[\[cite:(SRC_[A-Za-z0-9]+)\]\]", _re.IGNORECASE)
-    all_cited = [s.upper() for s in cite_pattern.findall(text)]
+    if not registry:
+        logger.info("[citation] Empty source registry — skipping resolution")
+        return text, []
 
-    # Assign sequential numbers by first appearance (only valid IDs)
+    logger.debug(
+        "[citation] Registry (%d entries): %s",
+        len(registry),
+        {k: f"{v['name'][:30]}|{'web' if v['url'] else 'doc'}" for k, v in registry.items()},
+    )
+
+    # --- Phase 1: find cited source IDs with multiple patterns ---------
+
+    # A) [[cite:SRC_XXX]] or [cite:SRC_XXX] (with optional whitespace)
+    cite_pat = _re.compile(
+        r"\[{1,2}cite:\s*(SRC_[A-Za-z0-9_]+)\s*\]{1,2}", _re.IGNORECASE,
+    )
+    # B) [[SRC_XXX]] or [SRC_XXX] without "cite:" — but NOT markdown link text [SRC_XXX](url)
+    bare_pat = _re.compile(
+        r"\[{1,2}(SRC_[A-Za-z0-9_]+)\]{1,2}(?!\()", _re.IGNORECASE,
+    )
+
+    found: list[tuple[str, int, str]] = []  # (SRC_ID_UPPER, position, pattern_label)
+    seen_pos: set[int] = set()
+
+    for m in cite_pat.finditer(text):
+        found.append((m.group(1).upper(), m.start(), "cite"))
+        seen_pos.add(m.start())
+
+    for m in bare_pat.finditer(text):
+        if m.start() not in seen_pos:
+            found.append((m.group(1).upper(), m.start(), "bare"))
+            seen_pos.add(m.start())
+
+    found.sort(key=lambda x: x[1])
+
+    # --- Phase 2: assign citation numbers (first-appearance order) -----
+
+    def _resolve_id(src_id: str) -> str | None:
+        """Return the registry key for *src_id*, or None if unresolvable."""
+        if src_id in registry:
+            return src_id
+        # Prefix match: SRC_A81F ↔ SRC_A81F3E
+        candidates = [k for k in registry if k.startswith(src_id) or src_id.startswith(k)]
+        if len(candidates) == 1:
+            logger.info("[citation] Prefix-matched %s → %s", src_id, candidates[0])
+            return candidates[0]
+        return None
+
     id_to_num: dict[str, int] = {}
-    for src_id in all_cited:
-        if src_id in registry and src_id not in id_to_num:
-            id_to_num[src_id] = len(id_to_num) + 1
+    id_to_rkey: dict[str, str] = {}      # cited ID → registry key
+    rkey_to_num: dict[str, int] = {}     # registry key → citation number (dedup)
+    next_num = 1
 
-    # Remove any legacy numeric citations the LLM might have produced
+    for src_id, _, pat_label in found:
+        if src_id in id_to_num:
+            continue
+        rkey = _resolve_id(src_id)
+        if rkey is None:
+            logger.debug("[citation] Unresolved ID: %s (pattern: %s)", src_id, pat_label)
+            continue
+        if rkey in rkey_to_num:
+            id_to_num[src_id] = rkey_to_num[rkey]
+        else:
+            id_to_num[src_id] = next_num
+            rkey_to_num[rkey] = next_num
+            next_num += 1
+        id_to_rkey[src_id] = rkey
+
+    cite_n = sum(1 for *_, p in found if p == "cite")
+    bare_n = sum(1 for *_, p in found if p == "bare")
+    logger.info(
+        "[citation] Found %d references (cite=%d, bare=%d), resolved %d unique sources",
+        len(found), cite_n, bare_n, len(rkey_to_num),
+    )
+
+    # --- Phase 3: clean legacy formats ---------------------------------
+
     text = _re.sub(r"\[Source\s+\d+\](?!\()", "", text)
     text = _re.sub(r"\[\d+\]\(#cite-\d+\)", "", text)
 
-    # Replace [[cite:SRC_ID]] with [N](#cite-N) or remove if invalid
-    def _replace_cite(m: _re.Match) -> str:
-        src_id = m.group(1).upper()
-        num = id_to_num.get(src_id)
-        if num is None:
-            return ""
-        return f"[{num}](#cite-{num})"
+    # --- Phase 4: replace citations ------------------------------------
 
-    resolved = cite_pattern.sub(_replace_cite, text)
+    def _make_cite(src_id_upper: str) -> str:
+        num = id_to_num.get(src_id_upper)
+        return f"[{num}](#cite-{num})" if num is not None else ""
 
-    # Build sources list for frontend (only actually cited sources)
-    sources_list = []
-    for src_id, num in sorted(id_to_num.items(), key=lambda x: x[1]):
-        entry = registry[src_id]
+    resolved = cite_pat.sub(lambda m: _make_cite(m.group(1).upper()), text)
+    resolved = bare_pat.sub(
+        lambda m: _make_cite(m.group(1).upper()) or m.group(0),
+        resolved,
+    )
+
+    # --- Phase 5: build sources list -----------------------------------
+
+    used_nums: set[int] = set()
+    sources_list: list[dict] = []
+    for rkey, num in sorted(rkey_to_num.items(), key=lambda x: x[1]):
+        if num in used_nums:
+            continue
+        used_nums.add(num)
+        entry = registry[rkey]
         sources_list.append({
             "index": num,
             "name": entry["name"],
@@ -1404,15 +1526,28 @@ def finalize_node(state: ResearchState) -> dict:
 
     output = _fix_markdown_output(output)
 
-    # Resolve [[cite:SRC_ID]] → [N](#cite-N) and build sources list
+    # Resolve citations and build sources list
     accumulated_context = state.get("accumulated_context") or []
+    web_ctx = [c for c in accumulated_context if (c.get("metadata") or {}).get("type") == "web_search"]
+    doc_ctx = [c for c in accumulated_context if (c.get("metadata") or {}).get("type") != "web_search"]
     logger.info(
-        "[finalize] Resolving citations: %d context entries, %d have source_id",
+        "[finalize] Resolving citations: %d context entries (%d doc, %d web), %d have source_id",
         len(accumulated_context),
+        len(doc_ctx),
+        len(web_ctx),
         sum(1 for c in accumulated_context if c.get("source_id")),
     )
+    import re as _finalize_re
+    raw_cite_count = len(_finalize_re.findall(r"SRC_[A-Za-z0-9_]+", output))
+    logger.info("[finalize] Pre-resolution SRC_ patterns in text: %d", raw_cite_count)
+
     output, sources_list = resolve_citations(output, accumulated_context)
-    logger.info("[finalize] Citation resolution: %d sources cited", len(sources_list))
+    web_sources = [s for s in sources_list if s.get("url")]
+    doc_sources = [s for s in sources_list if not s.get("url")]
+    logger.info(
+        "[finalize] Citation resolution: %d sources cited (%d doc, %d web)",
+        len(sources_list), len(doc_sources), len(web_sources),
+    )
 
     # Append references section (only actually cited sources, deterministic order)
     if sources_list:

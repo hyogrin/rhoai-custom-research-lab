@@ -27,8 +27,8 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
         onClick={onClose}
       />
       {/* Panel */}
-      <div className="fixed inset-y-0 right-0 z-50 w-80 border-l border-border bg-card shadow-xl">
-        <div className="flex h-14 items-center justify-between border-b border-border px-4">
+      <div className="fixed inset-y-0 right-0 z-50 flex w-80 flex-col overflow-hidden border-l border-border bg-card shadow-xl">
+        <div className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4">
           <h2 className="text-sm font-semibold">Research Settings</h2>
           <button
             onClick={onClose}
@@ -39,7 +39,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
           </button>
         </div>
 
-        <div className="flex flex-col gap-6 overflow-y-auto p-4">
+        <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-y-auto p-4 pb-8">
           {/* Sliders */}
           <SliderSetting
             icon={<Target className="h-4 w-4 text-primary" />}

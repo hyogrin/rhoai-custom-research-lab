@@ -1,8 +1,12 @@
 """Vector Search MCP Server — sqlite-vec semantic search tools."""
 
 import json
+import logging
 import os
 import sys
+import threading
+import time
+from collections import OrderedDict
 
 import httpx
 from dotenv import load_dotenv
@@ -14,6 +18,8 @@ load_dotenv(override=True)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from db import get_connection
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_v1(url: str) -> str:
@@ -32,10 +38,30 @@ _HTTP_CLIENT = None if _VERIFY_SSL else httpx.Client(verify=False, timeout=httpx
 mcp = FastMCP("vector-search-mcp", host="0.0.0.0", port=9002, stateless_http=True)
 
 
+_EMBED_CACHE_SIZE = int(os.getenv("EMBEDDING_CACHE_SIZE", "128"))
+_embed_cache: OrderedDict[str, list[float]] = OrderedDict()
+_embed_cache_lock = threading.Lock()
+
+
 def _get_embedding(text: str) -> list[float]:
+    with _embed_cache_lock:
+        if text in _embed_cache:
+            _embed_cache.move_to_end(text)
+            return _embed_cache[text]
+
+    t0 = time.monotonic()
     client = OpenAI(base_url=EMBEDDING_BASE_URL, api_key=EMBEDDING_API_KEY, http_client=_HTTP_CLIENT)
     response = client.embeddings.create(input=[text], model=EMBEDDING_MODEL)
-    return response.data[0].embedding
+    embedding = response.data[0].embedding
+    elapsed = time.monotonic() - t0
+    logger.debug("Embedding API: %.1fs for %d chars", elapsed, len(text))
+
+    with _embed_cache_lock:
+        _embed_cache[text] = embedding
+        if len(_embed_cache) > _EMBED_CACHE_SIZE:
+            _embed_cache.popitem(last=False)
+
+    return embedding
 
 
 @mcp.tool()

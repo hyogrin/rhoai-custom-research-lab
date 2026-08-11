@@ -192,3 +192,103 @@ class TestResolveCitations:
         assert len(sources) == 2
         assert sources[0]["name"] == "Doc A"
         assert sources[1]["name"] == "Doc B"
+
+    def test_single_bracket_cite(self):
+        """LLM might use single brackets: [cite:SRC_XXX] instead of [[cite:SRC_XXX]]."""
+        ctx = _make_context([
+            {"id": "SRC_A81F", "name": "Doc A"},
+            {"id": "SRC_B27C", "name": "Doc B"},
+        ])
+        text = "Single [cite:SRC_A81F]. Double [[cite:SRC_B27C]]."
+        resolved, sources = resolve_citations(text, ctx)
+
+        assert "[1](#cite-1)" in resolved
+        assert "[2](#cite-2)" in resolved
+        assert "[cite:" not in resolved
+        assert "[[cite:" not in resolved
+        assert len(sources) == 2
+
+    def test_bare_src_id_in_brackets(self):
+        """LLM might cite as [SRC_XXX] without 'cite:' prefix."""
+        ctx = _make_context([
+            {"id": "SRC_A81F", "name": "Doc A"},
+            {"id": "SRC_B27C", "name": "Doc B"},
+        ])
+        text = "Bare [SRC_A81F]. Also [[SRC_B27C]]."
+        resolved, sources = resolve_citations(text, ctx)
+
+        assert "[1](#cite-1)" in resolved
+        assert "[2](#cite-2)" in resolved
+        assert len(sources) == 2
+
+    def test_bare_src_id_not_confused_with_link(self):
+        """[SRC_XXX](url) is a markdown link — should NOT be matched as citation."""
+        ctx = _make_context([
+            {"id": "SRC_A81F", "name": "Doc A"},
+        ])
+        text = "Link [SRC_A81F](https://example.com). Citation [SRC_A81F]."
+        resolved, sources = resolve_citations(text, ctx)
+
+        assert "[SRC_A81F](https://example.com)" in resolved
+        assert len(sources) == 1
+
+    def test_prefix_match_truncated_id(self):
+        """LLM might truncate source ID (SRC_A81F instead of SRC_A81F3E)."""
+        ctx = _make_context([
+            {"id": "SRC_A81F3E", "name": "Doc A"},
+            {"id": "SRC_B27C4D", "name": "Doc B"},
+        ])
+        text = "Truncated [[cite:SRC_A81F]]. Full [[cite:SRC_B27C4D]]."
+        resolved, sources = resolve_citations(text, ctx)
+
+        assert "[1](#cite-1)" in resolved
+        assert "[2](#cite-2)" in resolved
+        assert len(sources) == 2
+        assert sources[0]["name"] == "Doc A"
+
+    def test_prefix_match_same_source_same_number(self):
+        """Truncated and full IDs for the same source get the same citation number."""
+        ctx = _make_context([
+            {"id": "SRC_A81F3E", "name": "Doc A"},
+        ])
+        text = "Full [[cite:SRC_A81F3E]]. Truncated [[cite:SRC_A81F]]."
+        resolved, sources = resolve_citations(text, ctx)
+
+        assert resolved.count("[1](#cite-1)") == 2
+        assert len(sources) == 1
+
+    def test_cite_with_space_after_colon(self):
+        """LLM might add a space: [[cite: SRC_XXX]]."""
+        ctx = _make_context([
+            {"id": "SRC_A81F", "name": "Doc A"},
+        ])
+        text = "Spaced [[cite: SRC_A81F]]. Also [cite: SRC_A81F]."
+        resolved, sources = resolve_citations(text, ctx)
+
+        assert resolved.count("[1](#cite-1)") == 2
+        assert len(sources) == 1
+
+    def test_mixed_formats_across_sections(self):
+        """Different sections may use different citation formats — all should resolve."""
+        ctx = _make_context([
+            {"id": "SRC_DOC1", "name": "Document 1", "url": ""},
+            {"id": "SRC_WEB1", "name": "Web Article", "url": "https://example.com"},
+            {"id": "SRC_DOC2", "name": "Document 2", "url": ""},
+        ])
+        text = (
+            "## Section 1\n"
+            "Finding [[cite:SRC_DOC1]]. Web source [[cite:SRC_WEB1]].\n\n"
+            "## Section 2\n"
+            "Another finding [cite:SRC_DOC2]. Also relevant [SRC_WEB1].\n\n"
+            "## Section 3\n"
+            "Cross-ref [SRC_DOC1]."
+        )
+        resolved, sources = resolve_citations(text, ctx)
+
+        assert "[[cite:" not in resolved
+        assert "[cite:" not in resolved
+        assert "[SRC_" not in resolved or "[SRC_" in "[1](#cite-1)"
+        assert len(sources) == 3
+        web = next(s for s in sources if s["name"] == "Web Article")
+        assert web["url"] == "https://example.com"
+        assert web["domain"] == "example.com"

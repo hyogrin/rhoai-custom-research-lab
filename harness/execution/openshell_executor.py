@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 class ExecutorProtocol(Protocol):
     """Protocol that both real and fake executors implement."""
 
+    def check_connectivity(self) -> tuple[bool, str]: ...
     def create_sandbox(self, config: SandboxConfig) -> str: ...
     def upload_inputs(self, sandbox_id: str, files: dict[str, bytes]) -> None: ...
     def execute(self, sandbox_id: str, command: list[str], timeout: int) -> ExecutionResult: ...
@@ -43,6 +44,23 @@ class OpenShellExecutor:
                 )
             self._client = SandboxClient.from_active_cluster()
         return self._client
+
+    def check_connectivity(self) -> tuple[bool, str]:
+        """Verify the OpenShell gateway is reachable via TCP (gRPC port)."""
+        import socket
+        import urllib.parse
+        gateway_url = os.environ.get("OPENSHELL_GATEWAY_URL", "http://127.0.0.1:8080")
+        parsed = urllib.parse.urlparse(gateway_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 8080
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3)
+            s.connect((host, port))
+            s.close()
+            return True, ""
+        except Exception as e:
+            return False, f"Gateway {host}:{port} unreachable: {e}"
 
     def create_sandbox(self, config: SandboxConfig) -> str:
         client = self._get_client()
@@ -172,6 +190,9 @@ class FakeOpenShellExecutor:
         self._metadata_output = b'{"nodes_rendered": 5}'
         self.created_sandboxes: list[str] = []
         self.deleted_sandboxes: list[str] = []
+
+    def check_connectivity(self) -> tuple[bool, str]:
+        return True, ""
 
     def create_sandbox(self, config: SandboxConfig) -> str:
         self.created_sandboxes.append(config.name)
