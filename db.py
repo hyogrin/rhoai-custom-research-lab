@@ -1,55 +1,84 @@
-"""Shared database module — SQLite + sqlite-vec for vector search and application state.
+"""Shared database module — local PostgreSQL for harness state only.
 
 All modules import `get_connection()` from here instead of managing DB connections directly.
-The sqlite-vec extension is loaded automatically on every connection.
+This connects to the LOCAL PostgreSQL instance (POSTGRES_URL in .env) for:
+  - LangGraph checkpointing
+  - Research sessions, trace events, failure log
+  - Chat history
+
+Vector storage (pgvector) is handled separately by Llama Stack on the cluster
+and is NOT accessed through this module.
 """
 
-import json
+import logging
 import os
-import sqlite3
 
-import sqlite_vec
+import psycopg
 from dotenv import load_dotenv
-from sqlite_vec import serialize_float32
 
 load_dotenv(override=True)
 
-_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+logger = logging.getLogger(__name__)
 
-_raw_db_path = os.getenv(
-    "SQLITE_DB_PATH",
-    os.path.join(_PROJECT_ROOT, "data", "research.db"),
+POSTGRES_URL = os.getenv(
+    "POSTGRES_URL",
+    "postgresql://research:research@localhost:5432/research_db",
 )
-DB_PATH = _raw_db_path if os.path.isabs(_raw_db_path) else os.path.join(_PROJECT_ROOT, _raw_db_path)
 
-_INIT_SQL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "init-db.sql")
+_HARNESS_DDL = """
+CREATE TABLE IF NOT EXISTS research_sessions (
+    session_id TEXT PRIMARY KEY,
+    query TEXT NOT NULL,
+    iteration INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'initialized',
+    quality_score REAL DEFAULT 0.0,
+    state JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_status ON research_sessions(status);
+
+CREATE TABLE IF NOT EXISTS trace_events (
+    id SERIAL PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    iteration INTEGER,
+    layer TEXT,
+    operation TEXT,
+    input_summary TEXT,
+    output_summary TEXT,
+    tokens_used INTEGER DEFAULT 0,
+    latency_ms INTEGER DEFAULT 0,
+    success BOOLEAN DEFAULT TRUE,
+    failure_category TEXT,
+    metadata JSONB DEFAULT '{}',
+    timestamp TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_traces_session ON trace_events(session_id);
+
+CREATE TABLE IF NOT EXISTS failure_log (
+    id SERIAL PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    iteration INTEGER,
+    category TEXT,
+    description TEXT,
+    context TEXT,
+    resolution TEXT DEFAULT '',
+    timestamp TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_failures_session ON failure_log(session_id);
+CREATE INDEX IF NOT EXISTS idx_failures_category ON failure_log(category);
+"""
 
 
-def get_connection() -> sqlite3.Connection:
-    """Return a SQLite connection with sqlite-vec loaded."""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    if not hasattr(conn, "enable_load_extension"):
-        conn.close()
-        raise RuntimeError(
-            "This Python build does not support SQLite extension loading.\n"
-            "On macOS, use Homebrew Python instead of the python.org installer:\n"
-            "  brew install python@3.13\n"
-            "  uv venv --python $(brew --prefix python@3.13)/bin/python3.13\n"
-            "  uv sync"
-        )
-    conn.enable_load_extension(True)
-    sqlite_vec.load(conn)
-    conn.enable_load_extension(False)
+def get_connection() -> psycopg.Connection:
+    """Return a PostgreSQL connection with autocommit off and dict-like row factory."""
+    conn = psycopg.connect(POSTGRES_URL, row_factory=psycopg.rows.dict_row)
     return conn
 
 
 def init_db():
-    """Initialize the database schema from scripts/init-db.sql."""
+    """Ensure harness tables exist in PostgreSQL."""
     conn = get_connection()
-    with open(_INIT_SQL) as f:
-        conn.executescript(f.read())
+    conn.execute(_HARNESS_DDL)
+    conn.commit()
     conn.close()

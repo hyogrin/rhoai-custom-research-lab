@@ -115,7 +115,7 @@ class TraceCollector:
         }
 
     def persist(self, session_id: str):
-        """Save trace events to SQLite."""
+        """Save trace events to PostgreSQL."""
         events = self.get_events(session_id)
         if not events:
             return
@@ -127,11 +127,11 @@ class TraceCollector:
                 """INSERT INTO trace_events
                     (session_id, iteration, layer, operation, input_summary, output_summary,
                      tokens_used, latency_ms, success, failure_category, metadata, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
                     event.session_id, event.iteration, event.layer, event.operation,
                     event.input_summary, event.output_summary, event.tokens_used,
-                    event.latency_ms, 1 if event.success else 0, event.failure_category,
+                    event.latency_ms, event.success, event.failure_category,
                     json.dumps(event.metadata), event.timestamp,
                 ),
             )

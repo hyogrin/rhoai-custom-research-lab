@@ -4,7 +4,7 @@
 
 [Docling](https://github.com/docling-project/docling) is an open-source document processing library developed by IBM Research, adopted by Red Hat for use in OpenShift AI pipelines. With 62,000+ GitHub stars, it is the leading open-source tool for converting complex documents into structured formats for generative AI applications.
 
-In this lab, Docling serves as the data foundation for the harness — documents are parsed, chunked, and embedded into pgvector, where the harness's MCP tools can search and retrieve them during iterative research.
+In this lab, Docling serves as the data foundation for the harness — documents are parsed into Markdown and then ingested into Llama Stack's vector store (which handles chunking, embedding, and storage). The harness's MCP tools proxy search requests to Llama Stack during iterative research.
 
 ## Why Docling?
 
@@ -27,23 +27,11 @@ Document Upload (PDF/DOCX/PPTX)
 │  Docling Parser  │  ← DocumentConverter
 │  (Multi-format)  │
 └────────┬────────┘
-         │
+         │ (Markdown output)
          ▼
 ┌─────────────────┐
-│ Hybrid Chunker   │  ← Semantic chunking with structure preservation
-│ (Token-aware)    │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Embedding Model  │  ← Granite Embedding via RHOAI
-│ (768-dim)        │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ PostgreSQL +     │  ← pgvector for similarity search
-│ pgvector         │
+│  Llama Stack     │  ← Files API + Vector Stores API
+│  (RHOAI 3.4)    │     Handles chunking, embedding, storage
 └─────────────────┘
 ```
 
@@ -52,15 +40,12 @@ Document Upload (PDF/DOCX/PPTX)
 ### Document Conversion
 Docling's `DocumentConverter` handles format detection and parsing automatically. It produces a unified `Document` object with structured content (headings, paragraphs, tables, figures).
 
-### Semantic Chunking
-The `HybridChunker` splits documents while respecting:
-- Section boundaries (headings)
-- Paragraph integrity
-- Table completeness
-- Token budget (configurable max tokens per chunk)
-
-### pgvector Storage
-Chunks are embedded using the Granite embedding model and stored in PostgreSQL with the pgvector extension, enabling cosine similarity search for RAG retrieval.
+### Llama Stack Ingestion
+After Docling parsing, the Markdown output is uploaded to Llama Stack's Files API,
+then added to a Vector Store. Llama Stack handles:
+- Chunking (configurable `max_chunk_size_tokens` and `chunk_overlap_tokens`)
+- Embedding (using the configured embedding model on the cluster)
+- Storage and similarity search via the Vector Stores API
 
 ## References
 

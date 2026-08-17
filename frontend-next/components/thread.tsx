@@ -673,17 +673,109 @@ const ThreadSuggestions: FC<{ onShowIntro: () => void }> = ({
 // Composer
 // ---------------------------------------------------------------------------
 
+type PipelinePhase = "uploading" | "docling" | "llama_stack_upload" | "llama_stack_ingest" | "completed" | "error" | null;
+
+const PIPELINE_STEPS: { key: string; label: string; phases: string[] }[] = [
+  { key: "upload", label: "Upload", phases: ["uploading"] },
+  { key: "docling", label: "Docling", phases: ["docling"] },
+  { key: "llama_stack", label: "Llama Stack", phases: ["llama_stack_upload", "llama_stack_ingest"] },
+];
+
+function getPipelineStepState(
+  stepPhases: string[],
+  currentPhase: PipelinePhase,
+): "pending" | "active" | "done" | "error" {
+  if (currentPhase === "error") return "error";
+  if (currentPhase === "completed") return "done";
+  if (!currentPhase) return "pending";
+
+  const phaseOrder = [
+    "uploading",
+    "docling",
+    "llama_stack_upload",
+    "llama_stack_ingest",
+    "completed",
+  ];
+  const currentIdx = phaseOrder.indexOf(currentPhase);
+  const stepFirstIdx = phaseOrder.indexOf(stepPhases[0]);
+  const stepLastIdx = phaseOrder.indexOf(stepPhases[stepPhases.length - 1]);
+
+  if (currentIdx > stepLastIdx) return "done";
+  if (currentIdx >= stepFirstIdx && currentIdx <= stepLastIdx) return "active";
+  return "pending";
+}
+
+const PipelineIndicator: FC<{ phase: PipelinePhase }> = ({ phase }) => (
+  <div className="flex items-center justify-center gap-0 px-4 py-1.5">
+    {PIPELINE_STEPS.map((step, i) => {
+      const state = getPipelineStepState(step.phases, phase);
+      return (
+        <div key={step.key} className="flex items-center">
+          {i > 0 && (
+            <div
+              className={cn(
+                "h-px w-6 transition-colors duration-300",
+                state === "done" || state === "active"
+                  ? "bg-primary/50"
+                  : "bg-border/60",
+              )}
+            />
+          )}
+          <div className="flex items-center gap-1.5">
+            <div
+              className={cn(
+                "flex size-4 items-center justify-center rounded-full transition-all duration-300",
+                state === "active" &&
+                  "bg-primary text-primary-foreground ring-2 ring-primary/20",
+                state === "done" && "bg-emerald-500 text-white",
+                state === "pending" && "bg-muted-foreground/20",
+                state === "error" && "bg-destructive text-white",
+              )}
+            >
+              {state === "done" ? (
+                <Check className="size-2.5" />
+              ) : state === "active" ? (
+                <Loader2 className="size-2.5 animate-spin" />
+              ) : state === "error" ? (
+                <AlertTriangle className="size-2.5" />
+              ) : (
+                <div className="size-1.5 rounded-full bg-muted-foreground/40" />
+              )}
+            </div>
+            <span
+              className={cn(
+                "text-[11px] font-medium transition-colors duration-300",
+                state === "active" && "text-primary",
+                state === "done" && "text-emerald-600 dark:text-emerald-400",
+                state === "pending" && "text-muted-foreground/50",
+                state === "error" && "text-destructive",
+              )}
+            >
+              {step.label}
+            </span>
+          </div>
+        </div>
+      );
+    })}
+  </div>
+);
+
 const Composer: FC = () => {
   const { settings } = useSettings();
   const { refreshDocuments, uploadStatus, setUploadStatus } = useDocuments();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadPhase, setUploadPhase] = useState<PipelinePhase>(null);
+  const [chunkProgress, setChunkProgress] = useState<{ current: number; total: number } | null>(null);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
     setUploading(true);
+    setUploadPhase("uploading");
+    setUploadProgress(0);
     setUploadStatus("Uploading...");
 
     const formData = new FormData();
@@ -701,18 +793,23 @@ const Composer: FC = () => {
         const data = await res.json();
         const uploadId = data.upload_id;
         if (uploadId) {
+          setUploadPhase("docling");
           await pollUploadStatus(uploadId);
         } else {
+          setUploadPhase("completed");
+          setUploadProgress(100);
           setUploadStatus("Upload complete!");
-          setTimeout(() => setUploadStatus(null), 3000);
+          setTimeout(() => { setUploadStatus(null); setUploadPhase(null); setUploadProgress(0); }, 3000);
         }
       } else {
+        setUploadPhase("error");
         setUploadStatus("Upload failed");
-        setTimeout(() => setUploadStatus(null), 3000);
+        setTimeout(() => { setUploadStatus(null); setUploadPhase(null); setUploadProgress(0); }, 3000);
       }
     } catch {
+      setUploadPhase("error");
       setUploadStatus("Connection error");
-      setTimeout(() => setUploadStatus(null), 3000);
+      setTimeout(() => { setUploadStatus(null); setUploadPhase(null); setUploadProgress(0); }, 3000);
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -726,33 +823,81 @@ const Composer: FC = () => {
         const res = await fetch(`${API_URL}/upload_status/${uploadId}`);
         if (!res.ok) continue;
         const info = await res.json();
+        const pct = info.progress || 0;
+        const serverPhase = info.phase as PipelinePhase | undefined;
         if (info.status === "completed") {
+          setUploadProgress(100);
+          setUploadPhase("completed");
+          setChunkProgress(null);
           setUploadStatus(info.message || "Processing complete!");
           await refreshDocuments();
-          setTimeout(() => setUploadStatus(null), 4000);
+          setTimeout(() => { setUploadStatus(null); setUploadPhase(null); setUploadProgress(0); }, 4000);
           return;
         } else if (info.status === "error") {
+          setUploadPhase("error");
+          setChunkProgress(null);
           setUploadStatus(info.message || "Processing failed");
-          setTimeout(() => setUploadStatus(null), 5000);
+          setTimeout(() => { setUploadStatus(null); setUploadPhase(null); setUploadProgress(0); }, 5000);
           return;
         } else {
-          setUploadStatus(
-            `Processing... ${info.progress || 0}%${info.message ? " — " + info.message : ""}`,
-          );
+          setUploadProgress(pct);
+          if (serverPhase) setUploadPhase(serverPhase);
+          if (info.chunk_total && info.chunk_total > 0) {
+            setChunkProgress({ current: info.chunk_current || 0, total: info.chunk_total });
+          } else {
+            setChunkProgress(null);
+          }
+          setUploadStatus(info.message || "Processing...");
         }
       } catch {
         continue;
       }
     }
     setUploadStatus(null);
+    setUploadPhase(null);
+    setUploadProgress(0);
   };
 
   return (
     <div className="relative mx-auto w-full max-w-[var(--thread-max-width)]">
-      {uploadStatus && (
-        <div className="mb-2 flex items-center gap-2 rounded-full bg-muted px-4 py-1.5 text-xs text-muted-foreground">
-          <Upload className="size-3.5 animate-pulse" />
-          <span className="truncate">{uploadStatus}</span>
+      {uploadPhase && (
+        <div className="mb-2 overflow-hidden rounded-xl border border-border/60 bg-muted/50">
+          <PipelineIndicator phase={uploadPhase} />
+          <div className="flex items-center gap-2.5 border-t border-border/30 px-4 py-1.5">
+            {uploadPhase === "error" ? (
+              <AlertTriangle className="size-3.5 shrink-0 text-destructive" />
+            ) : uploadPhase === "completed" ? (
+              <CheckCircle2 className="size-3.5 shrink-0 text-emerald-500" />
+            ) : (
+              <Loader2 className="size-3.5 shrink-0 animate-spin text-primary" />
+            )}
+            <span className="truncate text-xs text-muted-foreground">
+              {uploadStatus}
+            </span>
+            {uploadPhase !== "completed" && uploadPhase !== "error" && (
+              <span className="ml-auto flex shrink-0 items-center gap-2 text-xs font-medium tabular-nums text-primary">
+                {chunkProgress && (
+                  <span className="text-muted-foreground">
+                    {chunkProgress.current}/{chunkProgress.total} chunks
+                  </span>
+                )}
+                {uploadProgress > 0 && <span>{uploadProgress}%</span>}
+              </span>
+            )}
+          </div>
+          <div className="h-1 w-full bg-muted">
+            <div
+              className={cn(
+                "h-full transition-all duration-500 ease-out",
+                uploadPhase === "error"
+                  ? "bg-destructive"
+                  : uploadPhase === "completed"
+                    ? "bg-emerald-500"
+                    : "bg-primary",
+              )}
+              style={{ width: `${uploadProgress}%` }}
+            />
+          </div>
         </div>
       )}
       <ComposerPrimitive.Root className="relative flex w-full flex-col">

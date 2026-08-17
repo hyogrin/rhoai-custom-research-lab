@@ -62,7 +62,7 @@ const defaultSettings: ResearchSettings = {
   enableWebSearch: true,
   enablePlanning: true,
   enableFactCheck: true,
-  enableParallel: true,
+  enableParallel: false,
   enableSectioned: true,
   enableClaimEvidenceGraph: false,
   webSearchLimit: 2,
@@ -260,6 +260,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     fetchThreads();
+    const interval = setInterval(fetchThreads, 10_000);
+    return () => clearInterval(interval);
   }, [fetchThreads]);
 
   const switchToNewThread = useCallback(() => {
@@ -329,6 +331,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
     [activeThreadId, threads, switchToNewThread, switchToThread, deleteThread],
   );
 
+  const fetchThreadsRef = useRef(fetchThreads);
+  fetchThreadsRef.current = fetchThreads;
+
   const customFetch = useCallback(
     async (url: string, init: RequestInit): Promise<Response> => {
       if (init.body) {
@@ -344,7 +349,11 @@ export function Providers({ children }: { children: React.ReactNode }) {
           // not JSON, pass through
         }
       }
-      return fetch(url, init);
+      const response = await fetch(url, init);
+      if (url.includes("/agent") && response.ok) {
+        setTimeout(() => fetchThreadsRef.current(), 2000);
+      }
+      return response;
     },
     [],
   );

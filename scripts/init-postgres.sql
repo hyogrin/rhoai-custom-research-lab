@@ -1,46 +1,19 @@
 -- =============================================================================
--- PostgreSQL + pgvector schema for the RHOAI Custom Deep Research Lab
+-- PostgreSQL schema for the RHOAI Custom Deep Research Lab
 -- =============================================================================
 -- Run this ONCE on a fresh database:
 --   psql $POSTGRES_URL -f scripts/init-postgres.sql
+--
+-- This database serves dual purposes:
+--   1. Harness state (sessions, traces, failures, chat history)
+--   2. Vector storage via pgvector (used by Llama Stack's pgvector provider)
 --
 -- LangGraph checkpointer tables are auto-created by AsyncPostgresSaver.setup()
 -- and are NOT included here (they are managed by the langgraph library).
 -- =============================================================================
 
--- Enable pgvector extension (requires superuser or CREATE privilege)
+-- pgvector extension for vector similarity search
 CREATE EXTENSION IF NOT EXISTS vector;
-
--- =============================================================================
--- Document Storage
--- =============================================================================
-
-CREATE TABLE IF NOT EXISTS documents (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    file_type TEXT,
-    file_size INTEGER,
-    chunk_count INTEGER DEFAULT 0,
-    status TEXT DEFAULT 'pending',
-    object_store_path TEXT,
-    metadata JSONB DEFAULT '{}',
-    created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS document_chunks (
-    id SERIAL PRIMARY KEY,
-    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    document_name TEXT NOT NULL,
-    chunk_index INTEGER NOT NULL,
-    content TEXT NOT NULL,
-    embedding vector(768),
-    metadata JSONB DEFAULT '{}',
-    created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON document_chunks(document_id);
-CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON document_chunks
-    USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 
 -- =============================================================================
 -- Harness Tables (Research Sessions, Traces, Failures)

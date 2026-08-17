@@ -91,7 +91,9 @@ Active MCP servers (FastMCP, **streamable-http** transport):
 The `observability-mcp` (port 9005) server is started but currently unused — observability
 is handled in-process by `HarnessObserver` (`agents/orchestrator/layers/observability.py`).
 
-Document ingestion (Docling → embedding → pgvector) is handled directly by the backend API — no MCP indirection needed.
+Document ingestion (Docling parse → Llama Stack Files API → Vector Store) is handled
+directly by the backend API — no MCP indirection needed. Llama Stack handles chunking,
+embedding, and vector storage.
 Query rewriting, context synthesis, research planning, and report drafting are performed as direct LLM calls within the orchestrator (no MCP overhead for pure prompt operations).
 
 ### MCP Transport
@@ -104,8 +106,8 @@ Query rewriting, context synthesis, research planning, and report drafting are p
 
 ```
 0_setup/                  — Environment and model setup
-1_document_processing/    — Docling + pgvector (data foundation)
-2_tool_layer/             — MCP tool servers (vector-search, web-search, verification)
+1_document_processing/    — Docling parse + Llama Stack ingestion (data foundation)
+2_tool_layer/             — MCP tool servers (vector-search proxy, web-search, verification)
 3_harness_engineering/    — Iterative inner loop concept + long transaction pattern
 4_agent_orchestration/    — LangGraph orchestrator + system integration
 5_deployment/             — OpenShift deployment with Helm
@@ -192,9 +194,12 @@ make frontend-start       # Start Next.js UI (separate terminal)
 
 `make setup` runs `uv sync` + `scripts/setup.sh` which:
 - Auto-detects if you're on a cluster (`oc whoami`) or local Docker
-- Provisions PostgreSQL + pgvector with DDL initialization
+- Provisions PostgreSQL for harness state (sessions, traces, failures, LangGraph checkpointing)
 - Updates `.env` with `POSTGRES_URL`
 - Checks for OpenShell availability (admin prerequisite, not installed here)
+
+Document storage and vector search are handled by **Llama Stack** (RHOAI 3.4), not PostgreSQL.
+Configure `LLAMA_STACK_URL` and `LLAMA_STACK_API_KEY` in `.env`.
 
 For advanced use:
 ```bash
@@ -206,7 +211,8 @@ For advanced use:
 
 | Component | Scope | Provisioned by |
 |-----------|-------|----------------|
-| PostgreSQL + pgvector | Lab-owned | `make setup` (automatic) |
+| Llama Stack (RHOAI 3.4) | Cluster-shared | LlamaStackDistribution CR (RHOAI operator) |
+| PostgreSQL | Lab-owned | `make setup` (automatic) |
 | Agent Sandbox CRDs | Cluster-shared | `./scripts/install-openshell.sh` (cluster-admin) |
 | OpenShell gateway | Cluster-shared | `./scripts/install-openshell.sh` (cluster-admin) |
 
@@ -262,7 +268,8 @@ The user can accept the result or trigger additional iterations.
 ### Persistence
 
 - **PostgreSQL checkpointer** (`AsyncPostgresSaver`) — LangGraph graph state persistence
-- **pgvector** — semantic search embeddings (consolidated with checkpointer DB)
+- **PostgreSQL harness state** — research sessions, trace events, failure log
+- **Llama Stack vector store** — document embeddings and semantic search
 - **Thread management** — `GET/POST/DELETE /threads` endpoints for chat history
 
 ### Running a Research Query

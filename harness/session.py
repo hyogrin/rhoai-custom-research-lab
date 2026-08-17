@@ -1,6 +1,6 @@
-"""Research session state management with SQLite persistence.
+"""Research session state management with PostgreSQL persistence.
 
-Falls back to in-memory storage when SQLite is unavailable.
+Falls back to in-memory storage when PostgreSQL is unavailable.
 """
 
 import json
@@ -143,7 +143,7 @@ class ResearchSession:
 class SessionManager:
     """Persist and retrieve research sessions.
 
-    Uses SQLite when available, falls back to in-memory dict otherwise.
+    Uses PostgreSQL when available, falls back to in-memory dict otherwise.
     """
 
     def __init__(self):
@@ -152,7 +152,7 @@ class SessionManager:
         self._try_connect()
 
     def _try_connect(self):
-        """Probe SQLite; fall back to in-memory if unavailable."""
+        """Probe PostgreSQL; fall back to in-memory if unavailable."""
         if not _HAS_DB:
             logger.info("db module not available — using in-memory session storage")
             return
@@ -160,9 +160,9 @@ class SessionManager:
             conn = get_connection()
             conn.close()
             self._use_db = True
-            logger.info("Connected to SQLite for session storage")
+            logger.info("Connected to PostgreSQL for session storage")
         except Exception as e:
-            logger.warning("SQLite unavailable (%s) — using in-memory session storage", e)
+            logger.warning("PostgreSQL unavailable (%s) — using in-memory session storage", e)
 
     def _get_conn(self):
         return get_connection()
@@ -172,19 +172,22 @@ class SessionManager:
         if not self._use_db:
             return
         conn = self._get_conn()
-        conn.executescript("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS research_sessions (
                 session_id TEXT PRIMARY KEY,
                 query TEXT NOT NULL,
                 iteration INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'initialized',
                 quality_score REAL DEFAULT 0.0,
-                state TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_sessions_status ON research_sessions(status);
+                state JSONB NOT NULL DEFAULT '{}',
+                created_at TIMESTAMPTZ DEFAULT now(),
+                updated_at TIMESTAMPTZ DEFAULT now()
+            )
         """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_status ON research_sessions(status)"
+        )
+        conn.commit()
         conn.close()
 
     def save(self, session: ResearchSession):
@@ -196,16 +199,17 @@ class SessionManager:
         state_json = json.dumps(session.to_dict())
         now = datetime.utcnow().isoformat()
         conn.execute(
-            """INSERT INTO research_sessions (session_id, query, iteration, status, quality_score, state, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO research_sessions
+                (session_id, query, iteration, status, quality_score, state, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (session_id) DO UPDATE SET
-                iteration = excluded.iteration,
-                status = excluded.status,
-                quality_score = excluded.quality_score,
-                state = excluded.state,
-                updated_at = ?""",
+                iteration = EXCLUDED.iteration,
+                status = EXCLUDED.status,
+                quality_score = EXCLUDED.quality_score,
+                state = EXCLUDED.state,
+                updated_at = EXCLUDED.updated_at""",
             (session.session_id, session.query, session.iteration,
-             session.status, session.quality_score, state_json, now, now),
+             session.status, session.quality_score, state_json, now),
         )
         conn.commit()
         conn.close()
@@ -216,11 +220,11 @@ class SessionManager:
             return self._memory.get(session_id)
         conn = self._get_conn()
         row = conn.execute(
-            "SELECT state FROM research_sessions WHERE session_id = ?", (session_id,)
+            "SELECT state FROM research_sessions WHERE session_id = %s", (session_id,)
         ).fetchone()
         conn.close()
         if row:
-            return ResearchSession.from_dict(json.loads(row["state"]))
+            return ResearchSession.from_dict(json.loads(row["state"]) if isinstance(row["state"], str) else row["state"])
         return None
 
     def get_progress(self, session_id: str) -> dict | None:
@@ -230,13 +234,14 @@ class SessionManager:
             return session.get_progress() if session else None
         conn = self._get_conn()
         row = conn.execute(
-            "SELECT state FROM research_sessions WHERE session_id = ?",
+            "SELECT state FROM research_sessions WHERE session_id = %s",
             (session_id,),
         ).fetchone()
         conn.close()
         if not row:
             return None
-        session = ResearchSession.from_dict(json.loads(row["state"]))
+        state = json.loads(row["state"]) if isinstance(row["state"], str) else row["state"]
+        session = ResearchSession.from_dict(state)
         return session.get_progress()
 
     def list_sessions(self, status: str | None = None, limit: int = 20) -> list[dict]:
@@ -255,13 +260,13 @@ class SessionManager:
         if status:
             rows = conn.execute(
                 "SELECT session_id, query, iteration, status, quality_score, created_at "
-                "FROM research_sessions WHERE status = ? ORDER BY updated_at DESC LIMIT ?",
+                "FROM research_sessions WHERE status = %s ORDER BY updated_at DESC LIMIT %s",
                 (status, limit),
             ).fetchall()
         else:
             rows = conn.execute(
                 "SELECT session_id, query, iteration, status, quality_score, created_at "
-                "FROM research_sessions ORDER BY updated_at DESC LIMIT ?",
+                "FROM research_sessions ORDER BY updated_at DESC LIMIT %s",
                 (limit,),
             ).fetchall()
         conn.close()

@@ -64,7 +64,7 @@ def load_past_failure_memory() -> str:
         rows = conn.execute(
             """SELECT category, COUNT(*) as cnt
             FROM failure_log
-            WHERE timestamp > datetime('now', '-7 days')
+            WHERE timestamp > now() - INTERVAL '7 days'
             GROUP BY category
             ORDER BY cnt DESC
             LIMIT 5"""

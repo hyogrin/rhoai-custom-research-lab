@@ -11,7 +11,6 @@ dependencies = [
     "langchain-openai>=0.3.0",
     "langchain-community>=0.3.0",
     "docling>=2.100.0",
-    "sqlite-vec>=0.1.6",
     "chainlit>=2.11.0",
     "fastapi>=0.138.0",
     "uvicorn>=0.34.0",
@@ -31,7 +30,6 @@ dependencies = [
     "mlflow>=2.15.0",
     "pyyaml>=6.0",
     "sqlalchemy[asyncio]>=2.0.0",
-    "aiosqlite>=0.20.0",
     "langgraph-checkpoint-postgres>=3.0.0",
     "psycopg[binary,pool]>=3.1.0",
 ]

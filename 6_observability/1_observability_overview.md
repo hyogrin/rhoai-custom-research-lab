@@ -31,7 +31,7 @@ serves all projects, with each OpenShift project mapping to an MLflow workspace.
 Get the tracking URI and token via CLI:
 
 ```bash
-echo "$(oc get route rhods-dashboard -n redhat-ods-applications -o jsonpath='https://{.spec.host}')/mlflow"
+oc get route mlflow -n redhat-ods-applications -o jsonpath='https://{.spec.host}'
 oc whoami --show-token
 ```
 

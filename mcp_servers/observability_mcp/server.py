@@ -41,16 +41,18 @@ def record_trace(
             """INSERT INTO trace_events
                 (session_id, iteration, layer, operation, input_summary, output_summary,
                  tokens_used, latency_ms, success, failure_category, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id""",
             (
                 session_id, iteration, layer, operation,
                 input_summary[:500], output_summary[:500],
-                tokens_used, latency_ms, 1 if success else 0,
+                tokens_used, latency_ms, success,
                 failure_category or None,
                 datetime.utcnow().isoformat(),
             ),
         )
-        trace_id = cur.lastrowid
+        row = cur.fetchone()
+        trace_id = row["id"] if row else 0
         conn.commit()
         conn.close()
         return {"trace_id": trace_id, "status": "recorded"}
@@ -71,11 +73,13 @@ def record_failure(
         conn = get_connection()
         cur = conn.execute(
             """INSERT INTO failure_log (session_id, iteration, category, description, context, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)""",
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id""",
             (session_id, iteration, category, description, context[:1000],
              datetime.utcnow().isoformat()),
         )
-        failure_id = cur.lastrowid
+        row = cur.fetchone()
+        failure_id = row["id"] if row else 0
         conn.commit()
         conn.close()
         return {"failure_id": failure_id, "status": "recorded"}
@@ -96,7 +100,7 @@ def get_metrics(session_id: str) -> dict:
                 SUM(CASE WHEN NOT success THEN 1 ELSE 0 END) as failures,
                 COUNT(DISTINCT iteration) as iterations
             FROM trace_events
-            WHERE session_id = ?""",
+            WHERE session_id = %s""",
             (session_id,),
         ).fetchone()
 
@@ -105,7 +109,7 @@ def get_metrics(session_id: str) -> dict:
             for r in conn.execute(
                 """SELECT layer, COUNT(*) as count
                 FROM trace_events
-                WHERE session_id = ?
+                WHERE session_id = %s
                 GROUP BY layer""",
                 (session_id,),
             ).fetchall()
@@ -141,15 +145,13 @@ def get_failure_hints(session_id: str) -> dict:
     }
     try:
         conn = get_connection()
-        categories = [
-            r[0]
-            for r in conn.execute(
-                "SELECT DISTINCT category FROM failure_log WHERE session_id = ?",
-                (session_id,),
-            ).fetchall()
-        ]
+        rows = conn.execute(
+            "SELECT DISTINCT category FROM failure_log WHERE session_id = %s",
+            (session_id,),
+        ).fetchall()
         conn.close()
 
+        categories = [r["category"] for r in rows]
         hints = [HINT_MAP[cat] for cat in categories if cat in HINT_MAP]
         return {"hints": "\n".join(f"- {h}" for h in hints), "categories": categories}
     except Exception as e:
@@ -163,11 +165,11 @@ def get_past_failure_patterns(limit: int = 50) -> list[dict]:
         conn = get_connection()
         rows = conn.execute(
             """SELECT category, COUNT(*) as count,
-                      GROUP_CONCAT(DISTINCT description) as descriptions
+                      STRING_AGG(DISTINCT description, ',') as descriptions
             FROM failure_log
             GROUP BY category
             ORDER BY count DESC
-            LIMIT ?""",
+            LIMIT %s""",
             (limit,),
         ).fetchall()
         conn.close()

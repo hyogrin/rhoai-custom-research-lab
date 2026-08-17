@@ -136,8 +136,6 @@ deploy-infra: ## Deploy namespace + secrets
 	oc apply -f deploy/namespace.yaml
 	@. ./.env 2>/dev/null; export $$(grep -v '^#' .env | xargs) 2>/dev/null; \
 		envsubst < deploy/secret.yaml | oc apply -f -
-	oc create configmap init-db-sql --from-file=scripts/init-db.sql \
-		-n $(NAMESPACE) --dry-run=client -o yaml | oc apply -f -
 	oc apply -f deploy/infra/ -n $(NAMESPACE)
 	@echo "Waiting for PostgreSQL to be ready..."
 	oc wait --for=condition=ready pod -l app=postgresql -n $(NAMESPACE) --timeout=120s

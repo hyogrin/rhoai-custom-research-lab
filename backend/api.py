@@ -160,10 +160,20 @@ def _ensure_openshell_gateway():
     gw_host = _parsed.hostname or "127.0.0.1"
     gw_port = _parsed.port or 8080
 
-    # --- Strategy 1: Already reachable ---
-    if _gw_tcp_check(gw_host, gw_port):
-        logger.info("[OpenShell] ✅ Gateway already reachable at %s:%d", gw_host, gw_port)
+    # --- Strategy 1: Already reachable (only trust our own managed process) ---
+    if _openshell_pf_proc and _openshell_pf_proc.poll() is None and _gw_tcp_check(gw_host, gw_port):
+        logger.info("[OpenShell] ✅ Gateway reachable via managed port-forward (pid=%d)", _openshell_pf_proc.pid)
         return
+
+    # Kill any stale port-forwards before trying strategies — avoids race
+    # conditions where a dying process still holds the port momentarily.
+    try:
+        subprocess.run(["pkill", "-f", "port-forward svc/openshell"], capture_output=True, timeout=5)
+        if _gw_tcp_check(gw_host, gw_port, timeout=1):
+            time.sleep(1)
+    except Exception:
+        pass
+    _openshell_pf_proc = None
 
     # --- Strategy 2: Docker compose ---
     compose_file = os.path.join(os.path.dirname(__file__), "..", "docker-compose.yml")
@@ -211,13 +221,6 @@ def _ensure_openshell_gateway():
             return
     except Exception:
         return
-
-    # Kill stale port-forwards
-    try:
-        subprocess.run(["pkill", "-f", "port-forward svc/openshell"], capture_output=True, timeout=5)
-        time.sleep(1)
-    except Exception:
-        pass
 
     logger.info("[OpenShell] Starting oc port-forward svc/openshell 8080:8080 -n openshell...")
     _openshell_pf_proc = subprocess.Popen(
@@ -336,6 +339,8 @@ async def lifespan(app: FastAPI):
         app.state.pg_checkpointer = None
         logger.info("POSTGRES_URL not set — using in-memory checkpointer")
 
+    _restore_document_registry()
+
     yield
 
     if getattr(app.state, "pg_checkpointer_ctx", None):
@@ -441,7 +446,7 @@ async def _stream_agui(run_id: str, thread_id: str, query: str, settings: dict, 
             "enable_web_search": settings.get("enableWebSearch", True),
             "enable_planning": settings.get("enablePlanning", True),
             "enable_fact_check": settings.get("enableFactCheck", True),
-            "enable_parallel": settings.get("enableParallel", True),
+            "enable_parallel": settings.get("enableParallel", False),
             "enable_sectioned": settings.get("enableSectioned", True),
             "enable_claim_evidence_graph": settings.get("enableClaimEvidenceGraph", False),
             "web_search_limit": settings.get("webSearchLimit", 2),
@@ -475,11 +480,43 @@ async def _stream_agui(run_id: str, thread_id: str, query: str, settings: dict, 
 
     event_queue: asyncio.Queue = asyncio.Queue()
     text_started = False
-    accumulated_steps: list[dict] = []
-    accumulated_verbose: list[dict] = []
+
+    # When accepting (finalize/artifact phase), start with fresh step history.
+    # The frontend already has previous steps from the prior SSE stream.
+    # Only carry over steps when iterating (user asked for more research).
+    _is_iteration_resume = (
+        resume_direction
+        and resume_direction not in ("__accept__", "__execution_approve__", "__execution_deny__")
+    )
+    accumulated_steps: list[dict] = list(_thread_steps_cache.get(thread_id, []) if _is_iteration_resume else [])
+    accumulated_verbose: list[dict] = list(_thread_verbose_cache.get(thread_id, []) if _is_iteration_resume else [])
     state_update: dict = {}
     _artifact_data: dict | None = None
     _artifact_status: str = "disabled"
+
+    # Restore session values from checkpoint when resuming from interrupt
+    if resume_direction:
+        try:
+            prev_state = await _graph_module.orchestrator_graph.aget_state(config)
+            if prev_state and hasattr(prev_state, "values"):
+                vals = prev_state.values
+                session.iteration = vals.get("iteration", session.iteration)
+                session.quality_score = vals.get("quality_score", session.quality_score)
+                session.total_tokens = vals.get("total_tokens", session.total_tokens)
+                session.status = vals.get("status", session.status)
+                session.current_draft = vals.get("current_draft", "")
+                session.accumulated_context = vals.get("accumulated_context", [])
+                session.report_sections = vals.get("report_sections", [])
+                session.section_order = vals.get("section_order", [])
+                session.failing_sections = vals.get("failing_sections", [])
+                if not query:
+                    query = vals.get("query", query)
+                logger.info(
+                    "[agui] Restored session from checkpoint: iteration=%d, tokens=%d, score=%.1f",
+                    session.iteration, session.total_tokens, session.quality_score,
+                )
+        except Exception as e:
+            logger.warning("[agui] Failed to restore session from checkpoint: %s", e)
 
     async def _run_graph():
         try:
@@ -698,6 +735,10 @@ async def _stream_agui(run_id: str, thread_id: str, query: str, settings: dict, 
         yield _agui_event({"type": "RUN_ERROR", "message": str(exc)})
         return
     finally:
+        if accumulated_steps:
+            _thread_steps_cache[thread_id] = list(accumulated_steps)
+        if accumulated_verbose:
+            _thread_verbose_cache[thread_id] = list(accumulated_verbose)
         if not graph_task.done():
             graph_task.cancel()
             try:
@@ -960,7 +1001,7 @@ class ResearchRequest(BaseModel):
     enable_web_search: bool = True
     enable_planning: bool = True
     enable_fact_check: bool = True
-    enable_parallel: bool = True
+    enable_parallel: bool = False
     enable_sectioned: bool = True
 
 
@@ -1316,16 +1357,16 @@ def _collect_sources(accumulated_context: list[dict]) -> list[dict]:
 _SSE_HEARTBEAT_INTERVAL = 15  # seconds between keepalive comments
 
 
+_thread_steps_cache: dict[str, list[dict]] = {}
+_thread_verbose_cache: dict[str, list[dict]] = {}
+
+
 def _check_documents_exist() -> bool:
-    """Check if any documents have been ingested into the database."""
-    try:
-        from lib.document_processing import get_db_connection
-        conn = get_db_connection()
-        row = conn.execute("SELECT COUNT(*) FROM documents").fetchone()
-        conn.close()
-        return row[0] > 0 if row else False
-    except Exception:
-        return False
+    """Check if any documents have been ingested.
+
+    Uses the in-memory document registry (fast, no network call).
+    """
+    return len(_document_registry) > 0
 
 
 async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None]:
@@ -1369,7 +1410,7 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
         "enable_web_search": getattr(session, "_enable_web_search", True),
         "enable_planning": getattr(session, "_enable_planning", True),
         "enable_fact_check": getattr(session, "_enable_fact_check", True),
-        "enable_parallel": getattr(session, "_enable_parallel", True),
+        "enable_parallel": getattr(session, "_enable_parallel", False),
         "enable_sectioned": getattr(session, "_enable_sectioned", True),
         "web_search_limit": getattr(session, "_web_search_limit", 2),
         "web_search_max_limit": getattr(session, "_web_search_max_limit", 5),
@@ -1387,11 +1428,13 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
     state_update = {}
     event_queue: asyncio.Queue[dict | None] = asyncio.Queue()
 
+    config = {"configurable": {"thread_id": session.session_id}}
+
     async def _run_graph():
         """Run the graph and push completed node updates into the queue."""
         try:
             async for mode, chunk in _graph_module.orchestrator_graph.astream(
-                initial_state, stream_mode=["updates", "custom"]
+                initial_state, config=config, stream_mode=["updates", "custom"]
             ):
                 await event_queue.put((mode, chunk))
         except Exception as exc:
@@ -1581,7 +1624,11 @@ async def _stream_research(session: ResearchSession) -> AsyncGenerator[str, None
                 evt["quality_score"] = session.quality_score
                 yield _sse(evt)
 
-        final_output = state_update.get("final_output", session.current_draft)
+        final_output = (
+            state_update.get("final_output", session.current_draft)
+            if isinstance(state_update, dict)
+            else session.current_draft
+        )
         session.status = "complete"
 
         yield _sse({"event": "content", "text": final_output})
@@ -1667,6 +1714,17 @@ async def upload_files(
         saved.append({"filename": f.filename or "unnamed", "size": len(contents)})
         logger.info("Saved uploaded file %s to %s", f.filename, dest)
 
+    _upload_status[upload_id] = {
+        "upload_id": upload_id,
+        "status": "processing",
+        "message": f"Queued {len(saved)} file(s) for processing...",
+        "progress": 2,
+        "phase": "uploading",
+        "file_index": 0,
+        "total_files": len(saved),
+        "files": [s["filename"] for s in saved],
+    }
+
     background_tasks.add_task(_process_documents_background, upload_id, file_paths)
 
     return {
@@ -1679,140 +1737,160 @@ async def upload_files(
 
 _upload_status: dict[str, dict] = {}
 
+# Document registry — tracks ingested documents because the direct
+# embedding pipeline (vector-io/insert) bypasses OpenAI file tracking.
+_document_registry: dict[str, dict] = {}
 
-def _semantic_chunk_document(doc) -> list[dict]:
-    """Split a Docling document using semantic chunking."""
-    from lib.document_processing import semantic_chunk_document
-    return semantic_chunk_document(doc)
+
+def _restore_document_registry():
+    """Rebuild the document registry from Llama Stack Files API on startup.
+
+    Only restores files if a vector store exists (meaning data hasn't been reset).
+    """
+    try:
+        from lib.llama_stack_client import get_client
+        client = get_client()
+
+        stores = client.vector_stores.list()
+        has_store = any(True for _ in stores.data)
+        if not has_store:
+            logger.info("No vector store found — document registry stays empty")
+            return
+
+        count = 0
+        for f in client.files.list():
+            fid = f.id
+            fname = getattr(f, "filename", "") or fid
+            if fid not in _document_registry:
+                _document_registry[fid] = {
+                    "id": fid,
+                    "name": fname,
+                    "status": "completed",
+                }
+                count += 1
+        if count:
+            logger.info("Restored %d document(s) from Llama Stack Files API", count)
+    except Exception as e:
+        logger.warning("Could not restore document registry: %s", e)
 
 
 def _process_documents_background(upload_id: str, file_paths: list[str]):
-    """Background task: parse, chunk, embed, and store documents with granular progress."""
+    """Background task: parse with Docling, upload to Llama Stack, ingest into vector store."""
     total = len(file_paths)
     filenames = [os.path.basename(p) for p in file_paths]
 
-    def _update(message: str, progress: int):
+    def _update(message: str, progress: int, phase: str = "docling",
+                file_index: int = 0):
         _upload_status[upload_id] = {
             "upload_id": upload_id,
             "status": "processing",
             "message": message,
             "progress": progress,
+            "phase": phase,
+            "file_index": file_index,
             "total_files": total,
             "files": filenames,
         }
 
-    _update(f"🖨️ [Docling] Parsing {total} document(s) with Docling...", 5)
+    _update(f"Parsing {total} document(s) with Docling...", 5, "docling", 0)
 
     try:
-        from docling.document_converter import DocumentConverter
-        from docling.datamodel.base_models import InputFormat
-        from lib.document_processing import get_embeddings, get_db_connection
-        from sqlite_vec import serialize_float32
-        import hashlib
-        import json as _json
+        from lib.document_processing import parse_to_markdown
+        from lib.llama_stack_client import ensure_vector_store, ingest_file, upload_file
+        import tempfile
 
-        converter = DocumentConverter(
-            allowed_formats=[
-                InputFormat.PDF,
-                InputFormat.DOCX,
-                InputFormat.PPTX,
-                InputFormat.MD,
-                InputFormat.HTML,
-            ]
-        )
-        total_chunks_stored = 0
+        vector_store_id = ensure_vector_store()
+        files_ingested = 0
 
         for file_idx, path in enumerate(file_paths):
             filename = os.path.basename(path)
             file_base_pct = int(5 + 90 * file_idx / total)
 
-            _update(f"📄 [Docling] Parsing ({file_idx+1}/{total}): {filename}", file_base_pct + 5)
+            _update(f"Parsing: {filename}", file_base_pct + 5,
+                    "docling", file_idx + 1)
             logger.info("Parsing document: %s", path)
-            result = converter.convert(path)
-            doc = result.document
+            md_content = parse_to_markdown(path)
 
-            doc_title = filename
-            for item, _level in doc.iterate_items():
-                if hasattr(item, "label") and item.label == "section_header" and item.text.strip():
-                    doc_title = item.text.strip()
-                    break
-            if doc_title == filename and hasattr(doc, "name") and doc.name:
-                doc_title = doc.name.replace("_", " ")
-            logger.info("Document title resolved: %s → %s", filename, doc_title)
-
-            _update(f"✂️ [Docling] Smart chunking (heading hierarchy): {filename}", file_base_pct + 15)
-            chunks = _semantic_chunk_document(doc)
-            _update(f"✂️ [Docling] {len(chunks)} semantic chunks created: {filename}", file_base_pct + 18)
-
-            if not chunks:
-                logger.warning("No chunks from %s", filename)
+            if not md_content or not md_content.strip():
+                logger.warning("No content from %s", filename)
                 continue
 
-            chunk_texts = [c["text"] for c in chunks]
-            embed_batch_size = 10
-            num_batches = (len(chunk_texts) + embed_batch_size - 1) // embed_batch_size
-            all_embeddings = []
+            _update(f"Uploading: {filename}", file_base_pct + 30,
+                    "llama_stack_upload", file_idx + 1)
+            tmp_suffix = os.path.splitext(filename)[0] + ".md"
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".md", prefix=tmp_suffix + "_", delete=False) as tmp:
+                tmp.write(md_content)
+                tmp_path = tmp.name
 
-            for batch_idx in range(0, len(chunk_texts), embed_batch_size):
-                batch = chunk_texts[batch_idx : batch_idx + embed_batch_size]
-                current_batch = batch_idx // embed_batch_size + 1
-                embed_pct = file_base_pct + 20 + int(60 * current_batch / num_batches / total)
-                _update(
-                    f"🧠 [Docling] Embedding: {filename} (batch {current_batch}/{num_batches})",
-                    min(embed_pct, 95),
+            try:
+                file_id = upload_file(tmp_path, filename=filename)
+            finally:
+                os.unlink(tmp_path)
+
+            _update(f"Embedding: {filename}", file_base_pct + 50,
+                    "llama_stack_ingest", file_idx + 1)
+
+            ingest_pct_start = file_base_pct + 50
+            ingest_pct_end = file_base_pct + int(90 / total)
+
+            def _on_chunk_progress(current: int, total_chunks: int,
+                                   _fn=filename, _fi=file_idx):
+                pct = ingest_pct_start + int(
+                    (ingest_pct_end - ingest_pct_start) * current / max(total_chunks, 1)
                 )
-                embeddings = get_embeddings(batch)
-                all_embeddings.extend(embeddings)
+                _upload_status[upload_id] = {
+                    "upload_id": upload_id,
+                    "status": "processing",
+                    "message": f"Embedding: {_fn} ({current}/{total_chunks})",
+                    "progress": min(pct, 95),
+                    "phase": "llama_stack_ingest",
+                    "file_index": _fi + 1,
+                    "total_files": total,
+                    "files": filenames,
+                    "chunk_current": current,
+                    "chunk_total": total_chunks,
+                }
 
-            _update(f"💾 [Docling] Storing {len(chunks)} chunks: {filename}", file_base_pct + 85 // total)
+            def _on_status_change(message: str, _fn=filename, _fi=file_idx):
+                _upload_status[upload_id] = {
+                    "upload_id": upload_id,
+                    "status": "processing",
+                    "message": f"{_fn}: {message}",
+                    "progress": _upload_status.get(upload_id, {}).get("progress", 50),
+                    "phase": "llama_stack_ingest",
+                    "file_index": _fi + 1,
+                    "total_files": total,
+                    "files": filenames,
+                }
 
-            document_id = hashlib.sha256(path.encode()).hexdigest()[:16]
-
-            object_store_path = path
-
-            conn = get_db_connection()
-            cur = conn.cursor()
-
-            cur.execute(
-                """INSERT INTO documents (id, name, file_type, chunk_count, status, object_store_path)
-                   VALUES (?, ?, ?, ?, 'completed', ?)
-                   ON CONFLICT (id) DO UPDATE SET
-                       name = excluded.name,
-                       chunk_count = excluded.chunk_count,
-                       status = excluded.status,
-                       object_store_path = excluded.object_store_path,
-                       updated_at = datetime('now')""",
-                (document_id, doc_title, os.path.splitext(path)[1], len(chunks), object_store_path),
+            result = ingest_file(
+                vector_store_id, file_id,
+                content=md_content, filename=filename,
+                on_progress=_on_chunk_progress,
+                on_status=_on_status_change,
             )
-            cur.execute("DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM document_chunks WHERE document_id = ?)", (document_id,))
-            cur.execute("DELETE FROM document_chunks WHERE document_id = ?", (document_id,))
 
-            for idx, (chunk, embedding) in enumerate(zip(chunks, all_embeddings)):
-                metadata = chunk.get("metadata", {})
-                cur.execute(
-                    """INSERT INTO document_chunks (document_id, document_name, chunk_index, content, metadata)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (document_id, doc_title, idx, chunk["text"],
-                     _json.dumps(metadata) if metadata else "{}"),
-                )
-                chunk_id = cur.lastrowid
-                cur.execute(
-                    "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
-                    (chunk_id, serialize_float32(embedding)),
-                )
-
-            conn.commit()
-            cur.close()
-            conn.close()
-            total_chunks_stored += len(chunks)
-            documents_processed_total.labels(status="success").inc()
-            logger.info("Document stored: %s → %d chunks", filename, len(chunks))
+            if result.get("status") == "completed":
+                files_ingested += 1
+                _document_registry[file_id] = {
+                    "id": file_id,
+                    "name": filename,
+                    "status": "completed",
+                    "vector_store_id": vector_store_id,
+                }
+                documents_processed_total.labels(status="success").inc()
+                logger.info("Document ingested: %s -> file_id=%s", filename, file_id)
+            else:
+                documents_processed_total.labels(status="error").inc()
+                logger.warning("Document ingestion %s for %s", result.get("status"), filename)
 
         _upload_status[upload_id] = {
             "upload_id": upload_id,
             "status": "completed",
-            "message": f"✅ [Docling] Complete! {total_chunks_stored} chunks from {total} file(s) stored.",
+            "message": f"Complete! {files_ingested}/{total} file(s) ingested.",
             "progress": 100,
+            "phase": "completed",
+            "file_index": total,
             "total_files": total,
             "files": filenames,
         }
@@ -1822,8 +1900,10 @@ def _process_documents_background(upload_id: str, file_paths: list[str]):
         _upload_status[upload_id] = {
             "upload_id": upload_id,
             "status": "error",
-            "message": f"❌ Processing failed: {e}",
+            "message": f"Processing failed: {e}",
             "progress": 100,
+            "phase": "error",
+            "file_index": 0,
             "total_files": total,
             "files": filenames,
             "error": str(e),
@@ -1835,56 +1915,47 @@ async def get_upload_status(upload_id: str):
     """Get document processing status for an upload."""
     if upload_id in _upload_status:
         return _upload_status[upload_id]
-    return {"upload_id": upload_id, "status": "processing", "message": "Still processing..."}
+    return {
+        "upload_id": upload_id,
+        "status": "error",
+        "message": "Upload session lost (server restarted). Please re-upload.",
+    }
 
 
 @app.get("/documents")
 async def list_documents():
-    """List all completed documents from the database."""
-    try:
-        from lib.document_processing import get_db_connection
+    """List ingested documents from the local registry.
 
-        conn = get_db_connection()
-        rows = conn.execute(
-            "SELECT id, name, file_type, chunk_count, status, created_at "
-            "FROM documents WHERE status = 'completed' ORDER BY created_at DESC"
-        ).fetchall()
-        conn.close()
-        return {
-            "documents": [
-                {
-                    "id": r["id"],
-                    "name": r["name"],
-                    "file_type": r["file_type"],
-                    "chunk_count": r["chunk_count"],
-                    "status": r["status"],
-                    "created_at": r["created_at"],
-                }
-                for r in rows
-            ]
-        }
-    except Exception as e:
-        logger.warning("Failed to list documents: %s", e)
-        return {"documents": []}
+    The direct embedding pipeline bypasses OpenAI file tracking, so we
+    maintain our own registry populated during ingestion.
+    """
+    return {"documents": list(_document_registry.values())}
 
 
 @app.delete("/documents/reset")
 async def reset_documents():
-    """Delete all documents, chunks, and vector embeddings from the database."""
+    """Delete the vector store, all uploaded files, and clear the registry."""
     try:
-        from lib.document_processing import get_db_connection
+        from lib.llama_stack_client import ensure_vector_store, delete_vector_store, get_client
 
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM vec_chunks")
-        cur.execute("DELETE FROM document_chunks")
-        cur.execute("DELETE FROM documents")
-        conn.commit()
-        deleted = cur.execute("SELECT changes()").fetchone()[0]
-        cur.close()
-        conn.close()
-        logger.info("Document database reset: all documents, chunks, and vectors deleted")
-        return {"reset": True, "message": "All documents deleted"}
+        vs_id = ensure_vector_store()
+        delete_vector_store(vs_id)
+
+        client = get_client()
+        deleted_files = 0
+        try:
+            for f in client.files.list():
+                try:
+                    client.files.delete(f.id)
+                    deleted_files += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        _document_registry.clear()
+        logger.info("Reset complete: vector store %s deleted, %d files removed", vs_id, deleted_files)
+        return {"reset": True, "message": f"Vector store and {deleted_files} file(s) deleted"}
     except Exception as e:
         logger.warning("Failed to reset documents: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -1892,19 +1963,8 @@ async def reset_documents():
 
 @app.get("/documents/{document_id}/download_url")
 async def get_document_download_url(document_id: str):
-    """Return the stored path for a document."""
-    from lib.document_processing import get_db_connection
-
-    conn = get_db_connection()
-    row = conn.execute(
-        "SELECT object_store_path, name FROM documents WHERE id = ?", (document_id,)
-    ).fetchone()
-    conn.close()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    return {"document_id": document_id, "name": row["name"], "path": row["object_store_path"] or ""}
+    """Return file info from Llama Stack. Direct download not supported."""
+    return {"document_id": document_id, "name": document_id, "path": ""}
 
 
 @app.get("/health")

@@ -40,10 +40,13 @@ def _search_searxng(query: str, num_results: int) -> list[dict]:
     return results
 
 
+_DDG_TIMEOUT = int(os.getenv("DDG_TIMEOUT", "20"))
+
+
 def _search_duckduckgo(query: str, num_results: int) -> list[dict]:
     """Search via DuckDuckGo (local, no server required)."""
     from duckduckgo_search import DDGS
-    with DDGS() as ddgs:
+    with DDGS(timeout=_DDG_TIMEOUT) as ddgs:
         raw = list(ddgs.text(query, max_results=num_results))
     return [
         {"title": r.get("title", ""), "url": r.get("href", ""), "content": r.get("body", "")}

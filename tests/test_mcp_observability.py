@@ -7,9 +7,13 @@ import pytest
 
 @pytest.fixture
 def mock_obs_db():
-    """Mock the database connection for observability MCP server."""
+    """Mock the database connection for observability MCP server.
+
+    Uses dict-based rows to match psycopg's dict_row factory.
+    """
     mock_cursor = MagicMock()
-    mock_cursor.lastrowid = 42
+    mock_cursor.fetchone.return_value = {"id": 42}
+
     mock_conn = MagicMock()
     mock_conn.execute.return_value = mock_cursor
 
@@ -73,13 +77,21 @@ class TestRecordTrace:
 
 class TestGetMetrics:
     def test_returns_valid_metrics(self, mock_obs_db):
-        mock_row = MagicMock()
-        mock_row.__getitem__ = lambda self, i: (15, 3000, 4500, 2, 3)[i]
+        mock_row = {
+            "total_events": 15,
+            "total_tokens": 3000,
+            "total_latency_ms": 4500,
+            "failures": 2,
+            "iterations": 3,
+        }
 
-        mock_layer_rows = [("execute", 8), ("verify", 4), ("observe", 3)]
+        mock_layer_rows = [
+            {"layer": "execute", "count": 8},
+            {"layer": "verify", "count": 4},
+            {"layer": "observe", "count": 3},
+        ]
 
         call_count = [0]
-        orig_execute = mock_obs_db["connection"].execute
 
         def side_effect(*args, **kwargs):
             call_count[0] += 1
@@ -130,8 +142,8 @@ class TestGetFailureHints:
     def test_returns_hints_for_known_categories(self, mock_obs_db):
         mock_result = MagicMock()
         mock_result.fetchall.return_value = [
-            ("insufficient_depth",),
-            ("missing_citations",),
+            {"category": "insufficient_depth"},
+            {"category": "missing_citations"},
         ]
         mock_obs_db["connection"].execute.return_value = mock_result
 
@@ -173,7 +185,7 @@ class TestGetFailureHints:
 class TestRecordFailure:
     def test_stores_failure_record(self, mock_obs_db):
         mock_cursor = MagicMock()
-        mock_cursor.lastrowid = 7
+        mock_cursor.fetchone.return_value = {"id": 7}
         mock_obs_db["connection"].execute.return_value = mock_cursor
 
         from mcp_servers.observability_mcp.server import record_failure

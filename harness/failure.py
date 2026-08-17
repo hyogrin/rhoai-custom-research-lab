@@ -114,7 +114,7 @@ class FailureLog:
         return "\n".join(f"- {h}" for h in hints)
 
     def persist(self, session_id: str):
-        """Save failures to SQLite for cross-session learning."""
+        """Save failures to PostgreSQL for cross-session learning."""
         entries = self.get_failures(session_id)
         if not entries:
             return
@@ -124,7 +124,7 @@ class FailureLog:
         for entry in entries:
             conn.execute(
                 """INSERT INTO failure_log (session_id, iteration, category, description, context, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)""",
+                VALUES (%s, %s, %s, %s, %s, %s)""",
                 (entry.session_id, entry.iteration, entry.category.value,
                  entry.description, entry.context, entry.timestamp),
             )
@@ -138,11 +138,11 @@ class FailureLog:
             conn = get_connection()
             rows = conn.execute(
                 """SELECT category, COUNT(*) as count,
-                          GROUP_CONCAT(DISTINCT description) as descriptions
+                          STRING_AGG(DISTINCT description, ',') as descriptions
                 FROM failure_log
                 GROUP BY category
                 ORDER BY count DESC
-                LIMIT ?""",
+                LIMIT %s""",
                 (limit,),
             ).fetchall()
             conn.close()

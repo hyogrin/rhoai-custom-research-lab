@@ -34,7 +34,7 @@ if [ -f "$ENV_FILE" ]; then
     set -e
 fi
 
-NAMESPACE="${NAMESPACE:-doc-research-lab}"
+NAMESPACE="${NAMESPACE:-demo}"
 PG_USER="${PG_USER:-research}"
 PG_PASSWORD="${PG_PASSWORD:-research}"
 PG_DB="${PG_DB:-research_db}"

@@ -64,34 +64,54 @@ _MCP_MAX_RETRIES = int(os.getenv("MCP_MAX_RETRIES", "2"))
 
 
 async def _call_mcp_tool(server: str, tool_name: str, arguments: dict) -> Any:
-    """Call a tool on a remote MCP server via streamable-http transport."""
+    """Call a tool on a remote MCP server via streamable-http transport.
+
+    Timeout is applied at the httpx client level to avoid CancelledError
+    propagating into the MCP session's anyio TaskGroup.
+    """
     url = SERVER_URLS[server]
     t0 = time.monotonic()
-    async with streamable_http_client(url) as (read_stream, write_stream, _):
-        t_connect = time.monotonic()
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
-            t_init = time.monotonic()
-            result = await session.call_tool(tool_name, arguments)
-            t_call = time.monotonic()
+    http_client = httpx.AsyncClient(timeout=httpx.Timeout(_MCP_TIMEOUT))
+    try:
+        async with streamable_http_client(url, http_client=http_client) as (read_stream, write_stream, _):
+            t_connect = time.monotonic()
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                t_init = time.monotonic()
+                result = await session.call_tool(tool_name, arguments)
+                t_call = time.monotonic()
 
-            logger.debug(
-                "MCP %s/%s timing: connect=%.1fs init=%.1fs call=%.1fs total=%.1fs",
-                server, tool_name,
-                t_connect - t0, t_init - t_connect, t_call - t_init, t_call - t0,
-            )
+                logger.debug(
+                    "MCP %s/%s timing: connect=%.1fs init=%.1fs call=%.1fs total=%.1fs",
+                    server, tool_name,
+                    t_connect - t0, t_init - t_connect, t_call - t_init, t_call - t0,
+                )
 
-            if hasattr(result, "structuredContent") and result.structuredContent is not None:
-                return result.structuredContent.get("result", result.structuredContent)
+                if getattr(result, "isError", False):
+                    error_text = ""
+                    if result.content and len(result.content) > 0:
+                        error_text = result.content[0].text
+                    logger.error("MCP %s/%s returned error: %s", server, tool_name, error_text[:300])
+                    return None
 
-            if result.content and len(result.content) > 0:
-                text = result.content[0].text
-                try:
-                    return json.loads(text)
-                except (json.JSONDecodeError, TypeError):
-                    return text
+                if hasattr(result, "structuredContent") and result.structuredContent is not None:
+                    return result.structuredContent.get("result", result.structuredContent)
 
-            return None
+                if result.content and len(result.content) > 0:
+                    text = result.content[0].text
+                    try:
+                        return json.loads(text)
+                    except (json.JSONDecodeError, TypeError):
+                        return text
+
+                return None
+    except BaseExceptionGroup as eg:
+        real_errors = [e for e in eg.exceptions if not isinstance(e, asyncio.CancelledError)]
+        if real_errors:
+            raise real_errors[0] from eg
+        raise TimeoutError(f"MCP {server}/{tool_name} timed out ({_MCP_TIMEOUT}s)") from eg
+    finally:
+        await http_client.aclose()
 
 
 def _call_mcp_sync(server: str, tool_name: str, arguments: dict) -> Any:
@@ -120,7 +140,12 @@ def _call_mcp_sync(server: str, tool_name: str, arguments: dict) -> Any:
 
 
 def _run_mcp_in_new_loop(server: str, tool_name: str, arguments: dict) -> Any:
-    """Run MCP call in a fresh event loop. Always safe from any thread."""
+    """Run MCP call in a fresh event loop. Always safe from any thread.
+
+    Timeout is handled inside ``_call_mcp_tool`` at the HTTP transport level.
+    Do NOT wrap with ``asyncio.wait_for()`` — it sends CancelledError into
+    the MCP session's anyio TaskGroup, causing "unhandled errors in a TaskGroup".
+    """
     import concurrent.futures
 
     try:
@@ -131,18 +156,13 @@ def _run_mcp_in_new_loop(server: str, tool_name: str, arguments: dict) -> Any:
     if loop and loop.is_running():
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(
-                asyncio.run, asyncio.wait_for(
-                    _call_mcp_tool(server, tool_name, arguments),
-                    timeout=_MCP_TIMEOUT,
-                )
+                asyncio.run,
+                _call_mcp_tool(server, tool_name, arguments),
             )
             return future.result(timeout=_MCP_TIMEOUT + 10)
     else:
         return asyncio.run(
-            asyncio.wait_for(
-                _call_mcp_tool(server, tool_name, arguments),
-                timeout=_MCP_TIMEOUT,
-            )
+            _call_mcp_tool(server, tool_name, arguments),
         )
 
 
@@ -298,11 +318,11 @@ def semantic_search(query: str, top_k: int = 5) -> list[dict]:
     return result if isinstance(result, list) else []
 
 
-def search_by_document(query: str, document_id: str, top_k: int = 5) -> list[dict]:
+def search_by_document(query: str, document_name: str, top_k: int = 5) -> list[dict]:
     """Search within a specific document via vector-search-mcp server."""
     result = _call_mcp_sync("vector-search", "search_by_document", {
         "query": query,
-        "document_id": document_id,
+        "document_name": document_name,
         "top_k": top_k,
     })
     return result if isinstance(result, list) else []
@@ -622,6 +642,7 @@ def draft_report(
     language_instruction: str = "",
 ) -> dict:
     """Draft report via direct LLM call."""
+    has_web = "[WEB]" in context
     system_prompt = (
         "You are a research report writer. Write a comprehensive, well-structured research report "
         "based on the provided context and research plan.\n\n"
@@ -632,8 +653,18 @@ def draft_report(
         "- ONLY use source IDs that appear in the provided context. NEVER invent IDs.\n"
         "- NEVER use numeric citations like [1], [2], [Source 1], etc.\n"
         "- Place citations at the END of the relevant sentence, before the period.\n"
-        "- NEVER place a citation immediately before a heading or on the same line as a heading.\n\n"
-        "Markdown formatting rules (STRICT):\n"
+        "- NEVER place a citation immediately before a heading or on the same line as a heading.\n"
+    )
+    if has_web:
+        system_prompt += (
+            "\nWeb source integration (MANDATORY):\n"
+            "- The context includes both [DOC] (uploaded document) and [WEB] (web search) sources.\n"
+            "- You MUST cite [WEB] sources in your writing — do NOT rely solely on [DOC] sources.\n"
+            "- Each web source has a DIFFERENT SRC_ ID — cite the specific one that supports each claim.\n"
+            "- A well-written report should cite BOTH [DOC] and [WEB] sources.\n"
+        )
+    system_prompt += (
+        "\nMarkdown formatting rules (STRICT):\n"
         "- ALWAYS insert a blank line before ANY heading (##, ###, etc.).\n"
         "- ALWAYS insert a blank line after a heading before the body text.\n"
         "- NEVER concatenate a citation and a heading on the same line.\n"
@@ -663,15 +694,21 @@ def draft_report(
 
 
 def _format_source_entry(idx: int, ctx: dict) -> str:
-    """Format a single context entry for LLM prompt using stable source_id."""
+    """Format a single context entry for LLM prompt using stable source_id.
+
+    Web sources are tagged with [WEB] and document sources with [DOC] so the
+    LLM can clearly distinguish them and cite both types appropriately.
+    """
     raw_name = ctx.get("document_name", ctx.get("source", "unknown"))
     name = re.sub(r"\[\d+\]$", "", raw_name).strip()
     src_id = ctx.get("source_id", f"SRC_{idx:04X}")
     metadata = ctx.get("metadata") or {}
     url = metadata.get("source_url", "") or metadata.get("url", "")
-    header = f"[{src_id}: {name}]"
+    is_web = (metadata.get("type") == "web_search") or ctx.get("source", "").startswith("web:")
+    tag = "[WEB]" if is_web else "[DOC]"
+    header = f"{tag} [{src_id}: {name}]"
     if url and url.startswith("http"):
-        header = f"[{src_id}: {name}]({url})"
+        header = f"{tag} [{src_id}: {name}]({url})"
     return f"{header}\n{ctx.get('content', '')[:400]}"
 
 
@@ -708,6 +745,14 @@ def draft_section(
     """
     sub_topic_title = sub_topic.get("title", "Section")
     sub_topic_purpose = sub_topic.get("purpose", "")
+    needs_web = sub_topic.get("needs_web", False)
+
+    interleaved = _interleave_context(search_context, max_items=6)
+    has_web_context = any(
+        (c.get("metadata") or {}).get("type") == "web_search"
+        or c.get("source", "").startswith("web:")
+        for c in interleaved
+    )
 
     system_prompt = (
         f'You are a research report writer. Write the section titled "{sub_topic_title}" '
@@ -726,8 +771,27 @@ def draft_section(
         "- ONLY use source IDs that appear in the provided context. NEVER invent IDs.\n"
         "- NEVER use numeric citations like [1], [2], [Source 1], etc.\n"
         "- Place citations at the END of the relevant sentence, before the period.\n"
-        "- NEVER place a citation immediately before a heading or on the same line as a heading.\n\n"
-        "Markdown formatting rules (STRICT):\n"
+        "- NEVER place a citation immediately before a heading or on the same line as a heading.\n"
+    )
+
+    if has_web_context:
+        system_prompt += (
+            "\nWeb source integration (MANDATORY):\n"
+            "- The context below includes both [DOC] (uploaded document) and [WEB] (web search) sources.\n"
+            "- You MUST cite [WEB] sources in your writing — do NOT rely solely on [DOC] sources.\n"
+            "- Use web sources to provide current trends, external perspectives, and industry context.\n"
+            "- Use document sources for specific details from the uploaded material.\n"
+            "- Each web source has a DIFFERENT SRC_ ID — cite the specific one that supports each claim.\n"
+            "- A well-written section should cite BOTH [DOC] and [WEB] sources throughout.\n"
+        )
+        if needs_web:
+            system_prompt += (
+                "- This section was specifically planned to require web search data "
+                "(trends, comparisons, external analysis). Web source citations are ESSENTIAL.\n"
+            )
+
+    system_prompt += (
+        "\nMarkdown formatting rules (STRICT):\n"
         "- ALWAYS insert a blank line before ANY heading (##, ###, etc.).\n"
         "- ALWAYS insert a blank line after a heading before the body text.\n"
         "- NEVER concatenate a citation and a heading on the same line.\n"
@@ -742,7 +806,7 @@ def draft_section(
 
     context_text = "\n\n".join(
         _format_source_entry(source_offset + i, c)
-        for i, c in enumerate(_interleave_context(search_context, max_items=6))
+        for i, c in enumerate(interleaved)
     )
 
     user_content = f"Research Question: {query}\n\nSection: {sub_topic_title}\n\nContext:\n{context_text}"

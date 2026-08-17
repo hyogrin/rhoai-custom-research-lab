@@ -33,15 +33,19 @@ def _patch_tracer_for_langgraph():
                 logger.debug("Patched MlflowLangchainTracer.%s (no-op)", attr)
 
         _original_on_chain_error = getattr(MlflowLangchainTracer, "on_chain_error", None)
-        if _original_on_chain_error:
+        _original_on_chain_end = getattr(MlflowLangchainTracer, "on_chain_end", None)
+        if _original_on_chain_error and _original_on_chain_end:
             def _filtered_on_chain_error(self, error, *args, **kwargs):
                 from langgraph.errors import GraphInterrupt
                 if isinstance(error, GraphInterrupt):
+                    _original_on_chain_end(
+                        self, {"status": "interrupted"}, *args, **kwargs
+                    )
                     return
                 return _original_on_chain_error(self, error, *args, **kwargs)
 
             MlflowLangchainTracer.on_chain_error = _filtered_on_chain_error
-            logger.debug("Patched MlflowLangchainTracer.on_chain_error (filters GraphInterrupt)")
+            logger.debug("Patched MlflowLangchainTracer.on_chain_error (GraphInterrupt → on_chain_end)")
     except Exception:
         pass
 

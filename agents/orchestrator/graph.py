@@ -58,32 +58,30 @@ def _get_observer(session_id: str) -> HarnessObserver:
 
 
 def _resolve_target_document(query: str) -> tuple[str, str]:
-    """Match document references in the query against the document database.
+    """Match document references in the query against Llama Stack vector store files.
 
-    Returns (document_id, document_name) or ("", "") if no match.
+    Returns (file_id, filename) or ("", "") if no match.
     """
     try:
-        from db import get_connection
-        conn = get_connection()
-        rows = conn.execute(
-            "SELECT id, name FROM documents WHERE status = 'completed'"
-        ).fetchall()
-        conn.close()
+        from lib.llama_stack_client import ensure_vector_store, list_files
+        vs_id = ensure_vector_store()
+        files = list_files(vs_id)
 
-        if not rows:
+        if not files:
             return "", ""
 
         q_lower = query.lower()
-        for row in rows:
-            doc_name = row["name"]
-            if doc_name.lower() in q_lower:
-                return row["id"], doc_name
-            name_no_ext = os.path.splitext(doc_name)[0]
+        for f in files:
+            file_id = f.get("file_id", f.get("id", ""))
+            filename = f.get("filename") or file_id
+            if filename.lower() in q_lower:
+                return file_id, filename
+            name_no_ext = os.path.splitext(filename)[0]
             if name_no_ext.lower() in q_lower:
-                return row["id"], doc_name
-            words = [w for w in doc_name.replace("_", " ").replace("-", " ").split() if len(w) > 3]
+                return file_id, filename
+            words = [w for w in filename.replace("_", " ").replace("-", " ").split() if len(w) > 3]
             if words and sum(1 for w in words if w.lower() in q_lower) >= len(words) * 0.6:
-                return row["id"], doc_name
+                return file_id, filename
     except Exception as e:
         logger.debug("Document resolution failed: %s", e)
     return "", ""
@@ -246,7 +244,7 @@ _PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "4"))
 
 def _search_section(
     topic: dict, query: str, iteration: int, ws_flag: bool, parallel: bool,
-    document_id: str = "", ws_limit: int = 2,
+    document_name: str = "", ws_limit: int = 2,
 ) -> dict:
     """Run search queries for a single section and return context + counts.
 
@@ -274,7 +272,7 @@ def _search_section(
         futures_map: dict = {}
         with ThreadPoolExecutor(max_workers=_PARALLEL_WORKERS) as pool:
             for idx, q in enumerate(queries[:3]):
-                futures_map[pool.submit(_run_semantic, q, iteration, document_id)] = ("semantic", q)
+                futures_map[pool.submit(_run_semantic, q, iteration, document_name)] = ("semantic", q)
                 if _should_web(idx):
                     futures_map[pool.submit(_run_web, q, iteration, ws_limit)] = ("web", q)
 
@@ -293,7 +291,7 @@ def _search_section(
                     logger.error("Section '%s' search (%s) failed: %s", title, kind, e, exc_info=True)
     else:
         for idx, q in enumerate(queries[:3]):
-            for r in _run_semantic(q, iteration, document_id):
+            for r in _run_semantic(q, iteration, document_name):
                 r.setdefault("metadata", {})["sub_topic"] = title
                 section_context.append(r)
                 semantic_count += 1
@@ -410,11 +408,11 @@ def _execute_sections(state: ResearchState, writer: StreamWriter) -> dict:
         # --- Phase 1: Search ---
         writer({"progress": "section_start", **evt_base})
 
-        target_doc_id = state.get("target_document_id", "")
+        target_doc_name = state.get("target_document_name", "")
         try:
             search_result = _search_section(
                 topic, state["query"], iteration, ws_flag, parallel,
-                document_id=target_doc_id,
+                document_name=target_doc_name,
                 ws_limit=state.get("web_search_limit", 2),
             )
         except Exception as e:
@@ -529,33 +527,34 @@ def _format_context_entry(ctx: dict, idx: int | None = None) -> str:
     doc_name = ctx.get("document_name", source)
     url = metadata.get("source_url", "") or metadata.get("url", "")
     content = ctx.get("content", "")[:500]
-    header = f"[{src_id}: {doc_name}]"
+    is_web = (metadata.get("type") == "web_search") or source.startswith("web:")
+    tag = "[WEB]" if is_web else "[DOC]"
+    header = f"{tag} [{src_id}: {doc_name}]"
     if url and url.startswith("http"):
-        header = f"[{src_id}: {doc_name}]({url})"
+        header = f"{tag} [{src_id}: {doc_name}]({url})"
     return f"{header}\n{content}"
 
 
-def _run_semantic(query: str, iteration: int, document_id: str = "") -> list[dict]:
+def _run_semantic(query: str, iteration: int, document_name: str = "") -> list[dict]:
     """Run a single semantic_search and return context entries. Thread-safe.
 
-    If document_id is provided, search is scoped to that document only.
+    If document_name is provided, search is scoped to that document only.
     Each entry gets a stable source_id based on the document name (not position).
     """
     import hashlib
     seen: set = set()
     entries: list[dict] = []
     results = (
-        search_by_document(query, document_id, top_k=5)
-        if document_id
+        search_by_document(query, document_name, top_k=5)
+        if document_name
         else semantic_search(query, top_k=3)
     )
     for r in results:
         key = (r.get("document_id", ""), r.get("chunk_index", 0))
         if key not in seen:
             seen.add(key)
-            doc_name = r.get("document_name", "unknown")
+            doc_name = r.get("document_name", "") or "unknown"
             source_url = r.get("source_url", "")
-            # Stable source_id: hash of document name (deduplicates chunks from same doc)
             id_basis = source_url if (source_url and source_url.startswith("http")) else doc_name
             src_id = "SRC_" + hashlib.sha256(id_basis.encode()).hexdigest()[:6].upper()
             entries.append({
@@ -614,7 +613,7 @@ def execute_node(state: ResearchState, writer: StreamWriter) -> dict:
 
     ws_flag = state.get("enable_web_search", True)
     parallel = state.get("enable_parallel", True)
-    target_doc_id = state.get("target_document_id", "")
+    target_doc_name = state.get("target_document_name", "")
     ws_limit = state.get("web_search_limit", 2)
 
     search_steps = [s for s in plan[:4] if s.get("action", "search") in ("search", "web_search")]
@@ -625,7 +624,7 @@ def execute_node(state: ResearchState, writer: StreamWriter) -> dict:
         with ThreadPoolExecutor(max_workers=_PARALLEL_WORKERS) as pool:
             for step in search_steps:
                 q = step.get("query", state["query"])
-                futures_map[pool.submit(_run_semantic, q, iteration, target_doc_id)] = ("semantic", q)
+                futures_map[pool.submit(_run_semantic, q, iteration, target_doc_name)] = ("semantic", q)
                 if ws_flag:
                     futures_map[pool.submit(_run_web, q, iteration, ws_limit)] = ("web", q)
 
@@ -646,7 +645,7 @@ def execute_node(state: ResearchState, writer: StreamWriter) -> dict:
     else:
         for step in search_steps:
             q = step.get("query", state["query"])
-            new_context.extend(_run_semantic(q, iteration, target_doc_id))
+            new_context.extend(_run_semantic(q, iteration, target_doc_name))
             observer.trace_tool_call(iteration=iteration, operation="semantic_search", input_summary=q[:200], output_summary="done", tokens_used=0)
             if ws_flag:
                 new_context.extend(_run_web(q, iteration, ws_limit))
